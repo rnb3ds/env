@@ -1,0 +1,29 @@
+# Application Configuration
+app:
+  name: myapp
+  env: production
+  port: 8080
+  debug: false
+
+# Database Configuration
+db:
+  host: localhost
+  port: 5432
+  name: mydb
+  user: admin
+  password: secret123
+  max_connections: 50
+  timeout: 30s
+
+# Cache Configuration
+cache:
+  enabled: true
+  ttl: 5m
+  hosts:
+    - redis1:6379
+    - redis2:6379
+
+# Feature Flags
+features:
+  rate_limit: false
+  circuit_breaker: true

@@ -1,0 +1,110 @@
+// Package env provides cross-platform memory locking configuration.
+package env
+
+import (
+	"sync/atomic"
+
+	"github.com/cybergodev/env/internal"
+)
+
+// MemoryLockConfig controls memory locking behavior for SecureValue.
+// Memory locking prevents sensitive data from being swapped to disk,
+// which is important for high-security applications handling passwords,
+// API keys, and other sensitive credentials.
+//
+// Usage:
+//
+//	// Enable memory locking globally (call once at application startup)
+//	env.SetMemoryLockEnabled(true)
+//
+//	// Check if memory locking is supported on this platform
+//	if env.IsMemoryLockSupported() {
+//	    // Memory locking is available
+//	}
+//
+// Security Considerations:
+//   - On Unix systems, mlock() requires CAP_IPC_LOCK capability or root privileges
+//   - On Windows, VirtualLock() requires SE_LOCK_MEMORY_NAME privilege
+//   - If privileges are missing, the operation will fail silently (by default)
+//   - Use SetMemoryLockStrict(true) to receive errors when locking fails
+//
+// Performance Impact:
+//   - Memory locking has minimal overhead during allocation
+//   - Locked pages cannot be paged out, which may increase memory pressure
+//   - Recommended to keep SecureValue objects small and short-lived
+type MemoryLockConfig struct {
+	// enabled controls whether memory locking is attempted
+	enabled atomic.Bool
+
+	// strict controls whether locking failures return errors
+	// If false (default), locking failures are silently ignored
+	// If true, NewSecureValue will return an error if locking fails
+	strict atomic.Bool
+
+	// supported indicates if the platform supports memory locking
+	// This is set at init time based on the build target
+	supported bool
+}
+
+// memLockConfig is the global memory lock configuration.
+var memLockConfig = MemoryLockConfig{
+	supported: internal.MemLockSupported(),
+}
+
+// SetMemoryLockEnabled enables or disables memory locking globally.
+// This affects all new SecureValue objects created after the call.
+// Existing SecureValue objects are not affected.
+//
+// This function is safe to call from multiple goroutines simultaneously.
+//
+// Example:
+//
+//	func main() {
+//	    // Enable at application startup
+//	    env.SetMemoryLockEnabled(true)
+//
+//	    // ... rest of application
+//	}
+func SetMemoryLockEnabled(enabled bool) {
+	memLockConfig.enabled.Store(enabled)
+}
+
+// IsMemoryLockEnabled returns whether memory locking is currently enabled.
+func IsMemoryLockEnabled() bool {
+	return memLockConfig.enabled.Load()
+}
+
+// SetMemoryLockStrict sets whether memory locking failures should return errors.
+// By default, locking failures are silently ignored for compatibility.
+// Enable strict mode for high-security applications that require confirmation
+// that memory is actually locked.
+//
+// Example:
+//
+//	env.SetMemoryLockEnabled(true)
+//	env.SetMemoryLockStrict(true) // Now locking failures will return errors
+//	sv := env.NewSecureValue("sensitive-data")
+//	// If locking failed, sv will still be valid but the error is logged
+func SetMemoryLockStrict(strict bool) {
+	memLockConfig.strict.Store(strict)
+}
+
+// IsMemoryLockStrict returns whether strict mode is enabled.
+func IsMemoryLockStrict() bool {
+	return memLockConfig.strict.Load()
+}
+
+// IsMemoryLockSupported returns whether the current platform supports memory locking.
+// This returns false on platforms like wasm or nacl where memory locking
+// is not available.
+//
+// Note: This only indicates platform support, not whether the process has
+// the required privileges to actually lock memory.
+func IsMemoryLockSupported() bool {
+	return memLockConfig.supported
+}
+
+// The following functions are implemented by platform-specific files:
+// - memLockSupported() bool - Returns true if platform supports memory locking
+// - lockMemory(data []byte) error - Locks memory to prevent swapping
+// - unlockMemory(data []byte) - Unlocks previously locked memory

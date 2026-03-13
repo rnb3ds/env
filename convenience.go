@@ -1,0 +1,329 @@
+// Package env provides a high-security environment variable library for Go 1.24+.
+package env
+
+import (
+	"time"
+)
+
+// ============================================================================
+// Package-level Convenience Functions
+// ============================================================================
+
+// withLoader executes a function with the default loader.
+// If the loader cannot be obtained, returns the provided default value.
+// This helper reduces boilerplate in the convenience functions.
+func withLoader[T any](fn func(*Loader) T, def T) T {
+	loader, err := getDefaultLoader()
+	if err != nil {
+		return def
+	}
+	return fn(loader)
+}
+
+// withLoaderError executes a function with the default loader that may return an error.
+// If the loader cannot be obtained, returns the error directly.
+func withLoaderError[T any](fn func(*Loader) (T, error)) (T, error) {
+	loader, err := getDefaultLoader()
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	return fn(loader)
+}
+
+// GetString retrieves a value from the default loader with optional default.
+// Returns an empty string if the loader cannot be initialized or the key is not found
+// and no default is provided.
+// Use Lookup to distinguish between "not found" and "empty value".
+//
+// Example:
+//
+//	value := env.GetString("KEY")           // Returns "" if not found
+//	value := env.GetString("KEY", "default") // Returns "default" if not found
+func GetString(key string, defaultValue ...string) string {
+	def := ""
+	if len(defaultValue) > 0 {
+		def = defaultValue[0]
+	}
+	return withLoader(func(l *Loader) string {
+		return l.GetString(key, defaultValue...)
+	}, def)
+}
+
+// GetInt retrieves an integer value from the default loader with optional default.
+// Returns 0 if the loader cannot be initialized or the key is not found
+// and no default is provided.
+//
+// Example:
+//
+//	port := env.GetInt("PORT")           // Returns 0 if not found
+//	port := env.GetInt("PORT", 8080)     // Returns 8080 if not found
+func GetInt(key string, defaultValue ...int64) int64 {
+	var def int64
+	if len(defaultValue) > 0 {
+		def = defaultValue[0]
+	}
+	return withLoader(func(l *Loader) int64 {
+		return l.GetInt(key, defaultValue...)
+	}, def)
+}
+
+// GetBool retrieves a boolean value from the default loader with optional default.
+// Returns false if the loader cannot be initialized or the key is not found
+// and no default is provided.
+//
+// Example:
+//
+//	debug := env.GetBool("DEBUG")           // Returns false if not found
+//	debug := env.GetBool("DEBUG", true)     // Returns true if not found
+func GetBool(key string, defaultValue ...bool) bool {
+	def := false
+	if len(defaultValue) > 0 {
+		def = defaultValue[0]
+	}
+	return withLoader(func(l *Loader) bool {
+		return l.GetBool(key, defaultValue...)
+	}, def)
+}
+
+// GetDuration retrieves a duration value from the default loader with optional default.
+// Returns 0 if the loader cannot be initialized or the key is not found
+// and no default is provided.
+//
+// Example:
+//
+//	timeout := env.GetDuration("TIMEOUT")                  // Returns 0 if not found
+//	timeout := env.GetDuration("TIMEOUT", 30*time.Second) // Returns 30s if not found
+func GetDuration(key string, defaultValue ...time.Duration) time.Duration {
+	var def time.Duration
+	if len(defaultValue) > 0 {
+		def = defaultValue[0]
+	}
+	return withLoader(func(l *Loader) time.Duration {
+		return l.GetDuration(key, defaultValue...)
+	}, def)
+}
+
+// Lookup retrieves a value and existence from the default loader.
+//
+// Example:
+//
+//	value, exists := env.Lookup("DATABASE_URL")
+//	if !exists {
+//	    log.Fatal("DATABASE_URL is required")
+//	}
+func Lookup(key string) (string, bool) {
+	loader, err := getDefaultLoader()
+	if err != nil {
+		return "", false
+	}
+	return loader.Lookup(key)
+}
+
+// Set sets a value in the default loader.
+//
+// Example:
+//
+//	if err := env.Set("DEBUG", "true"); err != nil {
+//	    log.Fatal(err)
+//	}
+func Set(key, value string) error {
+	_, err := withLoaderError(func(l *Loader) (struct{}, error) {
+		return struct{}{}, l.Set(key, value)
+	})
+	return err
+}
+
+// GetSlice retrieves a slice of values from the default loader.
+// Returns nil if the loader cannot be initialized or the key is not found
+// and no default is provided.
+//
+// Indexed keys are searched in format: KEY_0, KEY_1, KEY_2, etc.
+// Also supports comma-separated values as fallback for .env files.
+//
+// Example:
+//
+//	ports := env.GetSlice[int]("PORTS")
+//	hosts := env.GetSlice[string]("HOSTS", []string{"localhost"})
+func GetSlice[T sliceElement](key string, defaultValue ...[]T) []T {
+	var def []T
+	if len(defaultValue) > 0 {
+		def = defaultValue[0]
+	}
+	return withLoader(func(l *Loader) []T {
+		return GetSliceFrom[T](l, key, defaultValue...)
+	}, def)
+}
+
+// Keys returns all keys from the default loader.
+// Returns nil if the loader cannot be initialized.
+//
+// Example:
+//
+//	for _, key := range env.Keys() {
+//	    fmt.Printf("%s = %s\n", key, env.GetString(key))
+//	}
+func Keys() []string {
+	return withLoader((*Loader).Keys, nil)
+}
+
+// All returns all environment variables from the default loader as a map.
+// Returns nil if the loader cannot be initialized.
+//
+// Example:
+//
+//	vars := env.All()
+//	for key, value := range vars {
+//	    fmt.Printf("%s = %s\n", key, value)
+//	}
+func All() map[string]string {
+	return withLoader((*Loader).All, nil)
+}
+
+// Len returns the number of loaded variables from the default loader.
+// Returns 0 if the loader cannot be initialized.
+//
+// Example:
+//
+//	count := env.Len()
+//	fmt.Printf("Loaded %d environment variables\n", count)
+func Len() int {
+	return withLoader((*Loader).Len, 0)
+}
+
+// Delete removes a key from the default loader.
+// Returns an error if the loader cannot be initialized.
+//
+// Example:
+//
+//	if err := env.Delete("TEMP_VAR"); err != nil {
+//	    log.Fatal(err)
+//	}
+func Delete(key string) error {
+	_, err := withLoaderError(func(l *Loader) (struct{}, error) {
+		return struct{}{}, l.Delete(key)
+	})
+	return err
+}
+
+// GetSecure retrieves a SecureValue from the default loader.
+// Returns nil if the loader cannot be initialized or the key is not found.
+// Use GetSecure for sensitive values that need secure memory handling.
+//
+// Example:
+//
+//	sv := env.GetSecure("API_KEY")
+//	if sv != nil {
+//	    fmt.Println(sv.Masked()) // Safe for logging
+//	    data := sv.Bytes()
+//	    defer env.ClearBytes(data)
+//	    // Use data securely
+//	}
+func GetSecure(key string) *SecureValue {
+	return withLoader(func(l *Loader) *SecureValue {
+		return l.GetSecure(key)
+	}, nil)
+}
+
+// Validate validates the default loader against required and allowed keys.
+// Returns an error if the loader cannot be initialized or validation fails.
+//
+// Example:
+//
+//	if err := env.Validate(); err != nil {
+//	    log.Fatal("Environment validation failed:", err)
+//	}
+func Validate() error {
+	_, err := withLoaderError(func(l *Loader) (struct{}, error) {
+		return struct{}{}, l.Validate()
+	})
+	return err
+}
+
+// ============================================================================
+// Quick Load Functions
+// ============================================================================
+
+// Load loads environment files in order and applies them to os.Environ.
+// Files are loaded sequentially; later files can override values from earlier files.
+// All loaded variables are applied to os.Environ.
+//
+// Supported file formats:
+//   - .env files (dotenv format)
+//   - .json files (JSON format with nested structure)
+//   - .yaml/.yml files (YAML format with nested structure)
+//
+// For JSON/YAML files, nested values are flattened and can be accessed using dot-notation:
+//
+//	// config.json: {"database": {"host": "localhost", "port": 5432}}
+//	env.Load("config.json")
+//	host := env.GetString("database.host") // "localhost"
+//	port := env.GetInt("database.port")    // 5432
+//
+// The loader is set as the default for package-level functions (GetString, GetInt, etc.).
+// It returns ErrAlreadyInitialized if the default loader has already been initialized.
+//
+// Example:
+//
+//	// Load default .env file
+//	if err := env.Load(); err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	// Load .env first, then config.json (overrides)
+//	if err := env.Load(".env", "config.json"); err != nil {
+//	    log.Fatal(err)
+//	}
+//	// Now use package-level functions
+//	port := env.GetInt("PORT", 8080)
+//	host := env.GetString("database.host")
+func Load(filenames ...string) error {
+	cfg := DefaultConfig()
+	cfg.Filenames = filenames
+	cfg.AutoApply = true
+
+	loader, err := New(cfg)
+	if err != nil {
+		return err
+	}
+
+	// Set as default loader for package-level functions
+	if err := setDefaultLoader(loader); err != nil {
+		_ = loader.Close()
+		return err
+	}
+
+	return nil
+}
+
+// ParseInto populates a struct from the default loader's environment variables.
+// Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
+// Optional `envDefault:"value"` sets a default if the key is not found.
+//
+// This function automatically reads all loaded environment variables and maps
+// them to struct fields based on the `env` tags. It eliminates the need to
+// manually build a data map before calling UnmarshalStruct.
+//
+// Example:
+//
+//	type Config struct {
+//	    Host string `env:"DB_HOST"`
+//	    Port int    `env:"DB_PORT,envDefault:5432"`
+//	    Debug bool  `env:"DEBUG,envDefault:false"`
+//	}
+//
+//	if err := env.Load(".env"); err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	var cfg Config
+//	if err := env.ParseInto(&cfg); err != nil {
+//	    log.Fatal(err)
+//	}
+func ParseInto(v interface{}) error {
+	loader, err := getDefaultLoader()
+	if err != nil {
+		return err
+	}
+	return loader.ParseInto(v)
+}

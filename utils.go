@@ -1,0 +1,461 @@
+package env
+
+import (
+	"errors"
+	"reflect"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/cybergodev/env/internal"
+)
+
+// ============================================================================
+// Internal Parse Utilities
+// ============================================================================
+
+// boolValues maps lowercase boolean strings to their values.
+// This provides O(1) lookup for boolean parsing.
+var boolValues = map[string]bool{
+	"1":        true,
+	"0":        false,
+	"true":     true,
+	"false":    false,
+	"yes":      true,
+	"no":       false,
+	"on":       true,
+	"off":      false,
+	"enabled":  true,
+	"disabled": false,
+}
+
+// parseBool parses a boolean string with common variations.
+func parseBool(s string) (bool, error) {
+	s = strings.TrimSpace(s)
+	if len(s) == 0 {
+		return false, nil
+	}
+	if v, ok := boolValues[strings.ToLower(s)]; ok {
+		return v, nil
+	}
+	return false, &ValidationError{
+		Field:   "bool",
+		Value:   s,
+		Message: "invalid boolean value",
+	}
+}
+
+// parseDuration parses a duration string with additional validation.
+func parseDuration(s string) (time.Duration, error) {
+	d, err := time.ParseDuration(strings.TrimSpace(s))
+	if err != nil {
+		return 0, &ValidationError{
+			Field:   "duration",
+			Value:   s,
+			Message: "invalid duration format",
+		}
+	}
+	return d, nil
+}
+
+// parseInt parses an integer string with bounds checking.
+func parseInt(s string, bits int) (int64, error) {
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, bits)
+	if err != nil {
+		return 0, &ValidationError{
+			Field:   "int",
+			Value:   s,
+			Message: "invalid integer value",
+		}
+	}
+	return n, nil
+}
+
+// ============================================================================
+// Marshal/Unmarshal Utilities
+// ============================================================================
+
+// Marshal converts data to the specified format with sorted keys (default: .env format).
+// The input can be a map[string]string or a struct (will be converted to map first).
+// The format parameter is optional; if not provided, defaults to .env format.
+// Supported formats: FormatEnv, FormatJSON, FormatYAML.
+//
+// Keys are always sorted for consistent output.
+//
+// Example:
+//
+//	// Map to .env format (sorted)
+//	envString, _ := env.Marshal(mapData)
+//
+//	// Struct to .env format (sorted)
+//	envString, _ := env.Marshal(config)
+//
+//	// Map to JSON format (sorted)
+//	jsonString, _ := env.Marshal(mapData, env.FormatJSON)
+//
+//	// Struct to YAML format (sorted)
+//	yamlString, _ := env.Marshal(config, env.FormatYAML)
+func Marshal(data interface{}, format ...FileFormat) (string, error) {
+	f := FormatEnv
+	if len(format) > 0 {
+		f = format[0]
+	}
+
+	// Convert input to map if needed
+	m, err := toMap(data)
+	if err != nil {
+		return "", err
+	}
+
+	// Always use sorted output for consistency
+	return internal.MarshalEnvAs(m, toInternalFormat(f), true)
+}
+
+// toMap converts input data to map[string]string.
+// Supports map[string]string and struct types.
+func toMap(data interface{}) (map[string]string, error) {
+	if data == nil {
+		return nil, &ValidationError{
+			Field:   "data",
+			Message: "data cannot be nil",
+		}
+	}
+
+	// Check if it's already a map
+	if m, ok := data.(map[string]string); ok {
+		return m, nil
+	}
+
+	// Check if it's a pointer to map
+	if pm, ok := data.(*map[string]string); ok {
+		if pm == nil {
+			return nil, &ValidationError{
+				Field:   "data",
+				Message: "map pointer cannot be nil",
+			}
+		}
+		return *pm, nil
+	}
+
+	// Try to convert struct to map
+	return MarshalStruct(data)
+}
+
+// toInternalFormat converts public FileFormat to internal MarshalFormat.
+func toInternalFormat(f FileFormat) internal.MarshalFormat {
+	switch f {
+	case FormatJSON:
+		return internal.FormatJSON
+	case FormatYAML:
+		return internal.FormatYAML
+	default:
+		return internal.FormatEnv
+	}
+}
+
+// detectDataFormat auto-detects the format of input data.
+// Returns FormatJSON for JSON, FormatYAML for YAML, FormatEnv otherwise.
+func detectDataFormat(data string) FileFormat {
+	data = strings.TrimSpace(data)
+
+	// Empty data defaults to .env
+	if len(data) == 0 {
+		return FormatEnv
+	}
+
+	// JSON: starts with { or [
+	if data[0] == '{' || data[0] == '[' {
+		return FormatJSON
+	}
+
+	// Check first non-comment, non-empty line
+	lines := strings.Split(data, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// YAML list item: starts with "- "
+		if strings.HasPrefix(line, "- ") {
+			return FormatYAML
+		}
+
+		// YAML pattern: key: value (with space after colon)
+		// .env pattern: KEY=value
+		if strings.Contains(line, ": ") && !strings.Contains(line, "=") {
+			return FormatYAML
+		}
+
+		// .env pattern: contains = but not ": "
+		if strings.Contains(line, "=") {
+			return FormatEnv
+		}
+
+		break
+	}
+
+	return FormatEnv
+}
+
+// UnmarshalMap parses a formatted string into a map[string]string.
+// The format parameter is optional and defaults to FormatEnv.
+// Use FormatAuto for automatic format detection.
+//
+// Nested structures (JSON/YAML) are flattened with underscore delimiter.
+//
+// Example:
+//
+//	// .env format (default)
+//	m, _ := env.UnmarshalMap("KEY=value")
+//
+//	// JSON format
+//	m, _ := env.UnmarshalMap(`{"server": {"host": "localhost"}}`, env.FormatJSON)
+//
+//	// Auto-detect format
+//	m, _ := env.UnmarshalMap(jsonString, env.FormatAuto)
+func UnmarshalMap(data string, format ...FileFormat) (map[string]string, error) {
+	f := FormatEnv
+	if len(format) > 0 {
+		f = format[0]
+	}
+
+	// Auto-detect if requested
+	if f == FormatAuto {
+		f = detectDataFormat(data)
+	}
+
+	switch f {
+	case FormatJSON:
+		return unmarshalJSON(data)
+	case FormatYAML:
+		return unmarshalYAML(data)
+	default:
+		return parseString(data)
+	}
+}
+
+// unmarshalJSON parses a JSON string into a map.
+func unmarshalJSON(data string) (map[string]string, error) {
+	if data == "" {
+		return make(map[string]string), nil
+	}
+
+	cfg := internal.JSONFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      true,
+		NumberAsString:   true,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	result, err := internal.FlattenJSON([]byte(data), cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// unmarshalYAML parses a YAML string into a map.
+func unmarshalYAML(data string) (map[string]string, error) {
+	if data == "" {
+		return make(map[string]string), nil
+	}
+
+	cfg := internal.YAMLFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      true,
+		NumberAsString:   true,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	value, err := internal.ParseYAML([]byte(data), cfg.MaxDepth)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := internal.FlattenYAML(value, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// IsMarshalError checks if an error is a marshaling error.
+func IsMarshalError(err error) bool {
+	var me *MarshalError
+	return errors.As(err, &me)
+}
+
+// ============================================================================
+// Struct Marshaling/Unmarshaling
+// ============================================================================
+
+// Marshaler is the interface for types that can marshal themselves to env format.
+type Marshaler interface {
+	MarshalEnv() ([]byte, error)
+}
+
+// Unmarshaler is the interface for types that can unmarshal themselves from env values.
+type Unmarshaler interface {
+	UnmarshalEnv(map[string]string) error
+}
+
+// MarshalStruct converts a struct to environment variables.
+// Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
+// Nested structs are flattened with underscore-separated keys.
+func MarshalStruct(v interface{}) (map[string]string, error) {
+	// Check for Marshaler interface
+	if m, ok := v.(Marshaler); ok {
+		data, err := m.MarshalEnv()
+		if err != nil {
+			return nil, err
+		}
+		// Parse the marshaled data
+		return UnmarshalMap(string(data))
+	}
+
+	return internal.Struct(v, "")
+}
+
+// UnmarshalStruct parses a formatted string and populates the struct.
+// The format parameter is optional and defaults to FormatEnv.
+// Use FormatAuto for automatic format detection.
+//
+// Struct fields should use `env:"KEY"` tags for mapping.
+//
+// Example:
+//
+//	type Config struct {
+//	    Host string `env:"SERVER_HOST"`
+//	    Port int    `env:"SERVER_PORT"`
+//	}
+//
+//	// .env format (default)
+//	var cfg Config
+//	_ = env.UnmarshalStruct("SERVER_HOST=localhost\nSERVER_PORT=8080", &cfg)
+//
+//	// JSON format
+//	_ = env.UnmarshalStruct(`{"server": {"host": "localhost"}}`, &cfg, env.FormatJSON)
+func UnmarshalStruct(data string, v interface{}, format ...FileFormat) error {
+	m, err := UnmarshalMap(data, format...)
+	if err != nil {
+		return err
+	}
+	return UnmarshalInto(m, v)
+}
+
+// UnmarshalInto populates a struct from a map[string]string.
+// Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
+// Optional `envDefault:"value"` sets a default if the key is not found.
+func UnmarshalInto(data map[string]string, v interface{}) error {
+	if v == nil {
+		return &ValidationError{
+			Field:   "value",
+			Message: "cannot unmarshal into nil",
+		}
+	}
+
+	// Check for Unmarshaler interface
+	if u, ok := v.(Unmarshaler); ok {
+		return u.UnmarshalEnv(data)
+	}
+
+	val := reflect.ValueOf(v)
+	if val.Kind() != reflect.Ptr || val.IsNil() {
+		return &ValidationError{
+			Field:   "value",
+			Message: "expected non-nil pointer",
+		}
+	}
+
+	val = val.Elem()
+	if val.Kind() != reflect.Struct {
+		return &ValidationError{
+			Field:   "value",
+			Message: "expected pointer to struct",
+		}
+	}
+
+	return internal.StructInto(data, val, "")
+}
+
+// ============================================================================
+// Slice Parsing Utilities
+// ============================================================================
+
+// parseSliceElement parses a string value into the target type T.
+func parseSliceElement[T sliceElement](value string) (T, error) {
+	var zero T
+
+	// Trim whitespace for consistent behavior across all types
+	trimmed := strings.TrimSpace(value)
+
+	switch any(zero).(type) {
+	case string:
+		return any(trimmed).(T), nil
+	case int:
+		n, e := strconv.Atoi(trimmed)
+		return any(n).(T), e
+	case int64:
+		n, e := strconv.ParseInt(trimmed, 10, 64)
+		return any(n).(T), e
+	case uint:
+		n, e := strconv.ParseUint(trimmed, 10, 64)
+		return any(uint(n)).(T), e
+	case uint64:
+		n, e := strconv.ParseUint(trimmed, 10, 64)
+		return any(n).(T), e
+	case bool:
+		b, e := parseBool(trimmed)
+		return any(b).(T), e
+	case float64:
+		n, e := strconv.ParseFloat(trimmed, 64)
+		return any(n).(T), e
+	case time.Duration:
+		d, e := parseDuration(trimmed)
+		return any(d).(T), e
+	default:
+		return zero, &ValidationError{
+			Field:   "slice_element",
+			Value:   value,
+			Message: "unsupported slice element type",
+		}
+	}
+}
+
+// parseCommaSeparated parses a comma-separated string into a slice of T.
+func parseCommaSeparated[T sliceElement](value string, defaultValue ...[]T) []T {
+	if value == "" {
+		if len(defaultValue) > 0 {
+			return defaultValue[0]
+		}
+		return nil
+	}
+
+	parts := strings.Split(value, ",")
+	result := make([]T, 0, len(parts))
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		parsed, err := parseSliceElement[T](part)
+		if err != nil {
+			if len(defaultValue) > 0 {
+				return defaultValue[0]
+			}
+			return nil
+		}
+		result = append(result, parsed)
+	}
+
+	return result
+}

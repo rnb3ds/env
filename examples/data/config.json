@@ -1,0 +1,26 @@
+{
+  "app": {
+    "name": "myapp",
+    "env": "production",
+    "port": 8080,
+    "debug": false
+  },
+  "db": {
+    "host": "localhost",
+    "port": 5432,
+    "name": "mydb",
+    "user": "admin",
+    "password": "secret123",
+    "max_connections": 50,
+    "timeout": "30s"
+  },
+  "cache": {
+    "enabled": true,
+    "ttl": "5m",
+    "hosts": ["redis1:6379", "redis2:6379"]
+  },
+  "features": {
+    "rate_limit": false,
+    "circuit_breaker": true
+  }
+}
