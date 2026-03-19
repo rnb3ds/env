@@ -177,16 +177,24 @@ func ExtractNumericIndex(path string) (basePath string, index int, ok bool) {
 	// SECURITY: Prevent integer overflow for very long numeric indices
 	// Max int on 64-bit systems is ~9 quintillion (19 digits)
 	// We use 10 digits as safe limit (covers indices up to ~4 billion)
+	// On 32-bit systems, max int is ~2 billion, so we need overflow checking
 	const maxIndexLen = 10
 	if len(indexPart) > maxIndexLen {
 		return "", -1, false
 	}
 
-	// Parse the index
-	idx := 0
+	// Parse the index with overflow protection
+	// Use int64 to safely detect overflow on both 32-bit and 64-bit systems
+	const maxSafeIndex = 1<<31 - 1 // Max int32, safe for all platforms
+	var idx int64
 	for i := 0; i < len(indexPart); i++ {
-		idx = idx*10 + int(indexPart[i]-'0')
+		digit := int64(indexPart[i] - '0')
+		idx = idx*10 + digit
+		// Check for overflow during accumulation
+		if idx > maxSafeIndex {
+			return "", -1, false
+		}
 	}
 
-	return path[:lastDot], idx, true
+	return path[:lastDot], int(idx), true
 }

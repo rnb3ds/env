@@ -10,29 +10,27 @@
 
 ---
 
-## Overview
+## 📋 Overview
 
-**Env** is a production-ready, zero-dependency, thread-safe Go library for environment variable management, focusing on **security**, **concurrency**, and **developer experience**. It supports `.env`, `.json`, and `.yaml` formats with automatic type conversion and secure memory handling.
+**Env** is a production-ready, zero-dependency, thread-safe Go library for environment variable management. It focuses on **security**, **concurrency**, and **developer experience**.
 
----
-
-## Core Features
+### ✨ Highlights
 
 | Feature | Description |
 |:--------|:------------|
 | 🚀 **One-Line Setup** | `env.Load(".env")` loads and applies to `os.Environ` |
 | 🔒 **Type Safety** | `GetString`, `GetInt`, `GetBool`, `GetDuration`, `GetSlice[T]` |
-| 📁 **Multi-Format Support** | Auto-detect `.env`, `.json`, `.yaml` files |
-| ⚡ **Thread Safety** | Sharded storage (8 shards) + RWMutex, optimized for high concurrency |
-| 🛡️ **Memory Safety** | `SecureValue` auto-zeroes sensitive data, supports memory pooling |
-| 🔄 **Variable Expansion** | Full support for `${VAR}` syntax with default values |
-| 📝 **Audit Logging** | Built-in JSON/Log/Channel handlers for compliance requirements |
-| 🧪 **Testing Support** | Isolated loaders for test isolation |
+| 📁 **Multi-Format** | Auto-detect `.env`, `.json`, `.yaml` files |
+| ⚡ **Thread Safety** | Sharded storage (8 shards) + RWMutex for high concurrency |
+| 🛡️ **Secure Memory** | `SecureValue` auto-zeroes sensitive data with memory pooling |
+| 🔄 **Variable Expansion** | Full `${VAR}` syntax with default values |
+| 📝 **Audit Logging** | Built-in JSON/Log/Channel handlers for compliance |
+| 🧪 **Testing Ready** | Isolated loaders for test isolation |
 | 📦 **Zero Dependencies** | Standard library only |
 
 ---
 
-## Installation
+## 📦 Installation
 
 ```bash
 go get github.com/cybergodev/env
@@ -42,22 +40,22 @@ go get github.com/cybergodev/env
 
 ---
 
-## Quick Start
+## 🚀 Quick Start (2 Minutes)
 
 ### Step 1: Create a `.env` file
 
 ```env
-# Application configuration
+# Application
 APP_NAME=myapp
 APP_PORT=8080
 DEBUG=true
 
-# Database configuration
+# Database
 DB_HOST=localhost
 DB_PORT=5432
 DB_PASSWORD=secret123
 
-# Timeout settings
+# Timeouts
 TIMEOUT=30s
 ```
 
@@ -75,26 +73,109 @@ import (
 )
 
 func main() {
-    // One-line load and apply
+    // One-line load and apply to os.Environ
     if err := env.Load(".env"); err != nil {
-        log.Printf("Warning: %v", err) // Missing file doesn't cause error by default
+        log.Fatalf("Failed to load: %v", err)
     }
 
-    // Type-safe access (with defaults)
+    // Type-safe access with defaults
     port    := env.GetInt("APP_PORT", 8080)
     debug   := env.GetBool("DEBUG", false)
     timeout := env.GetDuration("TIMEOUT", 30*time.Second)
-    hosts   := env.GetSlice[string]("HOSTS", []string{"localhost"})
 
     fmt.Printf("Server: %s:%d\n", env.GetString("APP_NAME", "unknown"), port)
     fmt.Printf("Debug: %v, Timeout: %v\n", debug, timeout)
-    fmt.Printf("Hosts: %v\n", hosts)
 }
 ```
 
 ---
 
-## Multi-Format Support
+## 📚 Usage Guide
+
+### Basic Operations
+
+```go
+// Load multiple files (later files override earlier ones)
+env.Load(".env", "config.json", ".env.local")
+
+// Check existence
+value, exists := env.Lookup("KEY")
+if !exists {
+    // Handle missing key
+}
+
+// CRUD operations
+env.Set("KEY", "value")           // Set value (returns error)
+env.Delete("KEY")                 // Delete key (returns error)
+keys := env.Keys()                // Get all keys
+all := env.All()                  // Get all variables as map
+count := env.Len()                // Variable count
+```
+
+### Type Access
+
+```go
+// String (with default)
+name := env.GetString("APP_NAME", "default-app")
+
+// Integer (returns int64)
+port := env.GetInt("PORT", 8080)
+
+// Boolean - supports: true/1/yes/on/enabled, false/0/no/off/disabled
+debug := env.GetBool("DEBUG", false)
+
+// Duration
+timeout := env.GetDuration("TIMEOUT", 30*time.Second)
+
+// Generic slice: string, int, int64, uint, uint64, bool, float64, time.Duration
+hosts := env.GetSlice[string]("HOSTS", []string{"localhost"})
+ports := env.GetSlice[int]("PORTS", []int{8080})
+```
+
+### Struct Mapping
+
+```go
+type Config struct {
+    Port    int           `env:"PORT" envDefault:"8080"`
+    Debug   bool          `env:"DEBUG" envDefault:"false"`
+    Timeout time.Duration `env:"TIMEOUT"`
+    Origins []string      `env:"CORS_ORIGINS"`
+}
+
+var cfg Config
+if err := env.Load(".env"); err != nil {
+    log.Fatal(err)
+}
+if err := env.ParseInto(&cfg); err != nil {
+    log.Fatal(err)
+}
+```
+
+### Loader API (Fine-grained Control)
+
+```go
+cfg := env.ProductionConfig()
+cfg.Filenames = []string{"/etc/app/.env"}
+
+loader, err := env.New(cfg)
+if err != nil {
+    log.Fatal(err)
+}
+defer loader.Close()
+
+// Load additional files
+loader.LoadFiles("override.env")
+
+// Apply to os.Environ
+loader.Apply()
+
+// Access values
+port := loader.GetInt("PORT", 8080)
+```
+
+---
+
+## 📁 Multi-Format Support
 
 ### .env Files
 
@@ -107,6 +188,9 @@ DEBUG=true
 # Quotes are optional
 MESSAGE="Hello World"
 SINGLE='Single quotes work too'
+
+# Variable expansion
+URL=${HOST}:${PORT:-443}
 ```
 
 ### JSON (Auto-flattened)
@@ -139,76 +223,7 @@ ports: [8080, 8081]
 
 ---
 
-## Usage Guide
-
-### Basic Operations
-
-```go
-// Load multiple files (later files override earlier ones)
-env.Load(".env", "config.json", ".env.local")
-
-// Check existence
-value, exists := env.Lookup("KEY")
-if !exists {
-    // Handle missing key
-}
-
-// CRUD operations
-env.Set("KEY", "value")    // Set value
-env.Delete("KEY")          // Delete key
-keys := env.Keys()         // Get all keys
-all := env.All()           // Get all variables
-count := env.Len()         // Variable count
-```
-
-### Type Access
-
-```go
-// String (with default)
-name := env.GetString("APP_NAME", "default-app")
-
-// Integer (returns int64)
-port := env.GetInt("PORT", 8080)
-
-// Boolean
-debug := env.GetBool("DEBUG", false)
-
-// Duration
-timeout := env.GetDuration("TIMEOUT", 30*time.Second)
-
-// Generic slice: string, int, int64, uint, uint64, bool, float64, time.Duration
-hosts := env.GetSlice[string]("HOSTS", []string{"localhost"})
-ports := env.GetSlice[int]("PORTS", []int{8080})
-delays := env.GetSlice[time.Duration]("DELAYS", nil)
-```
-
-**Supported Boolean Values:**
-
-- **True**: `true`, `1`, `yes`, `on`, `enabled`
-- **False**: `false`, `0`, `no`, `off`, `disabled`
-
-### Struct Mapping
-
-```go
-type Config struct {
-    Port    int           `env:"PORT" envDefault:"8080"`
-    Debug   bool          `env:"DEBUG" envDefault:"false"`
-    Timeout time.Duration `env:"TIMEOUT"`
-    Origins []string      `env:"CORS_ORIGINS"`
-}
-
-var cfg Config
-if err := env.Load(".env"); err != nil {
-    log.Fatal(err)
-}
-if err := env.ParseInto(&cfg); err != nil {
-    log.Fatal(err)
-}
-```
-
-### Serialization/Deserialization
-
-> Supported formats: `FormatEnv`, `FormatJSON`, `FormatYAML`, `FormatAuto`
+## 🔄 Serialization / Deserialization
 
 ```go
 // Map to format string
@@ -231,7 +246,9 @@ env.UnmarshalInto(m, &config)               // Map to struct
 env.UnmarshalStruct("PORT=8080\nDEBUG=true", &config, env.FormatEnv)
 ```
 
-### Variable Expansion
+---
+
+## 🔄 Variable Expansion
 
 `.env` files fully support `${VAR}` syntax:
 
@@ -252,29 +269,9 @@ NAME=${NAME-default}
 FULL_URL=https://${HOST}:${PORT:-443}
 ```
 
-### Loader API (Fine-grained Control)
+---
 
-```go
-cfg := env.ProductionConfig()
-cfg.Filenames = []string{"/etc/app/.env"}
-
-loader, err := env.New(cfg)
-if err != nil {
-    log.Fatal(err)
-}
-defer loader.Close()
-
-// Load additional files
-loader.LoadFiles("override.env")
-
-// Apply to os.Environ
-loader.Apply()
-
-// Access values
-port := loader.GetInt("PORT", 8080)
-```
-
-### Secure Value Handling
+## 🔒 Secure Value Handling
 
 Use `SecureValue` for sensitive data like passwords, API keys, and tokens:
 
@@ -282,6 +279,8 @@ Use `SecureValue` for sensitive data like passwords, API keys, and tokens:
 // Get SecureValue
 sv := env.GetSecure("API_KEY")
 if sv != nil {
+    defer sv.Release()
+
     // Safe logging
     fmt.Println(sv.Masked())       // [SECURE:32 bytes]
 
@@ -291,9 +290,6 @@ if sv != nil {
     // Get bytes (caller must clean up)
     data := sv.Bytes()
     defer env.ClearBytes(data)     // Manual zeroing
-
-    // Cleanup
-    sv.Close()                     // or sv.Release() to return to pool
 }
 
 // Create SecureValue directly
@@ -301,7 +297,22 @@ secret := env.NewSecureValue("super_secret")
 defer secret.Release()
 ```
 
-### Audit Logging
+### SecureValue Methods
+
+| Method | Description |
+|:-------|:------------|
+| `String()` | Get string value |
+| `Bytes()` | Get byte slice copy (caller must clean up) |
+| `Length()` | Get value length |
+| `Masked()` | Get masked representation for logging |
+| `Close()` | Zero memory, don't return to pool |
+| `Release()` | Zero memory and return to pool |
+| `IsClosed()` | Check if closed |
+| `IsMemoryLocked()` | Check if memory is protected from swap |
+
+---
+
+## 📝 Audit Logging
 
 ```go
 cfg := env.ProductionConfig()
@@ -321,7 +332,9 @@ env.NewChannelAuditHandler(ch)  // Channel (external processing)
 env.NewNopAuditHandler()        // No-op (discard)
 ```
 
-### Testing Support
+---
+
+## 🧪 Testing Support
 
 ```go
 func TestConfig(t *testing.T) {
@@ -348,77 +361,38 @@ func TestMain(m *testing.M) {
 
 ---
 
-## API Reference
+## 🛠️ Utility Functions
 
-### Package Functions
+```go
+// Sensitive key detection
+env.IsSensitiveKey("API_SECRET")  // true
+env.IsSensitiveKey("HOST")        // false
 
-| Function | Description |
-|:---------|:------------|
-| `Load(files...)` | Load files and apply to `os.Environ` |
-| `GetString(key, def...)` | Get string value |
-| `GetInt(key, def...)` | Get `int64` value |
-| `GetBool(key, def...)` | Get boolean value |
-| `GetDuration(key, def...)` | Get duration value |
-| `GetSlice[T](key, def...)` | Get generic slice |
-| `GetSliceFrom[T](loader, key, def...)` | Get slice from specific loader |
-| `Lookup(key)` | Get value + existence check |
-| `Set(key, value)` | Set value (returns error) |
-| `Delete(key)` | Delete key (returns error) |
-| `Keys()` | Get all keys |
-| `All()` | Get all variables as map |
-| `Len()` | Get variable count |
-| `GetSecure(key)` | Get `SecureValue` for sensitive data |
-| `Validate()` | Validate required keys |
-| `ParseInto(&struct)` | Populate struct from env vars |
-| `Marshal(data, format?)` | Convert map/struct to format string |
-| `UnmarshalMap(string, format?)` | Parse format string to map |
-| `UnmarshalStruct(string, &struct, format?)` | Parse string to struct |
-| `UnmarshalInto(map, &struct)` | Populate struct from map |
-| `MarshalStruct(struct)` | Convert struct to map |
-| `New(cfg)` | Create new loader with config |
-| `NewSecureValue(string)` | Create SecureValue from string |
-| `ResetDefaultLoader()` | Reset singleton (for testing) |
-| `ClearBytes([]byte)` | Securely zero byte slice |
+// Value masking
+env.MaskValue("API_KEY", "secret123")  // "***"
 
-### Utility Functions
+// Key masking for logging
+env.MaskKey("DB_PASSWORD")  // "DB_***"
 
-| Function | Description |
-|:---------|:------------|
-| `IsSensitiveKey(key)` | Check if key contains sensitive pattern |
-| `MaskValue(key, value)` | Mask value based on key sensitivity |
-| `MaskKey(key)` | Mask key name for logging |
-| `MaskSensitiveInString(s)` | Mask sensitive content in string |
-| `SanitizeForLog(s)` | Remove sensitive info for logging |
-| `DetectFormat(filename)` | Detect file format by extension |
+// String sanitization
+safe := env.SanitizeForLog(userInput)
 
-### Loader Methods
+// Format detection
+env.DetectFormat("config.yaml")  // FormatYAML
+```
 
-| Method | Description |
-|:-------|:------------|
-| `LoadFiles(files...)` | Load files into loader |
-| `Apply()` | Apply to `os.Environ` |
-| `Validate()` | Validate required keys |
-| `Close()` | Close and cleanup resources |
-| `IsApplied()` | Check if applied to os.Environ |
-| `IsClosed()` | Check if closed |
-| `LoadTime()` | Get last load time |
-| `Config()` | Get loader configuration |
+### Sensitive Key Patterns
 
-### SecureValue Methods
+Automatically detected (case-insensitive):
 
-| Method | Description |
-|:-------|:------------|
-| `String()` | Get string value |
-| `Bytes()` | Get byte slice (copy - caller must clean up) |
-| `Length()` | Get value length |
-| `Masked()` | Get masked representation for logging |
-| `Close()` | Zero memory, don't return to pool |
-| `Release()` | Zero memory and return to pool |
-| `IsClosed()` | Check if closed |
+```
+*password*, *secret*, *key*, *token*, *credential*,
+*api_key*, *private*, *auth*, *session*, *access*
+```
 
 ---
 
-## Configuration Options
+## ⚙️ Configuration
 
 ### Preset Configurations
 
@@ -466,12 +440,10 @@ cfg.MaxLineLength     = 1024
 cfg.MaxKeyLength      = 64
 cfg.MaxValueLength    = 4096
 cfg.MaxExpansionDepth = 5
-cfg.JSONNullAsEmpty   = true
-cfg.YAMLNullAsEmpty   = true
 
-// === Security Settings ===
-cfg.KeyPattern        = nil  // nil = fast validation (recommended)
-cfg.AllowExportPrefix = false
+// === JSON/YAML Options ===
+cfg.JSONNullAsEmpty = true
+cfg.YAMLNullAsEmpty = true
 
 // === Advanced Options ===
 cfg.Prefix     = "APP_"      // Only load keys with prefix
@@ -495,7 +467,54 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 
 ---
 
-## Security Features
+## 📖 API Reference
+
+### Package Functions
+
+| Function | Description |
+|:---------|:------------|
+| `Load(files...)` | Load files and apply to `os.Environ` |
+| `GetString(key, def...)` | Get string value |
+| `GetInt(key, def...)` | Get `int64` value |
+| `GetBool(key, def...)` | Get boolean value |
+| `GetDuration(key, def...)` | Get duration value |
+| `GetSlice[T](key, def...)` | Get generic slice |
+| `GetSliceFrom[T](loader, key, def...)` | Get slice from specific loader |
+| `Lookup(key)` | Get value + existence check |
+| `Set(key, value)` | Set value (returns error) |
+| `Delete(key)` | Delete key (returns error) |
+| `Keys()` | Get all keys |
+| `All()` | Get all variables as map |
+| `Len()` | Get variable count |
+| `GetSecure(key)` | Get `SecureValue` for sensitive data |
+| `Validate()` | Validate required keys |
+| `ParseInto(&struct)` | Populate struct from env vars |
+| `Marshal(data, format?)` | Convert map/struct to format string |
+| `UnmarshalMap(string, format?)` | Parse format string to map |
+| `UnmarshalStruct(string, &struct, format?)` | Parse string to struct |
+| `UnmarshalInto(map, &struct)` | Populate struct from map |
+| `MarshalStruct(struct)` | Convert struct to map |
+| `New(cfg)` | Create new loader with config |
+| `NewSecureValue(string)` | Create SecureValue from string |
+| `ResetDefaultLoader()` | Reset singleton (for testing) |
+| `ClearBytes([]byte)` | Securely zero byte slice |
+
+### Loader Methods
+
+| Method | Description |
+|:-------|:------------|
+| `LoadFiles(files...)` | Load files into loader |
+| `Apply()` | Apply to `os.Environ` |
+| `Validate()` | Validate required keys |
+| `Close()` | Close and cleanup resources |
+| `IsApplied()` | Check if applied to os.Environ |
+| `IsClosed()` | Check if closed |
+| `LoadTime()` | Get last load time |
+| `Config()` | Get loader configuration |
+
+---
+
+## 🛡️ Security Features
 
 | Feature | Description |
 |:--------|:------------|
@@ -507,33 +526,9 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | **Secure Memory** | `SecureValue` zeroes memory on GC/cleanup |
 | **Path Traversal Protection** | Block `..`, absolute paths, UNC paths |
 
-### Sensitive Key Patterns
-
-Automatically detected patterns (case-insensitive):
-
-```
-*password*, *secret*, *key*, *token*, *credential*,
-*api_key*, *private*, *auth*, *session*, *access*
-```
-
-```go
-// Sensitive key detection
-env.IsSensitiveKey("API_SECRET")  // true
-env.IsSensitiveKey("HOST")        // false
-
-// Value masking
-env.MaskValue("API_KEY", "secret123")  // "***"
-
-// Key masking for logging
-env.MaskKey("DB_PASSWORD")  // "DB_***"
-
-// Safe log handling
-safe := env.SanitizeForLog(userInput)
-```
-
 ---
 
-## Performance
+## ⚡ Performance
 
 | Metric | Value |
 |:-------|:------|
@@ -544,7 +539,7 @@ safe := env.SanitizeForLog(userInput)
 
 ---
 
-## Examples
+## 📁 Examples
 
 See the [examples](examples) directory for complete example code:
 
@@ -557,10 +552,11 @@ See the [examples](examples) directory for complete example code:
 | [05_secure_values.go](examples/05_secure_values.go) | Secure handling |
 | [06_audit_logging.go](examples/06_audit_logging.go) | Audit logging |
 | [07_marshal_unmarshal.go](examples/07_marshal_unmarshal.go) | Serialization |
+| [08_utilities.go](examples/08_utilities.go) | Utility functions |
 
 ---
 
-## License
+## 📄 License
 
 MIT License - See [LICENSE](LICENSE) file for details.
 

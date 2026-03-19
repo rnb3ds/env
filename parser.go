@@ -284,18 +284,16 @@ func parseString(s string) (map[string]string, error) {
 		return nil, err
 	}
 
-	// Use defer to ensure cleanup even if Parse panics
-	defer func() {
-		// Close the parser which will close the factory since ownsFactory=true
-		if err := p.Close(); err != nil {
-			// Log cleanup error but don't panic - production safety is paramount
-			_ = p.auditor.LogError(internal.ActionError, "", "parser cleanup failed: "+err.Error())
-		}
-		p.clear()
-		parserPool.Put(p)
-	}()
-
 	// Parse and return result
 	result, err := p.Parse(strings.NewReader(s), "")
+
+	// Cleanup after parsing (explicit, not in defer, for clearer flow)
+	if closeErr := p.Close(); closeErr != nil && err == nil {
+		// Only log cleanup error if Parse succeeded (don't mask Parse errors)
+		_ = p.auditor.LogError(internal.ActionError, "", "parser cleanup failed: "+closeErr.Error())
+	}
+	p.clear()
+	parserPool.Put(p)
+
 	return result, err
 }

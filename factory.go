@@ -1,6 +1,7 @@
 package env
 
 import (
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,7 +44,9 @@ func (a *auditorAdapter) LogWithDuration(action AuditAction, key, reason string,
 
 // Close implements AuditLogger.
 func (a *auditorAdapter) Close() error {
-	if a == nil {
+	// Check both a and a.auditor for nil safety
+	// newAuditorAdapter guarantees non-nil auditor, but be defensive
+	if a == nil || a.auditor == nil {
 		return nil
 	}
 	return a.auditor.Close()
@@ -59,6 +62,9 @@ type ComponentFactory struct {
 	closed    atomic.Bool
 	mu        sync.Mutex // Protects auditor.Close()
 }
+
+// Compile-time check that ComponentFactory implements io.Closer.
+var _ io.Closer = (*ComponentFactory)(nil)
 
 // Validator returns the validator component.
 func (f *ComponentFactory) Validator() Validator {

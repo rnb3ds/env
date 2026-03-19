@@ -8,7 +8,19 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
+)
+
+// Compile-time checks that handlers implement io.Closer.
+var (
+	_ io.Closer = (*JSONHandler)(nil)
+	_ io.Closer = (*LogHandler)(nil)
+	_ io.Closer = (*ChannelHandler)(nil)
+	_ io.Closer = (*NopHandler)(nil)
+	_ io.Closer = (*CloseableChannelHandler)(nil)
+	_ io.Closer = (*BufferedHandler)(nil)
+	_ io.Closer = (*Auditor)(nil)
 )
 
 // Action represents the type of action being audited.
@@ -123,13 +135,35 @@ func (h *LogHandler) Close() error {
 }
 
 // ChannelHandler sends audit events to a channel.
-// Note: This handler blocks if the channel buffer is full.
+//
+// Channel Ownership: This handler does NOT own the channel. The caller is
+// responsible for closing the channel when done. The handler's Close() method
+// does nothing because closing a send-only channel (chan<-) would panic if
+// the caller hasn't finished receiving.
+//
+// Blocking Behavior: This handler blocks if the channel buffer is full.
 // Use a buffered channel if non-blocking behavior is required.
+//
+// Example:
+//
+//	ch := make(chan Event, 100)
+//	handler := NewChannelHandler(ch)
+//	// Start consumer goroutine
+//	go func() {
+//	    for event := range ch {
+//	        process(event)
+//	    }
+//	}()
+//	// ... use handler ...
+//	handler.Close() // Does NOT close ch
+//	close(ch)       // Caller must close the channel to signal EOF to receiver
 type ChannelHandler struct {
 	ch chan<- Event
 }
 
-// NewChannelHandler creates a new ChannelHandler.
+// NewChannelHandler creates a new ChannelHandler that sends events to the
+// provided channel. The caller retains ownership of the channel and must
+// close it when finished to signal EOF to receivers.
 func NewChannelHandler(ch chan<- Event) *ChannelHandler {
 	return &ChannelHandler{ch: ch}
 }
@@ -142,8 +176,83 @@ func (h *ChannelHandler) Log(event Event) error {
 }
 
 // Close implements Handler.
+// NOTE: This method does NOT close the underlying channel because the handler
+// does not own it. The caller must close the channel separately.
 func (h *ChannelHandler) Close() error {
 	return nil
+}
+
+// CloseableChannelHandler sends audit events to a channel and owns the channel
+// lifecycle. Unlike ChannelHandler, this handler creates its own channel and
+// closes it when Close() is called.
+//
+// This is useful when you want the handler to manage the complete lifecycle
+// of the channel, ensuring receivers are properly signaled when the handler
+// is closed.
+//
+// Example:
+//
+//	handler := NewCloseableChannelHandler(100)
+//	// Get the channel for receiving
+//	ch := handler.Channel()
+//	// Start consumer goroutine
+//	go func() {
+//	    for event := range ch {
+//	        process(event)
+//	    }
+//	    fmt.Println("Channel closed, consumer exiting")
+//	}()
+//	// ... use handler ...
+//	handler.Close() // Closes the channel, consumer goroutine exits gracefully
+type CloseableChannelHandler struct {
+	ch     chan Event
+	closed atomic.Bool
+}
+
+// NewCloseableChannelHandler creates a new CloseableChannelHandler with a
+// buffered channel of the specified size. The handler owns the channel and
+// will close it when Close() is called.
+func NewCloseableChannelHandler(bufferSize int) *CloseableChannelHandler {
+	if bufferSize < 0 {
+		bufferSize = 0
+	}
+	return &CloseableChannelHandler{
+		ch: make(chan Event, bufferSize),
+	}
+}
+
+// Channel returns the underlying channel for receiving events.
+// The returned channel will be closed when Close() is called.
+func (h *CloseableChannelHandler) Channel() <-chan Event {
+	return h.ch
+}
+
+// Log sends an audit event to the channel.
+// Returns an error if the handler has been closed.
+// This method blocks if the channel is full.
+func (h *CloseableChannelHandler) Log(event Event) error {
+	if h.closed.Load() {
+		return fmt.Errorf("handler is closed")
+	}
+
+	h.ch <- event
+	return nil
+}
+
+// Close implements Handler.
+// Closes the underlying channel, signaling to any receivers that no more
+// events will be sent. Safe to call multiple times.
+func (h *CloseableChannelHandler) Close() error {
+	if h.closed.Swap(true) {
+		return nil // Already closed
+	}
+	close(h.ch)
+	return nil
+}
+
+// IsClosed returns true if the handler has been closed.
+func (h *CloseableChannelHandler) IsClosed() bool {
+	return h.closed.Load()
 }
 
 // NopHandler discards all audit events.
@@ -413,44 +522,41 @@ func (h *BufferedHandler) flushLoop() {
 // If the buffer is full, it triggers an automatic flush.
 func (h *BufferedHandler) Log(event Event) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	if h.stopped {
+		h.mu.Unlock()
 		return fmt.Errorf("buffered handler is closed")
 	}
 
 	h.buffer = append(h.buffer, event)
+	shouldFlush := len(h.buffer) >= h.size
 
-	// Check if buffer is full
-	if len(h.buffer) >= h.size {
-		return h.flushLocked()
+	h.mu.Unlock()
+
+	// Flush outside of lock to allow concurrent Log() calls
+	if shouldFlush {
+		return h.Flush()
 	}
-
 	return nil
 }
 
 // Flush writes all buffered events to the underlying handler.
 // It clears the buffer after successful write.
+// This method is safe for concurrent use.
 func (h *BufferedHandler) Flush() error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.flushLocked()
-}
 
-// flushLocked flushes the buffer. Must be called with h.mu held.
-func (h *BufferedHandler) flushLocked() error {
 	if len(h.buffer) == 0 {
+		h.mu.Unlock()
 		return nil
 	}
 
-	// Copy buffer to avoid holding lock during write
+	// Take ownership of buffer and create new one
 	events := h.buffer
 	h.buffer = make([]Event, 0, h.size)
 
-	// Write events to underlying handler
-	// Release lock during write to allow concurrent Log() calls
+	// Release lock before I/O to allow concurrent Log() calls
 	h.mu.Unlock()
-	defer h.mu.Lock()
 
 	var lastErr error
 	for _, event := range events {

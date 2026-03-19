@@ -86,18 +86,11 @@ func demonstrateStructWithDefaults() {
 }
 
 func demonstrateNestedStruct() {
-	// Nested structs use underscore-separated keys
-	data := map[string]string{
-		"APP_NAME":  "myapp",
-		"APP_PORT":  "9090",
-		"APP_DEBUG": "true",
-		"DB_HOST":   "localhost",
-		"DB_PORT":   "3306",
-	}
-
+	// Nested structs are populated from loaded environment variables
+	// The env tags map flat keys to nested struct fields
 	var cfg FullConfig
-	if err := env.UnmarshalInto(data, &cfg); err != nil {
-		log.Fatalf("Failed to unmarshal: %v", err)
+	if err := env.ParseInto(&cfg); err != nil {
+		log.Fatalf("Failed to parse: %v", err)
 	}
 
 	fmt.Printf("App.Name: %s\n", cfg.App.Name)

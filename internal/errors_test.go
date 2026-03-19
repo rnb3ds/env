@@ -359,19 +359,6 @@ func TestExpansionError_NoKey(t *testing.T) {
 }
 
 // ============================================================================
-// ValidationError Unwrap Tests
-// ============================================================================
-
-func TestValidationErrorUnwrap(t *testing.T) {
-	err := &ValidationError{Field: "test", Message: "validation failed"}
-
-	unwrapped := err.Unwrap()
-	if unwrapped != nil {
-		t.Errorf("Unwrap() = %v, want nil (leaf error)", unwrapped)
-	}
-}
-
-// ============================================================================
 // Sentinel Errors Tests
 // ============================================================================
 

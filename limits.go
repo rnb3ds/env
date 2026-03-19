@@ -67,6 +67,11 @@ const (
 var DefaultKeyPattern *regexp.Regexp = nil
 
 // DefaultForbiddenKeys contains keys that could affect system behavior.
+// These keys are forbidden by default to prevent:
+//   - PATH injection attacks
+//   - Library preloading attacks (LD_PRELOAD, LD_LIBRARY_PATH, DYLD_*)
+//   - Shell escape attacks (SHELL, ENV, BASH_ENV, IFS)
+//   - Language-specific injection (PYTHONPATH, PERL5OPT, RUBYLIB, NODE_PATH)
 var DefaultForbiddenKeys = map[string]bool{
 	"PATH":                  true,
 	"LD_PRELOAD":            true,

@@ -20,6 +20,14 @@ const (
 	ModeAll
 )
 
+// braceOperators is a lookup table for valid brace expansion operators.
+// Used for O(1) operator validation in expandBracedVariable.
+var braceOperators = [256]bool{
+	'-': true, // ${VAR:-default}
+	'=': true, // ${VAR:=default}
+	'?': true, // ${VAR:?error}
+}
+
 // visitedMapPool provides a pool of reusable visited maps for cycle detection.
 // This reduces allocations during recursive expansion and cycle detection.
 var visitedMapPool = sync.Pool{
@@ -45,13 +53,13 @@ func putVisitedMap(m map[string]bool) {
 		return
 	}
 	// Check size before clearing - we want to avoid pooling very large maps
-	// that could waste memory. After deletion, len(m) will be 0, so check now.
+	// that could waste memory. After clear(), len(m) will be 0, so check now.
 	size := len(m)
 
-	// Clear the map for reuse
-	for k := range m {
-		delete(m, k)
-	}
+	// SECURITY: Use clear() builtin (Go 1.21+) for guaranteed complete clearing.
+	// This is O(1) and atomic, preventing partial clears that could leave stale
+	// entries from previous expansions (which could cause false positive cycle detection).
+	clear(m)
 
 	// Don't pool very large maps (check original size before clearing)
 	// Use <= to include maps at exactly MaxPooledMapSize
@@ -140,7 +148,9 @@ func (e *Expander) Expand(s string) (string, error) {
 	}
 
 	// Fast path: single variable reference at the start with no other variables
-	if dollarIdx == 0 && strings.IndexByte(s[1:], '$') == -1 {
+	// We need len(s) >= 2 for a valid variable reference ($X or ${...})
+	// This is guaranteed by the earlier len(s) == 1 check, but we make it explicit
+	if dollarIdx == 0 && len(s) >= 2 && strings.IndexByte(s[1:], '$') == -1 {
 		return e.expandSingleVar(s)
 	}
 
@@ -152,47 +162,44 @@ func (e *Expander) Expand(s string) (string, error) {
 
 // expandSingleVar handles the common case of a single variable reference.
 // This is an optimized path that avoids builder allocation for simple cases.
-// Precondition: len(s) >= 2 (caller is responsible for ensuring this)
+//
+// Precondition: len(s) >= 2 and s[0] == '$' (caller is responsible for ensuring this)
 func (e *Expander) expandSingleVar(s string) (string, error) {
 	// Note: Caller (Expand) guarantees len(s) >= 2, so we skip the check here
+	visited := getVisitedMap()
+	defer putVisitedMap(visited)
+
+	// clearVisited clears the visited map for reuse in fallback expansion.
+	// This avoids false cycle detection from partial expansion attempts.
+	clearVisited := func() {
+		clear(visited)
+	}
 
 	if s[1] == '{' {
 		// ${VAR} syntax
-		visited := getVisitedMap()
 		expanded, consumed, err := e.expandBracedVariable(s, 0, visited)
 		if err != nil {
-			putVisitedMap(visited)
 			return "", err
 		}
 		// If the entire string was consumed, return the expansion
 		if consumed == len(s) {
-			putVisitedMap(visited)
 			return expanded, nil
 		}
-		// Otherwise fall back to full expansion with a fresh visited map
-		// to avoid false cycle detection from the partial expansion above
-		putVisitedMap(visited)
-		visited = getVisitedMap()
-		defer putVisitedMap(visited)
+		// Otherwise fall back to full expansion with a cleared visited map
+		clearVisited()
 		return e.expandWithDepth(s, 0, visited)
 	}
 
 	// $VAR syntax
-	visited := getVisitedMap()
 	expanded, consumed, err := e.expandSimpleVariable(s, 0, visited)
 	if err != nil {
-		putVisitedMap(visited)
 		return "", err
 	}
 	if consumed == len(s) {
-		putVisitedMap(visited)
 		return expanded, nil
 	}
-	// Otherwise fall back to full expansion with a fresh visited map
-	// to avoid false cycle detection from the partial expansion above
-	putVisitedMap(visited)
-	visited = getVisitedMap()
-	defer putVisitedMap(visited)
+	// Otherwise fall back to full expansion with a cleared visited map
+	clearVisited()
 	return e.expandWithDepth(s, 0, visited)
 }
 
@@ -207,41 +214,50 @@ func (e *Expander) expandWithDepth(s string, depth int, visited map[string]bool)
 		}
 	}
 
-	// Estimate capacity by counting potential variable references
-	// Use a more conservative estimate to avoid over-allocation
+	// Fast path: count variables and check for escaped dollars in single pass
 	varCount := 0
+	hasEscapedDollar := false
 	for i := 0; i < len(s); i++ {
-		if s[i] == '$' && i+1 < len(s) && s[i+1] != '$' {
-			varCount++
+		if s[i] == '$' && i+1 < len(s) {
+			if s[i+1] == '$' {
+				hasEscapedDollar = true
+				i++ // Skip next $
+			} else {
+				varCount++
+			}
 		}
 	}
 
-	// Fast path: no variable references (but may have escaped dollars)
-	// Need to check for $$ which should become $
+	// Fast path: no variable references
 	if varCount == 0 {
-		// Check for escaped dollars ($$)
-		hasEscapedDollar := false
-		for i := 0; i < len(s); i++ {
-			if s[i] == '$' && i+1 < len(s) && s[i+1] == '$' {
-				hasEscapedDollar = true
-				break
-			}
-		}
 		if !hasEscapedDollar {
 			return s, nil
 		}
+		// Only escaped dollars - simple replacement
+		result := GetBuilder()
+		defer PutBuilder(result)
+		result.Grow(len(s))
+		for i := 0; i < len(s); i++ {
+			if s[i] == '$' && i+1 < len(s) && s[i+1] == '$' {
+				result.WriteByte('$')
+				i++
+			} else {
+				result.WriteByte(s[i])
+			}
+		}
+		return result.String(), nil
 	}
 
-	// Base capacity: original string length
-	// Add buffer for variable expansions (assume average 8 chars per variable)
-	// More conservative than 16 to reduce over-allocation
-	initialCap := len(s) + varCount*8
+	// Estimate capacity: use a more conservative estimate
+	// Base: original length + buffer for expansions
+	// Use 16 chars per variable as typical expansion size
+	initialCap := len(s) + varCount*16
 	if initialCap < 32 {
 		initialCap = 32
 	}
-	// Cap maximum initial allocation to prevent over-allocation
+	// Cap maximum initial allocation
 	if initialCap > 2048 {
-		initialCap = len(s) + len(s)/4
+		initialCap = len(s) + len(s)/2
 		if initialCap < 32 {
 			initialCap = 32
 		}
@@ -302,9 +318,23 @@ func (e *Expander) expandVariable(s string, depth int, visited map[string]bool) 
 }
 
 // expandBracedVariable expands ${VAR}, ${VAR:-default}, ${VAR:=default}, etc.
+// Handles nested braces correctly by counting brace depth.
 func (e *Expander) expandBracedVariable(s string, depth int, visited map[string]bool) (string, int, error) {
-	// Find the closing brace
-	end := strings.IndexByte(s, '}')
+	// Find the matching closing brace, handling nested braces
+	// We need to find '}' at depth 1 (not inside any nested braces)
+	braceDepth := 0
+	end := -1
+	for i := 0; i < len(s); i++ {
+		if s[i] == '{' {
+			braceDepth++
+		} else if s[i] == '}' {
+			braceDepth--
+			if braceDepth == 0 {
+				end = i
+				break
+			}
+		}
+	}
 	if end == -1 {
 		// No closing brace - return placeholder to avoid exposing variable names in logs
 		return "${...}", len(s), nil
@@ -321,16 +351,13 @@ func (e *Expander) expandBracedVariable(s string, depth int, visited map[string]
 	var hasDefault bool
 	var opType byte // '!' for :-, '=' for :=, '?' for :?
 
-	// Single scan to find colon operator
+	// Single scan to find colon operator using lookup table for O(1) validation
 	colonIdx := -1
 	for i := 0; i < len(content)-1; i++ {
-		if content[i] == ':' {
-			nextChar := content[i+1]
-			if nextChar == '-' || nextChar == '=' || nextChar == '?' {
-				colonIdx = i
-				opType = nextChar
-				break
-			}
+		if content[i] == ':' && braceOperators[content[i+1]] {
+			colonIdx = i
+			opType = content[i+1]
+			break
 		}
 	}
 
@@ -377,13 +404,15 @@ func (e *Expander) expandBracedVariable(s string, depth int, visited map[string]
 
 	// Look up the value
 	value, ok := e.lookup(key)
-	if !ok || value == "" {
+	if !ok {
+		// Variable not set - use default if available
 		if hasDefault {
 			value = defaultValue
 		} else {
 			return "", end + 1, nil // Return empty for unset variables
 		}
 	}
+	// Note: An empty string is a valid explicit value and should NOT trigger the default
 
 	// Mark as visited for cycle detection
 	visited[key] = true
@@ -444,7 +473,7 @@ func (e *Expander) expandSimpleVariable(s string, depth int, visited map[string]
 }
 
 // buildChain builds a string representation of the expansion chain for error messages.
-// Keys are sorted for deterministic output.
+// Keys are sorted for deterministic output. Sensitive keys are masked for security.
 func (e *Expander) buildChain(visited map[string]bool) string {
 	if len(visited) == 0 {
 		return ""
@@ -458,9 +487,14 @@ func (e *Expander) buildChain(visited map[string]bool) string {
 	sort.Strings(keys)
 
 	// Calculate total length to pre-allocate builder
+	// Account for potential key masking (masked keys are shorter)
 	totalLen := 0
 	for _, k := range keys {
-		totalLen += len(k)
+		if IsKey(k) {
+			totalLen += 5 // "***" + potential prefix
+		} else {
+			totalLen += len(k)
+		}
 	}
 	totalLen += (len(keys) - 1) * 4 // " -> " separator
 
@@ -470,7 +504,12 @@ func (e *Expander) buildChain(visited map[string]bool) string {
 		if i > 0 {
 			sb.WriteString(" -> ")
 		}
-		sb.WriteString(k)
+		// SECURITY: Mask sensitive keys in error messages
+		if IsKey(k) {
+			sb.WriteString(MaskKey(k))
+		} else {
+			sb.WriteString(k)
+		}
 	}
 	return sb.String()
 }

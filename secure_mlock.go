@@ -1,4 +1,3 @@
-// Package env provides cross-platform memory locking configuration.
 package env
 
 import (

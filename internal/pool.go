@@ -34,12 +34,22 @@ func GetBuilder() *strings.Builder {
 // PutBuilder returns a strings.Builder to the shared pool.
 // Builders with capacity exceeding MaxPooledBuilderSize are discarded
 // to prevent memory bloat.
+// The builder is reset before returning to pool for hygiene and to allow
+// GC to reclaim the previous string data.
+//
+// SECURITY NOTE: This function depends on strings.Builder.Reset() preserving
+// the underlying buffer capacity. The Go standard library guarantees this
+// behavior (Reset() only sets len to 0, does not free the buffer).
+// If this behavior changes, we would need explicit capacity tracking
+// to prevent pooling of oversized builders.
 func PutBuilder(sb *strings.Builder) {
 	if sb == nil {
 		return
 	}
+	// Reset before capacity check and pooling for hygiene
+	sb.Reset()
 	// Don't pool very large builders
-	if sb.Cap() < MaxPooledBuilderSize {
+	if sb.Cap() <= MaxPooledBuilderSize {
 		builderPool.Put(sb)
 	}
 }
@@ -71,6 +81,10 @@ func GetByteSlice() *[]byte {
 
 // PutByteSlice returns a byte slice to the pool.
 // Slices with capacity exceeding MaxPooledByteSliceSize are discarded.
+//
+// SECURITY NOTE: This function checks capacity before pooling to prevent
+// memory bloat from holding onto large buffers. The capacity check is
+// performed after resetting the slice length to 0.
 func PutByteSlice(buf *[]byte) {
 	if buf == nil {
 		return
@@ -106,17 +120,19 @@ func getKeysToUpperMap() map[string]bool {
 
 // putKeysToUpperMap returns a map to the pool after clearing it.
 // Maps with more entries than MaxPooledMapSize are discarded to prevent memory bloat.
+//
+// SECURITY NOTE: Size is checked BEFORE clearing because clear() sets len to 0.
+// We preserve the original size to make the pooling decision.
 func putKeysToUpperMap(m map[string]bool) {
 	if m == nil {
 		return
 	}
-	// Check size before clearing - after deletion len(m) will be 0
+	// Check size before clearing - after clear() len(m) will be 0
 	size := len(m)
 
-	// Clear the map for reuse
-	for k := range m {
-		delete(m, k)
-	}
+	// SECURITY: Use clear() builtin (Go 1.21+) for guaranteed complete clearing.
+	// This is O(1) and prevents partial clears that could leave stale entries.
+	clear(m)
 
 	// Don't pool very large maps (check original size before clearing)
 	// Use <= to include maps at exactly MaxPooledMapSize

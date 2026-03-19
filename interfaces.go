@@ -1,4 +1,3 @@
-// Package env provides a high-security environment variable library for Go 1.24+.
 package env
 
 import (

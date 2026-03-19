@@ -479,11 +479,18 @@ func (l *Lexer) scanQuotedString(quote byte) (string, error) {
 				buf.WriteByte('"')
 			case '\'':
 				buf.WriteByte('\'')
-			// SECURITY: \0 escape removed - null bytes are not allowed in values
-			// Null bytes can cause log injection, string truncation, and bypass security controls
-			// If a null byte is needed, it will be caught by ValidateValue()
+			// SECURITY: \0 escape is explicitly rejected at the lexer level for defense in depth.
+			// Null bytes can cause:
+			// - Log injection (log entries truncated at null byte)
+			// - String truncation vulnerabilities in C interop
+			// - Bypass of security controls that don't expect nulls
+			// This provides early rejection before value validation runs.
 			case '0':
-				// Ignore null byte escape - will be handled as invalid if validation is enabled
+				return "", &YAMLError{
+					Line:    l.line,
+					Column:  l.column,
+					Message: "null byte escape (\\0) is not allowed in YAML values",
+				}
 			default:
 				buf.WriteByte(escaped)
 			}

@@ -1,25 +1,105 @@
 // Package env provides a high-security environment variable library for Go 1.24+.
-// where security, concurrent access, and production-grade features are critical.
+// It is designed for applications where security, concurrent access, and production-grade
+// features are critical.
 //
-// Example usage:
+// The library supports multiple file formats (.env, JSON, YAML), secure memory handling
+// for sensitive values, comprehensive audit logging, and extensive validation.
+//
+// # Quick Start
+//
+// For simple use cases, use the package-level functions with Load:
+//
+//	err := env.Load(".env")
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	port := env.GetInt("PORT", 8080)
+//	host := env.GetString("DATABASE_HOST", "localhost")
+//
+// # Configuration-Based Usage
+//
+// For more control, create a Loader with custom configuration:
 //
 //	cfg := env.DefaultConfig()
 //	cfg.Filenames = []string{".env"}
 //	cfg.AutoApply = true
 //
-//	loader, err := env.New(cfg) // Files are auto-loaded
+//	loader, err := env.New(cfg)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
 //	defer loader.Close()
 //
-//	// GetString a value
 //	value := loader.GetString("DATABASE_URL")
+//
+// # Secure Value Handling
+//
+// For sensitive values like API keys and passwords, use SecureValue:
+//
+//	sv := loader.GetSecure("API_KEY")
+//	if sv != nil {
+//	    defer sv.Release()
+//	    data := sv.Bytes()
+//	    // use data securely
+//	    env.ClearBytes(data)
+//	}
+//
+// # Struct Mapping
+//
+// Map environment variables to structs using tags:
+//
+//	type Config struct {
+//	    Host string `env:"DB_HOST" envDefault:"localhost"`
+//	    Port int    `env:"DB_PORT" envDefault:"5432"`
+//	}
+//
+//	var cfg Config
+//	if err := env.ParseInto(&cfg); err != nil {
+//	    log.Fatal(err)
+//	}
+//
+// # Environment Presets
+//
+// The library provides preset configurations for different environments:
+//   - DefaultConfig: Secure defaults for general use
+//   - DevelopmentConfig: Relaxed limits, overwrite enabled
+//   - TestingConfig: Isolated, compact limits
+//   - ProductionConfig: Strict limits, audit enabled
+//
+// # File Format Support
+//
+// Supported file formats:
+//   - .env: Standard dotenv format with KEY=value pairs
+//   - .json: JSON files with nested structure (flattened with underscores)
+//   - .yaml/.yml: YAML files with nested structure (flattened with underscores)
+//
+// # Thread Safety
+//
+// All Loader methods are safe for concurrent use. The library uses sharded
+// locking for optimal performance in high-concurrency scenarios.
+//
+// # Error Types
+//
+// The library defines several error types for precise error handling:
+//   - ErrFileNotFound: File does not exist
+//   - ErrFileTooLarge: File exceeds size limit
+//   - ErrInvalidKey: Key format validation failed
+//   - ErrSecurityViolation: Security policy violation
+//   - ErrClosed: Loader has been closed
+//   - ParseError: Parsing failure with file/line info
+//   - ValidationError: Configuration or value validation failure
+//   - SecurityError: Security-related error
+//   - FileError: File operation error
+//   - ExpansionError: Variable expansion error
+//   - JSONError: JSON parsing error
+//   - YAMLError: YAML parsing error
+//   - MarshalError: Marshaling/unmarshaling error
 package env
 
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +110,8 @@ import (
 )
 
 // sliceElement is a type constraint for supported slice element types.
+// This constraint is used by GetSlice and GetSliceFrom functions to ensure
+// type-safe parsing of slice values from environment variables.
 type sliceElement interface {
 	string | int | int64 | uint | uint64 | bool | float64 | time.Duration
 }
@@ -57,25 +139,85 @@ type Loader struct {
 // Compile-time check that Loader implements EnvLoader.
 var _ EnvLoader = (*Loader)(nil)
 
+// Compile-time check that Loader implements io.Closer.
+var _ io.Closer = (*Loader)(nil)
+
+// isZeroConfig checks if a Config is its zero value (uninitialized).
+// This is used to determine if DefaultConfig() should be applied.
+//
+// Detection Strategy:
+// We check fields that are ALWAYS non-zero in DefaultConfig() but zero in an
+// uninitialized Config. This is more maintainable than checking all 30+ fields
+// because adding new fields with zero defaults won't break the logic.
+//
+// IMPORTANT: If users want to customize configuration, they should start with
+// DefaultConfig() and modify only the fields they need to change:
+//
+//	cfg := env.DefaultConfig()
+//	cfg.Filenames = []string{".env.production"}
+//	loader, err := env.New(cfg)
+//
+// Passing a partially-initialized Config may trigger unexpected default behavior.
+//
+// Maintenance Note: When adding new fields with non-zero defaults, add them to this check.
+// Fields with zero defaults (e.g., Filenames, Prefix) don't need to be added here.
+func isZeroConfig(cfg Config) bool {
+	// Check ALL fields that have non-zero defaults in DefaultConfig()
+	// If these are all zero, the config is almost certainly uninitialized
+	return cfg.MaxFileSize == 0 &&
+		cfg.MaxVariables == 0 &&
+		cfg.MaxLineLength == 0 &&
+		cfg.MaxKeyLength == 0 &&
+		cfg.MaxValueLength == 0 &&
+		cfg.MaxExpansionDepth == 0 &&
+		cfg.JSONMaxDepth == 0 &&
+		cfg.YAMLMaxDepth == 0 &&
+		cfg.FileSystem == nil
+}
+
 // New creates a new Loader with the given configuration.
+// If no configuration is provided or a zero-value Config is passed,
+// DefaultConfig() is used automatically.
+//
 // If cfg.Filenames is non-empty, files are automatically loaded.
 // If cfg.AutoApply is true, loaded variables are also applied to os.Environ.
-func New(cfg Config) (*Loader, error) {
-	if err := cfg.Validate(); err != nil {
+//
+// Example:
+//
+//	// Use default configuration
+//	loader, err := env.New()
+//
+//	// Use custom configuration
+//	cfg := env.DefaultConfig()
+//	cfg.JSONMaxDepth = 20
+//	loader, err := env.New(cfg)
+func New(cfg ...Config) (*Loader, error) {
+	var c Config
+	if len(cfg) > 0 {
+		c = cfg[0]
+		// If zero-value Config is passed, use defaults
+		if isZeroConfig(c) {
+			c = DefaultConfig()
+		}
+	} else {
+		c = DefaultConfig()
+	}
+
+	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
 	// Use default file system if not specified
-	fs := cfg.FileSystem
+	fs := c.FileSystem
 	if fs == nil {
 		fs = DefaultFileSystem
 	}
 
 	// Build shared components once
-	factory := cfg.buildComponentFactoryWithFS(fs)
+	factory := c.buildComponentFactoryWithFS(fs)
 
 	// Create parsers using registry
-	parsers, err := createParsers(cfg, factory)
+	parsers, err := createParsers(c, factory)
 	if err != nil {
 		if closeErr := factory.Close(); closeErr != nil {
 			// Log close error via factory's auditor if available
@@ -87,7 +229,7 @@ func New(cfg Config) (*Loader, error) {
 	}
 
 	loader := &Loader{
-		config:      cfg,
+		config:      c,
 		factory:     factory,
 		ownsFactory: true,
 		validator:   factory.Validator(),
@@ -99,12 +241,12 @@ func New(cfg Config) (*Loader, error) {
 	}
 
 	// Auto-load files if Filenames is configured
-	if len(cfg.Filenames) > 0 {
+	if len(c.Filenames) > 0 {
 		start := time.Now()
 
-		for _, filename := range cfg.Filenames {
+		for _, filename := range c.Filenames {
 			if err := loader.loadFileLocked(filename); err != nil {
-				if errors.Is(err, ErrFileNotFound) && !cfg.FailOnMissingFile {
+				if errors.Is(err, ErrFileNotFound) && !c.FailOnMissingFile {
 					_ = loader.auditor.LogWithFile(internal.ActionLoad, "", filename, "file not found, skipping", true)
 					continue
 				}
@@ -119,7 +261,7 @@ func New(cfg Config) (*Loader, error) {
 		_ = loader.auditor.LogWithDuration(internal.ActionLoad, "", "loaded files", true, time.Since(start))
 
 		// Auto-apply if configured
-		if cfg.AutoApply {
+		if c.AutoApply {
 			if err := loader.applyLocked(); err != nil {
 				if closeErr := loader.Close(); closeErr != nil {
 					_ = loader.auditor.LogError(internal.ActionError, "", "cleanup failed: "+closeErr.Error())
@@ -179,6 +321,16 @@ func (l *Loader) LoadFiles(filenames ...string) error {
 }
 
 // loadFileLocked loads a single file. Must be called with lock held.
+//
+// SECURITY - Defense-in-Depth for TOCTOU:
+// There is a theoretical Time-Of-Check-Time-Of-Use window between Open() and Stat()
+// where the file could be replaced or modified. This is mitigated by:
+//  1. SecureReader: The parser wraps the file with SecureReader which enforces
+//     hard limits during reading, providing secondary enforcement of size constraints.
+//  2. Hard Limits: Even if the file grows between Stat() and Read(), SecureReader
+//     will stop reading at HardMaxFileSize (100MB), preventing memory exhaustion.
+//  3. Validation: All parsed content is validated for size, format, and safety
+//     regardless of the initial Stat() results.
 func (l *Loader) loadFileLocked(filename string) error {
 	start := time.Now()
 
@@ -198,6 +350,8 @@ func (l *Loader) loadFileLocked(filename string) error {
 	defer file.Close()
 
 	// Get file info for size check
+	// Note: This provides a fast-path check for obviously oversized files.
+	// SecureReader provides defense-in-depth for files that grow after this check.
 	info, err := file.Stat()
 	if err != nil {
 		return newFileError(filename, "stat", err)
@@ -279,8 +433,10 @@ func (l *Loader) applyLocked() error {
 			continue
 		}
 
-		// Check for existing value
-		if existing := l.fs.Getenv(key); existing != "" && !l.config.OverwriteExisting {
+		// Check for existing value using LookupEnv to distinguish between
+		// "not set" and "empty string". This correctly handles the case where
+		// an environment variable is explicitly set to empty string.
+		if _, exists := l.fs.LookupEnv(key); exists && !l.config.OverwriteExisting {
 			_ = l.auditor.Log(internal.ActionSet, key, "skipped (existing)", false)
 			continue
 		}
@@ -546,22 +702,15 @@ func (l *Loader) IsClosed() bool {
 // a default value if the key is not found or parsing fails.
 // Parse failures are logged to the auditor for debugging purposes.
 func getWithDefault[T any](loader *Loader, key string, parse func(string) (T, error), defaultValue ...T) T {
-	var zero T
 	value, ok := loader.Lookup(key)
 	if !ok {
-		if len(defaultValue) > 0 {
-			return defaultValue[0]
-		}
-		return zero
+		return firstOrZero(defaultValue...)
 	}
 	result, err := parse(value)
 	if err != nil {
 		// Log parse failure for debugging
 		_ = loader.auditor.LogError(internal.ActionGet, key, fmt.Sprintf("parse failed: %v", err))
-		if len(defaultValue) > 0 {
-			return defaultValue[0]
-		}
-		return zero
+		return firstOrZero(defaultValue...)
 	}
 	return result
 }
@@ -673,10 +822,10 @@ func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, def
 
 		parsed, err := parseSliceElement[T](value)
 		if err != nil {
-			if len(defaultValue) > 0 {
-				return defaultValue[0]
-			}
-			return nil
+			// Log parse failure for debugging and skip this element
+			_ = loader.auditor.LogError(internal.ActionGet, indexedKey,
+				fmt.Sprintf("slice element parse failed: %v", err))
+			continue
 		}
 		result = append(result, parsed)
 	}
@@ -686,6 +835,11 @@ func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, def
 		if value, ok := loader.vars.Get(baseKey); ok {
 			return parseCommaSeparated[T](value, defaultValue...)
 		}
+	}
+
+	// Return default only if we collected nothing and have a default
+	if len(result) == 0 && len(defaultValue) > 0 {
+		return defaultValue[0]
 	}
 
 	return result
@@ -715,6 +869,8 @@ func (l *Loader) keysToUpper() map[string]bool {
 
 // validateFilePath validates a file path for security.
 // It checks for path traversal attempts and other potentially dangerous patterns.
+// Note: This function validates the logical path. For symlink resolution, the caller
+// should use validateFilePathWithSymlink if operating in a controlled directory.
 func validateFilePath(filename string) error {
 	if filename == "" {
 		return &SecurityError{
@@ -728,6 +884,15 @@ func validateFilePath(filename string) error {
 		return &SecurityError{
 			Action: "file_access",
 			Reason: "null byte in path",
+		}
+	}
+
+	// SECURITY: Check for URL encoding which could be used to bypass path checks
+	// Examples: %2e%2e for .., %5c for \, etc.
+	if strings.Contains(filename, "%") {
+		return &SecurityError{
+			Action: "file_access",
+			Reason: "URL encoded path not allowed",
 		}
 	}
 
@@ -782,12 +947,12 @@ func validateFilePath(filename string) error {
 		}
 	}
 
-	// On Windows, check for reserved device names
+	// SECURITY: On Windows, check for reserved device names
 	// These names are reserved in any directory and cannot be used as filenames
 	// See: https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
 	if len(filename) >= 3 {
 		upper := strings.ToUpper(filename)
-		// Check for CON, PRN, AUX, NUL, COM1-9, LPT1-9
+		// Check for CON, PRN, AUX, NUL
 		reserved := []string{"CON", "PRN", "AUX", "NUL"}
 		for _, r := range reserved {
 			if upper == r || (len(upper) > 3 && upper[:3] == r && (upper[3] == '.' || upper[3] == ':')) {
@@ -798,10 +963,13 @@ func validateFilePath(filename string) error {
 			}
 		}
 		// Check COM and LPT ports (COM1-COM9, LPT1-LPT9)
+		// These are 4-character names like "COM1", "LPT9", etc.
 		if len(upper) >= 4 {
 			prefix := upper[:3]
 			if (prefix == "COM" || prefix == "LPT") && upper[3] >= '1' && upper[3] <= '9' {
-				if len(upper) == 4 || upper[4] == '.' || upper[4] == ':' {
+				// Match: exactly 4 chars (e.g., "COM1") or followed by separator
+				// Note: Short-circuit evaluation ensures upper[4] is only accessed when len > 4
+				if len(upper) == 4 || len(upper) > 4 && (upper[4] == '.' || upper[4] == ':') {
 					return &SecurityError{
 						Action: "file_access",
 						Reason: "reserved device name",
@@ -818,6 +986,52 @@ func validateFilePath(filename string) error {
 					Reason: "reserved pseudo-device name",
 				}
 			}
+		}
+	}
+
+	// SECURITY: Resolve and validate symlinks to prevent symlink escape attacks
+	// A symlink within the allowed directory could point outside the intended scope
+	resolved, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		// If the path doesn't exist yet (e.g., for write operations),
+		// validate the parent directory instead
+		dir := filepath.Dir(cleanPath)
+		if dir != "." && dir != cleanPath {
+			resolvedDir, dirErr := filepath.EvalSymlinks(dir)
+			if dirErr != nil {
+				// Path or parent doesn't exist - allow to proceed
+				// The file operation will fail later if path is invalid
+				return nil
+			}
+			// Validate resolved parent directory
+			if err := validateResolvedPath(resolvedDir); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Validate the resolved path is still within allowed bounds
+	return validateResolvedPath(resolved)
+}
+
+// validateResolvedPath checks that a resolved (symlink-expanded) path is safe.
+// It ensures the path is relative and doesn't escape to absolute locations.
+func validateResolvedPath(resolved string) error {
+	// Check for absolute paths after symlink resolution
+	if filepath.IsAbs(resolved) {
+		return &SecurityError{
+			Action: "file_access",
+			Reason: "symlink resolves to absolute path",
+		}
+	}
+
+	// Double-check for path traversal in resolved path
+	cleanResolved := filepath.Clean(resolved)
+	if strings.Contains(cleanResolved, "..") {
+		return &SecurityError{
+			Action: "file_access",
+			Reason: "symlink escapes allowed directory",
 		}
 	}
 

@@ -4,7 +4,31 @@ All notable changes to the cybergodev/env library will be documented in this fil
 
 ---
 
-## v1.0.0 - Initial Release
+## v1.0.1 — Security Hardening & Performance (2026-03-19)
+
+### Added
+- `CloseableChannelHandler` — audit handler with owned channel lifecycle for proper resource cleanup
+- `validateResolvedPath()` — symlink escape attack prevention for file paths
+- `io.Closer` compile-time interface checks for all closeable types
+
+### Changed
+- `New()` now supports optional Config parameter; zero-value defaults to `DefaultConfig()`
+- `ExpandAll` returns original map when no expansion needed (14.5% faster, 31.8% less memory)
+- Use Go 1.21+ `clear()` builtin for byte-zeroing operations
+- `ChannelHandler` documentation clarified: caller owns channel lifecycle
+
+### Fixed
+- Symlink escape attacks blocked with `filepath.EvalSymlinks()` validation
+- Sensitive keys masked in variable expansion error chains
+- Channel ownership ambiguity — documented caller responsibility for closing
+
+### Security
+- TOCTOU defense-in-depth documentation for file loading operations
+- Windows `VirtualLock` privilege requirements documented for production deployments
+
+---
+
+## v1.0.0 — Initial Release (2026-03-01)
 
 ### Core Features
 

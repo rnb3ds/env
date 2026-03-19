@@ -2,8 +2,6 @@ package env
 
 import (
 	"errors"
-	"fmt"
-	"os"
 	"sync"
 	"sync/atomic"
 )
@@ -53,32 +51,46 @@ func getDefaultLoader() (*Loader, error) {
 // This function is intended for use in tests to ensure isolation between test cases.
 // It is safe for concurrent use.
 //
+// Returns any error that occurred while closing the old loader.
+// A nil return value indicates either no loader was set or it was closed successfully.
+//
+// Design: The function atomically swaps the loader to nil while holding the lock,
+// then closes the old loader outside the lock. This design choice:
+//   - Ensures only one reset can happen at a time (mutex protected)
+//   - Allows new loaders to be created immediately after the swap
+//   - Avoids blocking concurrent operations during potentially slow Close()
+//   - The old and new loaders are completely independent
+//
+// Concurrent getDefaultLoader() calls during reset will:
+//   - Either see the old loader (before swap) - safe to use
+//   - Or see nil and create a new loader (after swap) - safe to use
+//
+// They will never receive a closed loader.
+//
 // Example:
 //
 //	func TestSomething(t *testing.T) {
-//	    env.ResetDefaultLoader()
+//	    if err := env.ResetDefaultLoader(); err != nil {
+//	        t.Logf("warning: failed to reset loader: %v", err)
+//	    }
 //	    defer env.ResetDefaultLoader()
 //	    // ... test code
 //	}
-func ResetDefaultLoader() {
+func ResetDefaultLoader() error {
 	defaultMu.Lock()
-	defer defaultMu.Unlock()
-
-	// Use atomic Swap to ensure no window where nil is stored but Close not called.
-	// This eliminates the race condition between Store(nil) and Close().
+	// Atomically swap to nil while holding the lock.
+	// This ensures only one reset can happen at a time.
 	oldLoader := defaultLoader.Swap(nil)
-	if oldLoader == nil {
-		return
-	}
+	defaultMu.Unlock()
 
-	// Close the old loader after atomically clearing the reference.
-	// Any concurrent getDefaultLoader() call will either see the old loader
-	// (before Swap) or nil (after Swap), but never a closed loader.
-	if err := oldLoader.Close(); err != nil {
-		// Log to stderr as fallback - we don't have access to auditor here
-		// Production safety: don't panic on cleanup errors
-		fmt.Fprintf(os.Stderr, "[env] warning: failed to close default loader in ResetDefaultLoader: %v\n", err)
+	// Close outside the lock to avoid blocking concurrent operations.
+	// The old loader is no longer accessible via defaultLoader,
+	// so this is safe even if new loaders are created concurrently.
+	// The old and new loaders are independent - closing one doesn't affect the other.
+	if oldLoader != nil {
+		return oldLoader.Close()
 	}
+	return nil
 }
 
 // setDefaultLoader sets the given loader as the default loader.

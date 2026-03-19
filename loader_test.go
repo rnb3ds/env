@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,10 +20,12 @@ import (
 
 // testFileSystem is a mock FileSystem for testing.
 type testFileSystem struct {
-	files   map[string]string
-	env     map[string]string
-	openErr error
-	statErr error
+	files       map[string]string
+	env         map[string]string
+	openErr     error
+	statErr     error
+	setenvErr   error
+	unsetenvErr error
 }
 
 func newTestFileSystem() *testFileSystem {
@@ -77,11 +81,17 @@ func (fs *testFileSystem) Getenv(key string) string {
 }
 
 func (fs *testFileSystem) Setenv(key, value string) error {
+	if fs.setenvErr != nil {
+		return fs.setenvErr
+	}
 	fs.env[key] = value
 	return nil
 }
 
 func (fs *testFileSystem) Unsetenv(key string) error {
+	if fs.unsetenvErr != nil {
+		return fs.unsetenvErr
+	}
 	delete(fs.env, key)
 	return nil
 }
@@ -148,6 +158,63 @@ func TestNew(t *testing.T) {
 			t.Fatal("New() returned nil loader")
 		}
 		defer loader.Close()
+	})
+
+	t.Run("no arguments - uses default config", func(t *testing.T) {
+		loader, err := New()
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		if loader == nil {
+			t.Fatal("New() returned nil loader")
+		}
+		defer loader.Close()
+
+		// Verify default config values are applied
+		returnedCfg := loader.Config()
+		if returnedCfg.MaxFileSize != DefaultMaxFileSize {
+			t.Errorf("MaxFileSize = %d, want %d", returnedCfg.MaxFileSize, DefaultMaxFileSize)
+		}
+		if returnedCfg.MaxVariables != DefaultMaxVariables {
+			t.Errorf("MaxVariables = %d, want %d", returnedCfg.MaxVariables, DefaultMaxVariables)
+		}
+	})
+
+	t.Run("zero-value config - uses default config", func(t *testing.T) {
+		loader, err := New(Config{})
+		if err != nil {
+			t.Fatalf("New(Config{}) error = %v", err)
+		}
+		if loader == nil {
+			t.Fatal("New(Config{}) returned nil loader")
+		}
+		defer loader.Close()
+
+		// Verify default config values are applied
+		returnedCfg := loader.Config()
+		if returnedCfg.MaxFileSize != DefaultMaxFileSize {
+			t.Errorf("MaxFileSize = %d, want %d", returnedCfg.MaxFileSize, DefaultMaxFileSize)
+		}
+	})
+
+	t.Run("custom config - preserves values", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.JSONMaxDepth = 20
+		cfg.MaxVariables = 100
+
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer loader.Close()
+
+		returnedCfg := loader.Config()
+		if returnedCfg.JSONMaxDepth != 20 {
+			t.Errorf("JSONMaxDepth = %d, want 20", returnedCfg.JSONMaxDepth)
+		}
+		if returnedCfg.MaxVariables != 100 {
+			t.Errorf("MaxVariables = %d, want 100", returnedCfg.MaxVariables)
+		}
 	})
 
 	t.Run("invalid config - zero max file size", func(t *testing.T) {
@@ -414,152 +481,130 @@ func TestLoader_Apply(t *testing.T) {
 }
 
 // ============================================================================
-// GetString/GetSecure/Lookup Tests
+// GetString/GetSecure/Lookup Tests (Table-Driven)
 // ============================================================================
 
-func TestLoader_Get(t *testing.T) {
-	t.Run("existing key", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
+func TestLoader_GetString(t *testing.T) {
+	tests := []struct {
+		name       string
+		key        string
+		value      string
+		defaultVal string
+		wantValue  string
+	}{
+		{"existing key", "KEY", "value", "", "value"},
+		{"missing key with default", "MISSING", "", "default", "default"},
+		{"missing key without default", "MISSING", "", "", ""},
+	}
 
-		if err := loader.Set("KEY", "value"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loader, err := New(DefaultConfig())
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer loader.Close()
 
-		if got := loader.GetString("KEY"); got != "value" {
-			t.Errorf("GetString(\"KEY\") = %q, want %q", got, "value")
-		}
-	})
+			if tt.value != "" {
+				if err := loader.Set(tt.key, tt.value); err != nil {
+					t.Fatalf("Set() error = %v", err)
+				}
+			}
 
-	t.Run("missing key with default", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
+			var got string
+			if tt.defaultVal != "" {
+				got = loader.GetString(tt.key, tt.defaultVal)
+			} else {
+				got = loader.GetString(tt.key)
+			}
 
-		if got := loader.GetString("MISSING", "default"); got != "default" {
-			t.Errorf("GetString(\"MISSING\", \"default\") = %q, want %q", got, "default")
-		}
-	})
-
-	t.Run("missing key without default", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if got := loader.GetString("MISSING"); got != "" {
-			t.Errorf("GetString(\"MISSING\") = %q, want empty string", got)
-		}
-	})
+			if got != tt.wantValue {
+				t.Errorf("GetString() = %q, want %q", got, tt.wantValue)
+			}
+		})
+	}
 }
 
 func TestLoader_GetSecure(t *testing.T) {
-	t.Run("existing key", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
+	tests := []struct {
+		name      string
+		key       string
+		value     string
+		wantNil   bool
+		wantValue string
+	}{
+		{"existing key", "SECRET", "password123", false, "password123"},
+		{"missing key", "MISSING", "", true, ""},
+	}
 
-		if err := loader.Set("SECRET", "password123"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loader, err := New(DefaultConfig())
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer loader.Close()
 
-		sv := loader.GetSecure("SECRET")
-		if sv == nil {
-			t.Fatal("GetSecure() returned nil")
-		}
-		if sv.String() != "password123" {
-			t.Errorf("GetSecure().String() = %q, want %q", sv.String(), "password123")
-		}
-	})
+			if tt.value != "" {
+				if err := loader.Set(tt.key, tt.value); err != nil {
+					t.Fatalf("Set() error = %v", err)
+				}
+			}
 
-	t.Run("missing key", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		sv := loader.GetSecure("MISSING")
-		if sv != nil {
-			t.Errorf("GetSecure() = %v, want nil", sv)
-		}
-	})
-
+			sv := loader.GetSecure(tt.key)
+			if tt.wantNil {
+				if sv != nil {
+					t.Errorf("GetSecure() = %v, want nil", sv)
+				}
+			} else {
+				if sv == nil {
+					t.Fatal("GetSecure() returned nil")
+				}
+				if sv.String() != tt.wantValue {
+					t.Errorf("GetSecure().String() = %q, want %q", sv.String(), tt.wantValue)
+				}
+				sv.Release()
+			}
+		})
+	}
 }
 
 func TestLoader_Lookup(t *testing.T) {
-	t.Run("existing key", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
+	tests := []struct {
+		name      string
+		key       string
+		value     string
+		wantOK    bool
+		wantValue string
+	}{
+		{"existing key", "KEY", "value", true, "value"},
+		{"missing key", "MISSING", "", false, ""},
+		{"trims whitespace", "KEY", "  value  ", true, "value"},
+	}
 
-		if err := loader.Set("KEY", "value"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loader, err := New(DefaultConfig())
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer loader.Close()
 
-		value, ok := loader.Lookup("KEY")
-		if !ok {
-			t.Error("Lookup() ok = false, want true")
-		}
-		if value != "value" {
-			t.Errorf("Lookup() = %q, want %q", value, "value")
-		}
-	})
+			if tt.value != "" {
+				if err := loader.Set(tt.key, tt.value); err != nil {
+					t.Fatalf("Set() error = %v", err)
+				}
+			}
 
-	t.Run("missing key", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		value, ok := loader.Lookup("MISSING")
-		if ok {
-			t.Error("Lookup() ok = true for missing key, want false")
-		}
-		if value != "" {
-			t.Errorf("Lookup() = %q, want empty string", value)
-		}
-	})
-
-	t.Run("trims whitespace", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.Set("KEY", "  value  "); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
-
-		value, ok := loader.Lookup("KEY")
-		if !ok {
-			t.Fatal("Lookup() ok = false, want true")
-		}
-		if value != "value" {
-			t.Errorf("Lookup() = %q, want %q", value, "value")
-		}
-	})
-
+			value, ok := loader.Lookup(tt.key)
+			if ok != tt.wantOK {
+				t.Errorf("Lookup() ok = %v, want %v", ok, tt.wantOK)
+			}
+			if value != tt.wantValue {
+				t.Errorf("Lookup() = %q, want %q", value, tt.wantValue)
+			}
+		})
+	}
 }
 
 // ============================================================================
@@ -684,6 +729,74 @@ func TestLoader_Delete(t *testing.T) {
 		}
 	})
 
+}
+
+// ============================================================================
+// Error Path Tests
+// ============================================================================
+
+func TestLoader_ErrorPaths(t *testing.T) {
+	t.Run("Set with AutoApply error propagation", func(t *testing.T) {
+		fs := newTestFileSystem()
+		fs.setenvErr = errors.New("setenv failed")
+
+		cfg := DefaultConfig()
+		cfg.FileSystem = fs
+		cfg.AutoApply = true
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer loader.Close()
+
+		// Set should still succeed (error is logged, not returned)
+		if err := loader.Set("KEY", "value"); err != nil {
+			t.Logf("Set() with Setenv error = %v (may be expected)", err)
+		}
+	})
+
+	t.Run("Delete with AutoApply Unsetenv error propagation", func(t *testing.T) {
+		fs := newTestFileSystem()
+		fs.unsetenvErr = errors.New("unsetenv failed")
+
+		cfg := DefaultConfig()
+		cfg.FileSystem = fs
+		cfg.AutoApply = true
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer loader.Close()
+
+		// First set a value
+		loader.Set("KEY", "value")
+
+		// Delete should still succeed (error is logged, not returned)
+		if err := loader.Delete("KEY"); err != nil {
+			t.Logf("Delete() with Unsetenv error = %v (may be expected)", err)
+		}
+	})
+
+	t.Run("Apply with Setenv error", func(t *testing.T) {
+		fs := newTestFileSystem()
+		fs.setenvErr = errors.New("setenv failed")
+
+		cfg := DefaultConfig()
+		cfg.FileSystem = fs
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer loader.Close()
+
+		loader.Set("KEY", "value")
+
+		// Apply may return an error
+		err = loader.Apply()
+		if err != nil {
+			t.Logf("Apply() with Setenv error = %v (expected)", err)
+		}
+	})
 }
 
 // ============================================================================
@@ -1015,69 +1128,133 @@ func TestLoader_IsClosed(t *testing.T) {
 }
 
 // ============================================================================
-// GetInt/GetBool/GetDuration Tests
+// GetInt/GetBool/GetDuration Tests (Table-Driven)
 // ============================================================================
 
 func TestLoader_GetInt(t *testing.T) {
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	defer loader.Close()
-
-	if err := loader.Set("PORT", "8080"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-
-	if got := loader.GetInt("PORT"); got != 8080 {
-		t.Errorf("GetInt(\"PORT\") = %d, want 8080", got)
+	tests := []struct {
+		name       string
+		key        string
+		value      string
+		defaultVal int64
+		useDefault bool
+		wantValue  int64
+	}{
+		{"existing key", "PORT", "8080", 0, false, 8080},
+		{"missing key with default", "MISSING", "", 3000, true, 3000},
+		{"missing key without default", "MISSING", "", 0, false, 0},
 	}
 
-	if got := loader.GetInt("MISSING", 3000); got != 3000 {
-		t.Errorf("GetInt(\"MISSING\", 3000) = %d, want 3000", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loader, err := New(DefaultConfig())
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer loader.Close()
+
+			if tt.value != "" {
+				if err := loader.Set(tt.key, tt.value); err != nil {
+					t.Fatalf("Set() error = %v", err)
+				}
+			}
+
+			var got int64
+			if tt.useDefault {
+				got = loader.GetInt(tt.key, tt.defaultVal)
+			} else {
+				got = loader.GetInt(tt.key)
+			}
+
+			if got != tt.wantValue {
+				t.Errorf("GetInt() = %d, want %d", got, tt.wantValue)
+			}
+		})
 	}
 }
 
 func TestLoader_GetBool(t *testing.T) {
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
+	tests := []struct {
+		name       string
+		key        string
+		value      string
+		defaultVal bool
+		useDefault bool
+		wantValue  bool
+	}{
+		{"existing key true", "DEBUG", "true", false, false, true},
+		{"existing key false", "DEBUG", "false", true, false, false},
+		{"missing key with default", "MISSING", "", true, true, true},
+		{"missing key without default", "MISSING", "", false, false, false},
 	}
-	defer loader.Close()
 
-	if err := loader.Set("DEBUG", "true"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loader, err := New(DefaultConfig())
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer loader.Close()
 
-	if got := loader.GetBool("DEBUG"); !got {
-		t.Errorf("GetBool(\"DEBUG\") = %v, want true", got)
-	}
+			if tt.value != "" {
+				if err := loader.Set(tt.key, tt.value); err != nil {
+					t.Fatalf("Set() error = %v", err)
+				}
+			}
 
-	if got := loader.GetBool("MISSING", true); !got {
-		t.Errorf("GetBool(\"MISSING\", true) = %v, want true", got)
+			var got bool
+			if tt.useDefault {
+				got = loader.GetBool(tt.key, tt.defaultVal)
+			} else {
+				got = loader.GetBool(tt.key)
+			}
+
+			if got != tt.wantValue {
+				t.Errorf("GetBool() = %v, want %v", got, tt.wantValue)
+			}
+		})
 	}
 }
 
 func TestLoader_GetDuration(t *testing.T) {
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	defer loader.Close()
-
-	if err := loader.Set("TIMEOUT", "30s"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-
-	if got := loader.GetDuration("TIMEOUT"); got != 30*time.Second {
-		t.Errorf("GetDuration(\"TIMEOUT\") = %v, want 30s", got)
+	tests := []struct {
+		name       string
+		key        string
+		value      string
+		defaultVal time.Duration
+		useDefault bool
+		wantValue  time.Duration
+	}{
+		{"existing key", "TIMEOUT", "30s", 0, false, 30 * time.Second},
+		{"missing key with default", "MISSING", "", 5 * time.Minute, true, 5 * time.Minute},
+		{"missing key without default", "MISSING", "", 0, false, 0},
 	}
 
-	if got := loader.GetDuration("MISSING", 5*time.Minute); got != 5*time.Minute {
-		t.Errorf("GetDuration(\"MISSING\", 5m) = %v, want 5m", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loader, err := New(DefaultConfig())
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer loader.Close()
+
+			if tt.value != "" {
+				if err := loader.Set(tt.key, tt.value); err != nil {
+					t.Fatalf("Set() error = %v", err)
+				}
+			}
+
+			var got time.Duration
+			if tt.useDefault {
+				got = loader.GetDuration(tt.key, tt.defaultVal)
+			} else {
+				got = loader.GetDuration(tt.key)
+			}
+
+			if got != tt.wantValue {
+				t.Errorf("GetDuration() = %v, want %v", got, tt.wantValue)
+			}
+		})
 	}
 }
 
@@ -1924,6 +2101,86 @@ func TestValidateFilePath(t *testing.T) {
 						t.Errorf("validateFilePath(%q) reason = %q, want containing %q", tt.filename, secErr.Reason, tt.errReason)
 					}
 				}
+			}
+		})
+	}
+}
+
+// TestValidateFilePath_SymlinkEscape tests that symlink escape attacks are blocked.
+// This test creates actual symlinks to verify the security check works correctly.
+func TestValidateFilePath_SymlinkEscape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink tests require admin privileges on Windows")
+	}
+
+	// Create a temporary directory structure
+	tmpDir := t.TempDir()
+
+	// Create allowed directory
+	allowedDir := filepath.Join(tmpDir, "allowed")
+	if err := os.Mkdir(allowedDir, 0755); err != nil {
+		t.Fatalf("failed to create allowed dir: %v", err)
+	}
+
+	// Create a file outside the allowed directory
+	outsideFile := filepath.Join(tmpDir, "outside.txt")
+	if err := os.WriteFile(outsideFile, []byte("secret"), 0644); err != nil {
+		t.Fatalf("failed to create outside file: %v", err)
+	}
+
+	// Create symlink inside allowed directory pointing outside
+	symlinkPath := filepath.Join(allowedDir, "escape.env")
+	if err := os.Symlink(outsideFile, symlinkPath); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	// Change to allowed directory to test relative path
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+	if err := os.Chdir(allowedDir); err != nil {
+		t.Fatalf("failed to change directory: %v", err)
+	}
+	defer os.Chdir(oldWd)
+
+	// The symlink points to an absolute path, which should be blocked
+	// because it resolves to an absolute path
+	err = validateFilePath("escape.env")
+	if err == nil {
+		t.Error("validateFilePath should reject symlink that resolves to absolute path")
+	}
+
+	var secErr *SecurityError
+	if err != nil && !errors.As(err, &secErr) {
+		t.Errorf("expected SecurityError, got %T", err)
+	}
+}
+
+// TestValidateResolvedPath tests the resolved path validation function.
+func TestValidateResolvedPath(t *testing.T) {
+	tests := []struct {
+		name     string
+		resolved string
+		wantErr  bool
+		skipWin  bool // skip on Windows
+	}{
+		{"relative path", "config/.env", false, false},
+		{"simple filename", ".env", false, false},
+		{"subdirectory", "config/local/.env", false, false},
+		{"absolute Unix path", "/etc/passwd", true, true}, // Not absolute on Windows
+		{"path traversal remaining", "config/../..", true, false},
+		{"Windows absolute", "C:\\Windows\\System32", true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.skipWin && runtime.GOOS == "windows" {
+				t.Skip("test not applicable on Windows")
+			}
+			err := validateResolvedPath(tt.resolved)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateResolvedPath(%q) error = %v, wantErr %v", tt.resolved, err, tt.wantErr)
 			}
 		})
 	}

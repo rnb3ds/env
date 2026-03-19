@@ -6,6 +6,8 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -656,5 +658,277 @@ func TestBufferedHandler_Concurrent(t *testing.T) {
 	// Should have 100 events
 	if len(ch) != 100 {
 		t.Errorf("expected 100 events, got %d", len(ch))
+	}
+}
+
+// TestBufferedHandler_ConcurrentStressDuringFlush tests for race conditions
+// when concurrent Log() calls happen during buffer flush operations.
+// This validates the lock/unlock pattern in BufferedHandler.Log() is safe.
+func TestBufferedHandler_ConcurrentStressDuringFlush(t *testing.T) {
+	// Use a slow underlying handler to increase the chance of races during flush
+	slowHandler := &slowTestHandler{delay: time.Microsecond}
+
+	handler := NewBufferedHandler(BufferedHandlerConfig{
+		Handler:       slowHandler,
+		BufferSize:    10, // Small buffer to trigger frequent flushes
+		FlushInterval: 0,  // Manual flush only
+	})
+	defer handler.Close()
+
+	const (
+		numGoroutines = 20
+		eventsPerGoro = 50
+		totalEvents   = numGoroutines * eventsPerGoro
+	)
+
+	var wg sync.WaitGroup
+	var logErrors int64 // atomic counter for log errors
+	var flushErrors int64
+
+	// Start goroutines that continuously log events
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < eventsPerGoro; j++ {
+				if err := handler.Log(Event{
+					Action: ActionSet,
+					Key:    fmt.Sprintf("KEY_%d_%d", id, j),
+				}); err != nil {
+					// Log after close is expected, count but don't fail
+				}
+			}
+		}(i)
+	}
+
+	// Concurrently flush while logging
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			time.Sleep(time.Microsecond * 100)
+			if err := handler.Flush(); err != nil {
+				// Flush after close is expected
+			}
+		}
+	}()
+
+	wg.Wait()
+
+	// Final flush to capture any remaining events
+	_ = handler.Flush()
+
+	// Verify all events were processed (logged to slow handler)
+	finalCount := slowHandler.Count()
+	if finalCount != totalEvents {
+		t.Errorf("expected %d events in slow handler, got %d", totalEvents, finalCount)
+	}
+
+	t.Logf("Stress test completed: %d events logged, %d log errors, %d flush errors",
+		finalCount, logErrors, flushErrors)
+}
+
+// slowTestHandler is a handler that introduces a delay to simulate slow I/O
+type slowTestHandler struct {
+	count int64
+	delay time.Duration
+}
+
+func (h *slowTestHandler) Log(event Event) error {
+	time.Sleep(h.delay)
+	// Use atomic to avoid race in counter
+	// Note: This is a test helper; the actual library code uses proper mutex protection
+	for {
+		old := atomic.LoadInt64(&h.count)
+		if atomic.CompareAndSwapInt64(&h.count, old, old+1) {
+			break
+		}
+	}
+	return nil
+}
+
+func (h *slowTestHandler) Close() error {
+	return nil
+}
+
+func (h *slowTestHandler) Count() int64 {
+	return atomic.LoadInt64(&h.count)
+}
+
+// ============================================================================
+// CloseableChannelHandler Tests
+// ============================================================================
+
+func TestCloseableChannelHandler_Basic(t *testing.T) {
+	handler := NewCloseableChannelHandler(10)
+	defer handler.Close()
+
+	ch := handler.Channel()
+	if ch == nil {
+		t.Error("Channel() should not return nil")
+	}
+
+	event := Event{
+		Timestamp: time.Now(),
+		Action:    ActionSet,
+		Key:       "KEY",
+	}
+
+	err := handler.Log(event)
+	if err != nil {
+		t.Errorf("Log() error = %v", err)
+		return
+	}
+
+	select {
+	case received := <-ch:
+		if received.Action != ActionSet {
+			t.Errorf("received action = %v, want %v", received.Action, ActionSet)
+		}
+	case <-time.After(time.Second):
+		t.Error("timeout waiting for event")
+	}
+}
+
+func TestCloseableChannelHandler_CloseChannel(t *testing.T) {
+	handler := NewCloseableChannelHandler(10)
+	ch := handler.Channel()
+
+	// Log an event
+	_ = handler.Log(Event{Action: ActionSet})
+
+	// Close should close the channel
+	if err := handler.Close(); err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+
+	// Drain the buffered event first
+	<-ch
+
+	// Channel should be closed now
+	_, ok := <-ch
+	if ok {
+		t.Error("channel should be closed")
+	}
+}
+
+func TestCloseableChannelHandler_ReceiverUnblocks(t *testing.T) {
+	handler := NewCloseableChannelHandler(0) // Unbuffered
+
+	receiverDone := make(chan struct{})
+	go func() {
+		ch := handler.Channel()
+		// This will block until handler is closed
+		for range ch {
+			// Consume events
+		}
+		close(receiverDone)
+	}()
+
+	// Give receiver time to start blocking
+	time.Sleep(50 * time.Millisecond)
+
+	// Close the handler - this should unblock the receiver
+	if err := handler.Close(); err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+
+	// Wait for receiver to finish
+	select {
+	case <-receiverDone:
+		// Success - receiver was unblocked
+	case <-time.After(time.Second):
+		t.Error("receiver should have been unblocked by Close()")
+	}
+}
+
+func TestCloseableChannelHandler_LogAfterClose(t *testing.T) {
+	handler := NewCloseableChannelHandler(10)
+
+	// Close first
+	if err := handler.Close(); err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+
+	// Log after close should return error
+	err := handler.Log(Event{Action: ActionSet})
+	if err == nil {
+		t.Error("Log() after Close() should return error")
+	}
+}
+
+func TestCloseableChannelHandler_IdempotentClose(t *testing.T) {
+	handler := NewCloseableChannelHandler(10)
+
+	// Close multiple times should not error
+	for i := 0; i < 3; i++ {
+		if err := handler.Close(); err != nil {
+			t.Errorf("Close() #%d error = %v", i+1, err)
+		}
+	}
+
+	if !handler.IsClosed() {
+		t.Error("IsClosed() should return true")
+	}
+}
+
+func TestCloseableChannelHandler_NegativeBufferSize(t *testing.T) {
+	// Negative buffer size should be treated as 0
+	handler := NewCloseableChannelHandler(-1)
+	defer handler.Close()
+
+	// Should still work (unbuffered)
+	ch := handler.Channel()
+	go func() {
+		_ = handler.Log(Event{Action: ActionSet})
+	}()
+
+	select {
+	case <-ch:
+		// Success
+	case <-time.After(time.Second):
+		t.Error("should have received event")
+	}
+}
+
+func TestCloseableChannelHandler_Concurrent(t *testing.T) {
+	handler := NewCloseableChannelHandler(100)
+	defer handler.Close()
+
+	ch := handler.Channel()
+	received := make(chan int, 100)
+
+	// Start receiver
+	go func() {
+		for range ch {
+			received <- 1
+		}
+	}()
+
+	// Concurrent senders
+	var done sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			for j := 0; j < 10; j++ {
+				_ = handler.Log(Event{Action: ActionSet})
+			}
+		}()
+	}
+
+	done.Wait()
+
+	// Wait for all events to be received
+	timeout := time.After(time.Second)
+	count := 0
+	for count < 100 {
+		select {
+		case <-received:
+			count++
+		case <-timeout:
+			t.Errorf("timeout waiting for events, received %d/100", count)
+			return
+		}
 	}
 }

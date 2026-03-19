@@ -228,12 +228,14 @@ func (p *LineParser) ParseValueBytes(value []byte) (string, error) {
 	}
 
 	// Unquoted value - remove inline comments using byte-level search
-	// Find " #" pattern
+	// Find " #" pattern (need at least 2 characters for this pattern)
 	commentIdx := -1
-	for i := 0; i < len(value)-1; i++ {
-		if value[i] == ' ' && value[i+1] == '#' {
-			commentIdx = i
-			break
+	if len(value) >= 2 {
+		for i := 0; i < len(value)-1; i++ {
+			if value[i] == ' ' && value[i+1] == '#' {
+				commentIdx = i
+				break
+			}
 		}
 	}
 	if commentIdx != -1 {
@@ -272,29 +274,20 @@ func ParseDoubleQuoted(value string) (string, error) {
 	defer PutBuilder(result)
 	result.Grow(len(content))
 
-	i := 0
-	for i < len(content) {
-		if content[i] == '\\' && i+1 < len(content) {
+	// Optimized escape processing with lookup table
+	for i := 0; i < len(content); {
+		c := content[i]
+		if c == '\\' && i+1 < len(content) {
 			escaped := content[i+1]
-			switch escaped {
-			case 'n':
-				result.WriteByte('\n')
-			case 'r':
-				result.WriteByte('\r')
-			case 't':
-				result.WriteByte('\t')
-			case '\\':
-				result.WriteByte('\\')
-			case '"':
-				result.WriteByte('"')
-			case '$':
-				result.WriteByte('$')
-			default:
+			// Use lookup table for O(1) escape translation
+			if translated := escapeTable[escaped]; translated != 0 {
+				result.WriteByte(translated)
+			} else {
 				result.WriteByte(escaped)
 			}
 			i += 2
 		} else {
-			result.WriteByte(content[i])
+			result.WriteByte(c)
 			i++
 		}
 	}
@@ -310,6 +303,14 @@ func ParseSingleQuoted(value string) (string, error) {
 
 	// Single quotes don't process escapes
 	return value[1 : len(value)-1], nil
+}
+
+// escapeTable provides O(1) lookup for escape sequence translation.
+// Index by escaped character byte value, returns the translated character.
+// 0 means pass through the character as-is.
+var escapeTable = [256]byte{
+	'n': '\n', 'r': '\r', 't': '\t',
+	'\\': '\\', '"': '"', '$': '$',
 }
 
 // ParseDoubleQuotedBytes handles double-quoted values from a byte slice with escape sequences.
@@ -332,31 +333,21 @@ func ParseDoubleQuotedBytes(value []byte) (string, error) {
 	buf := GetByteSlice()
 	defer PutByteSlice(buf)
 
-	// Ensure capacity
+	// Ensure capacity - allocate exactly what we need, no more
 	if cap(*buf) < len(content) {
 		*buf = make([]byte, 0, len(content))
 	}
 	*buf = (*buf)[:0]
 
-	// Use range with index for better performance
+	// Optimized escape processing with lookup table
 	for i := 0; i < len(content); {
 		c := content[i]
 		if c == '\\' && i+1 < len(content) {
 			escaped := content[i+1]
-			switch escaped {
-			case 'n':
-				*buf = append(*buf, '\n')
-			case 'r':
-				*buf = append(*buf, '\r')
-			case 't':
-				*buf = append(*buf, '\t')
-			case '\\':
-				*buf = append(*buf, '\\')
-			case '"':
-				*buf = append(*buf, '"')
-			case '$':
-				*buf = append(*buf, '$')
-			default:
+			// Use lookup table for O(1) escape translation
+			if translated := escapeTable[escaped]; translated != 0 {
+				*buf = append(*buf, translated)
+			} else {
 				*buf = append(*buf, escaped)
 			}
 			i += 2
@@ -471,6 +462,7 @@ func IsYamlNumber(s string) bool {
 }
 
 // ExpandAll expands all variables in the map.
+// Returns the original map if no expansion is needed, avoiding unnecessary allocations.
 func (p *LineParser) ExpandAll(vars map[string]string) (map[string]string, error) {
 	// Fast path: first check if any values need expansion
 	// This avoids expensive cycle detection when no expansion is needed
@@ -482,8 +474,7 @@ func (p *LineParser) ExpandAll(vars map[string]string) (map[string]string, error
 		}
 	}
 
-	// No expansion needed - return original map to avoid allocation
-	// The caller (Parser.Parse) creates a new map each time, so this is safe
+	// No expansion needed - return original map without copying
 	if !needsExpansion {
 		return vars, nil
 	}
@@ -497,7 +488,7 @@ func (p *LineParser) ExpandAll(vars map[string]string) (map[string]string, error
 		}
 	}
 
-	// Pre-allocate result map with exact size to avoid growth
+	// Pre-allocate result map with exact size
 	result := make(map[string]string, len(vars))
 
 	// Expand all values
@@ -514,34 +505,43 @@ func (p *LineParser) ExpandAll(vars map[string]string) (map[string]string, error
 	return result, nil
 }
 
-// KeysToUpper converts map keys to uppercase for comparison.
-// This function is optimized to minimize allocations.
-func KeysToUpper(m map[string]string) map[string]bool {
-	result := make(map[string]bool, len(m))
+// keysToUpperImpl is the shared implementation for converting map keys to uppercase.
+// The result map is provided by the caller to allow both pooled and non-pooled variants.
+func keysToUpperImpl(m map[string]string, result map[string]bool) {
 	for k := range m {
 		if k == "" {
 			continue
 		}
 		result[ToUpperASCII(k)] = true
 	}
+}
+
+// KeysToUpper converts map keys to uppercase for comparison.
+// This function is optimized to minimize allocations.
+// The caller owns the returned map and does not need to return it to a pool.
+func KeysToUpper(m map[string]string) map[string]bool {
+	result := make(map[string]bool, len(m))
+	keysToUpperImpl(m, result)
 	return result
 }
 
 // KeysToUpperPooled converts map keys to uppercase using a pooled map.
 // The returned map MUST be returned to the pool using PutKeysToUpperMap after use.
 // This reduces allocations when the map is only needed temporarily.
+//
+// Example:
+//
+//	upperKeys := KeysToUpperPooled(vars)
+//	defer PutKeysToUpperMap(upperKeys)
+//	// use upperKeys...
 func KeysToUpperPooled(m map[string]string) map[string]bool {
 	result := getKeysToUpperMap()
-	for k := range m {
-		if k == "" {
-			continue
-		}
-		result[ToUpperASCII(k)] = true
-	}
+	keysToUpperImpl(m, result)
 	return result
 }
 
 // PutKeysToUpperMap returns a pooled map obtained from KeysToUpperPooled.
+// It is safe to call with nil.
 func PutKeysToUpperMap(m map[string]bool) {
 	putKeysToUpperMap(m)
 }

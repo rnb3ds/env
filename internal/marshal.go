@@ -184,7 +184,7 @@ func StructInto(data map[string]string, val reflect.Value, prefix string) error 
 			key = prefix + "_" + key
 		}
 
-		// GetString value from data
+		// Gets value from data
 		value, ok := data[key]
 		if !ok {
 			if defaultVal != "" {

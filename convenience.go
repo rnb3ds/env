@@ -1,4 +1,3 @@
-// Package env provides a high-security environment variable library for Go 1.24+.
 package env
 
 import (
@@ -31,6 +30,11 @@ func withLoaderError[T any](fn func(*Loader) (T, error)) (T, error) {
 	return fn(loader)
 }
 
+// defaultString extracts the first string from a variadic slice or returns empty string.
+func defaultString(defaultValue []string) string {
+	return firstOrZero(defaultValue...)
+}
+
 // GetString retrieves a value from the default loader with optional default.
 // Returns an empty string if the loader cannot be initialized or the key is not found
 // and no default is provided.
@@ -41,13 +45,9 @@ func withLoaderError[T any](fn func(*Loader) (T, error)) (T, error) {
 //	value := env.GetString("KEY")           // Returns "" if not found
 //	value := env.GetString("KEY", "default") // Returns "default" if not found
 func GetString(key string, defaultValue ...string) string {
-	def := ""
-	if len(defaultValue) > 0 {
-		def = defaultValue[0]
-	}
 	return withLoader(func(l *Loader) string {
 		return l.GetString(key, defaultValue...)
-	}, def)
+	}, defaultString(defaultValue))
 }
 
 // GetInt retrieves an integer value from the default loader with optional default.
@@ -59,13 +59,9 @@ func GetString(key string, defaultValue ...string) string {
 //	port := env.GetInt("PORT")           // Returns 0 if not found
 //	port := env.GetInt("PORT", 8080)     // Returns 8080 if not found
 func GetInt(key string, defaultValue ...int64) int64 {
-	var def int64
-	if len(defaultValue) > 0 {
-		def = defaultValue[0]
-	}
 	return withLoader(func(l *Loader) int64 {
 		return l.GetInt(key, defaultValue...)
-	}, def)
+	}, firstOrZero(defaultValue...))
 }
 
 // GetBool retrieves a boolean value from the default loader with optional default.
@@ -77,13 +73,9 @@ func GetInt(key string, defaultValue ...int64) int64 {
 //	debug := env.GetBool("DEBUG")           // Returns false if not found
 //	debug := env.GetBool("DEBUG", true)     // Returns true if not found
 func GetBool(key string, defaultValue ...bool) bool {
-	def := false
-	if len(defaultValue) > 0 {
-		def = defaultValue[0]
-	}
 	return withLoader(func(l *Loader) bool {
 		return l.GetBool(key, defaultValue...)
-	}, def)
+	}, firstOrZero(defaultValue...))
 }
 
 // GetDuration retrieves a duration value from the default loader with optional default.
@@ -95,13 +87,9 @@ func GetBool(key string, defaultValue ...bool) bool {
 //	timeout := env.GetDuration("TIMEOUT")                  // Returns 0 if not found
 //	timeout := env.GetDuration("TIMEOUT", 30*time.Second) // Returns 30s if not found
 func GetDuration(key string, defaultValue ...time.Duration) time.Duration {
-	var def time.Duration
-	if len(defaultValue) > 0 {
-		def = defaultValue[0]
-	}
 	return withLoader(func(l *Loader) time.Duration {
 		return l.GetDuration(key, defaultValue...)
-	}, def)
+	}, firstOrZero(defaultValue...))
 }
 
 // Lookup retrieves a value and existence from the default loader.
@@ -146,13 +134,9 @@ func Set(key, value string) error {
 //	ports := env.GetSlice[int]("PORTS")
 //	hosts := env.GetSlice[string]("HOSTS", []string{"localhost"})
 func GetSlice[T sliceElement](key string, defaultValue ...[]T) []T {
-	var def []T
-	if len(defaultValue) > 0 {
-		def = defaultValue[0]
-	}
 	return withLoader(func(l *Loader) []T {
 		return GetSliceFrom[T](l, key, defaultValue...)
-	}, def)
+	}, firstOrZero(defaultValue...))
 }
 
 // Keys returns all keys from the default loader.

@@ -369,8 +369,9 @@ func escapeYAMLValue(value string) string {
 		return value
 	}
 
-	// Escape and quote
-	var buf strings.Builder
+	// Escape and quote using pooled builder
+	buf := GetBuilder()
+	defer PutBuilder(buf)
 	buf.Grow(len(value) + 10)
 	buf.WriteByte('"')
 	for i := 0; i < len(value); i++ {

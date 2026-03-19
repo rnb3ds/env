@@ -176,14 +176,17 @@ var badCharTable = [256]byte{
 	0,
 	// 0x0E-0x1F: control chars (invalid)
 	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-	// 0x20-0x7E: printable chars (allowed) - 95 zeros
+	// 0x20-0x7E: printable ASCII (95 chars, all allowed - zeros by default)
+	// Note: We explicitly list these for clarity, though Go would zero-initialize them
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x20-0x2F
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x30-0x3F
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x40-0x4F
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x50-0x5F
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x60-0x6F
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x70-0x7E
 	// 0x7F: DEL (invalid)
-	// These are initialized to 0 by default
-}
-
-func init() {
-	// Mark DEL character (0x7F) as invalid
-	badCharTable[0x7F] = 1
+	1,
+	// 0x80-0xFF: high bytes (zeros by default, not validated)
 }
 
 // validateValueChars checks for invalid characters using a lookup table.

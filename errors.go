@@ -1,5 +1,3 @@
-// Package env provides a high-security environment variable library for Go 1.24+.
-// where security, concurrent access, and production-grade features are critical.
 package env
 
 import (
@@ -28,7 +26,8 @@ var (
 	ErrForbiddenKey = errors.New("key is forbidden for security reasons")
 
 	// ErrSecurityViolation indicates a general security policy violation.
-	ErrSecurityViolation = errors.New("security policy violation")
+	// Re-exported from internal/errors for backward compatibility.
+	ErrSecurityViolation = ierrors.ErrSecurityViolation
 
 	// ErrExpansionDepth indicates variable expansion exceeded the maximum depth.
 	ErrExpansionDepth = errors.New("variable expansion depth exceeded")

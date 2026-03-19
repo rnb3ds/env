@@ -2,6 +2,7 @@ package env
 
 import (
 	"fmt"
+	"io"
 	"maps"
 	"runtime"
 	"sync"
@@ -116,9 +117,7 @@ func (sv *SecureValue) reset(value string) {
 			internal.UnlockMemory(sv.data)
 			sv.locked = false
 		}
-		for i := range sv.data {
-			sv.data[i] = 0
-		}
+		clear(sv.data) // Use builtin for efficient zeroing (Go 1.21+)
 	}
 
 	// Reset lock error state
@@ -181,6 +180,14 @@ func (sv *SecureValue) tryLockMemory() {
 // - Release() clears the finalizer BEFORE putting the object back in the pool
 // - NewSecureValue() sets a fresh finalizer when taking from the pool
 // - This ensures no finalizer runs on pooled objects being reused
+//
+// SECURITY REQUIREMENT:
+// Callers that return SecureValue to the pool MUST follow this sequence:
+//  1. Call runtime.SetFinalizer(sv, nil) to clear the finalizer
+//  2. Then call secureValuePool.Put(sv)
+//
+// Failure to clear the finalizer before Put() may cause the GC to run
+// finalize() while the object is being reused, leading to data corruption.
 func (sv *SecureValue) finalize() {
 	// Fast path: if already closed or no data, nothing to do
 	if sv.closed.Load() || sv.data == nil {
@@ -197,7 +204,12 @@ func (sv *SecureValue) finalize() {
 // that sensitive data is actually cleared from memory.
 // Also unlocks memory if it was previously locked.
 func (sv *SecureValue) clearData() {
-	if sv.data == nil {
+	// SECURITY: Check for empty/nil slice to avoid panic when accessing &sv.data[0].
+	// Note: len(slice) == 0 correctly handles BOTH cases:
+	// 1. nil slice: len(nil) == 0
+	// 2. empty slice: len([]byte{}) == 0
+	// The unsafe.Pointer(&sv.data[0]) below is safe because we've verified len > 0.
+	if len(sv.data) == 0 {
 		return
 	}
 
@@ -296,6 +308,9 @@ func (sv *SecureValue) Release() {
 func (sv *SecureValue) IsClosed() bool {
 	return sv.closed.Load()
 }
+
+// Compile-time check that SecureValue implements io.Closer.
+var _ io.Closer = (*SecureValue)(nil)
 
 // Masked returns a masked representation for logging.
 func (sv *SecureValue) Masked() string {
@@ -441,6 +456,7 @@ func (sm *secureMap) SetAll(values map[string]string) {
 
 // distributeToShards distributes values to per-shard maps for batch processing.
 // Returns the distributed values and count per shard.
+// Optimized to use pre-allocated stack arrays for small batches.
 func (sm *secureMap) distributeToShards(values map[string]string) ([numSecureMapShards]map[string]string, [numSecureMapShards]int) {
 	// First pass: count items per shard for accurate pre-allocation
 	var shardCounts [numSecureMapShards]int
@@ -452,6 +468,7 @@ func (sm *secureMap) distributeToShards(values map[string]string) ([numSecureMap
 	var shardValues [numSecureMapShards]map[string]string
 	for i := range numSecureMapShards {
 		if shardCounts[i] > 0 {
+			// Pre-allocate with exact size to avoid map growth
 			shardValues[i] = make(map[string]string, shardCounts[i])
 		}
 	}
@@ -467,20 +484,30 @@ func (sm *secureMap) distributeToShards(values map[string]string) ([numSecureMap
 
 // ensureShardCapacity ensures the shard map has enough capacity for new entries.
 // Must be called with shard.mu held.
+// Optimized to reduce allocations by using more aggressive growth for empty maps.
 func (sm *secureMap) ensureShardCapacity(shard *secureMapShard, additionalCount int) {
-	newSize := len(shard.values) + additionalCount
+	currentLen := len(shard.values)
+	newSize := currentLen + additionalCount
 
 	// Handle empty map initialization
-	if len(shard.values) == 0 {
-		newCap := max(newSize*capacityGrowthNumerator/capacityGrowthDenominator, minShardCapacity)
+	if currentLen == 0 {
+		// Use the larger of: additionalCount with growth factor, or minimum capacity
+		newCap := max(newSize, minShardCapacity)
+		// Add growth buffer to reduce future reallocations
+		newCap = newCap * capacityGrowthNumerator / capacityGrowthDenominator
 		shard.values = make(map[string]*SecureValue, newCap)
 		return
 	}
 
 	// Handle map growth if load factor would be too high
 	// Grow when current size * loadFactorGrowthThreshold < new size * 2
-	if len(shard.values)*loadFactorGrowthThreshold < newSize*2 {
+	if currentLen*loadFactorGrowthThreshold < newSize*2 {
+		// Calculate new capacity with growth factor
 		newCap := newSize * capacityGrowthNumerator / capacityGrowthDenominator
+		// Ensure minimum growth to avoid frequent reallocations
+		if newCap < currentLen*2 {
+			newCap = currentLen * 2
+		}
 		newMap := make(map[string]*SecureValue, newCap)
 		maps.Copy(newMap, shard.values)
 		shard.values = newMap
@@ -616,6 +643,13 @@ func (sm *secureMap) Clear() {
 
 // Keys returns all keys in the map.
 // Uses atomic counter for O(1) allocation sizing instead of double traversal.
+//
+// Note: In concurrent scenarios, the returned slice may have slightly different
+// capacity than the actual number of keys due to concurrent modifications.
+// This is a performance optimization - the capacity is estimate is approximate
+// and the actual key count may differ by the time the slice is allocated
+// and the time keys are collected. The slice will grow automatically if needed.
+// For an exact snapshot, external synchronization is required.
 func (sm *secureMap) Keys() []string {
 	// Use atomic count for fast capacity estimation
 	totalKeys := int(sm.count.Load())
@@ -639,12 +673,21 @@ func (sm *secureMap) Keys() []string {
 
 // Len returns the number of entries.
 // Uses atomic counter for O(1) performance instead of traversing all shards.
+//
+// Note: In concurrent scenarios, the returned count may be slightly stale
+// due to concurrent modifications. For an exact count,
+// external synchronization is required.
 func (sm *secureMap) Len() int {
 	return int(sm.count.Load())
 }
 
 // ToMap returns a copy of all values as a regular map.
 // The caller should be aware that this creates copies of sensitive data.
+//
+// Note: Uses atomic counter for O(1) allocation sizing.
+// In concurrent scenarios, the returned map may have slightly different
+// entries than the actual count due to concurrent modifications.
+// For an exact snapshot, external synchronization is required.
 func (sm *secureMap) ToMap() map[string]string {
 	// Use atomic count for fast capacity estimation
 	totalKeys := int(sm.count.Load())
@@ -686,7 +729,5 @@ var _ EnvStorage = (*secureMap)(nil)
 //	data := sv.Bytes()
 //	defer env.ClearBytes(data)
 func ClearBytes(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
+	clear(b) // Use builtin for efficient zeroing (Go 1.21+)
 }

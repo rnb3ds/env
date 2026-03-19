@@ -227,6 +227,76 @@ func TestConfig_Validate(t *testing.T) {
 }
 
 // ============================================================================
+// KeyPattern Edge Case Tests
+// ============================================================================
+
+func TestKeyPattern_EdgeCases(t *testing.T) {
+	// Test the default key pattern behavior
+	t.Run("nil pattern allows standard keys", func(t *testing.T) {
+		cfg := DefaultConfig()
+		// KeyPattern is nil by default for fast byte-level validation
+		if cfg.KeyPattern != nil {
+			t.Error("KeyPattern should be nil by default")
+		}
+
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer loader.Close()
+
+		// Standard keys should work
+		if err := loader.Set("TEST_KEY", "value"); err != nil {
+			t.Errorf("Set() error = %v", err)
+		}
+		if err := loader.Set("API_KEY_123", "value"); err != nil {
+			t.Errorf("Set() error = %v", err)
+		}
+	})
+
+	t.Run("custom pattern matches valid keys", func(t *testing.T) {
+		cfg := DefaultConfig()
+		// Pattern that matches uppercase with underscores and numbers (and TEST_KEY)
+		cfg.KeyPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer loader.Close()
+
+		// Keys matching the pattern should work
+		if err := loader.Set("VALID_KEY", "value"); err != nil {
+			t.Errorf("Set() error = %v", err)
+		}
+	})
+
+	t.Run("pattern must match TEST_KEY during validation", func(t *testing.T) {
+		cfg := DefaultConfig()
+		// Pattern that only allows lowercase - this will fail validation
+		// because it can't match TEST_KEY
+		cfg.KeyPattern = regexp.MustCompile(`^[a-z]+$`)
+
+		_, err := New(cfg)
+		if err == nil {
+			t.Error("New() should fail with pattern that doesn't match TEST_KEY")
+		}
+	})
+
+	t.Run("pattern must not allow numeric start", func(t *testing.T) {
+		cfg := DefaultConfig()
+		// Pattern that allows keys starting with numbers
+		// This should fail validation because it allows numeric-start keys
+		cfg.KeyPattern = regexp.MustCompile(`^[A-Z0-9][A-Z0-9_]*$`)
+
+		_, err := New(cfg)
+		if err == nil {
+			t.Error("New() should fail with pattern that allows numeric-start keys")
+		}
+	})
+}
+
+// ============================================================================
 // validateConfigLimits Tests
 // ============================================================================
 

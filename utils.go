@@ -11,6 +11,20 @@ import (
 )
 
 // ============================================================================
+// Generic Helpers
+// ============================================================================
+
+// firstOrZero returns the first element of a variadic slice, or the zero value
+// if the slice is empty. This is a generic helper for default value handling.
+func firstOrZero[T any](values ...T) T {
+	if len(values) > 0 {
+		return values[0]
+	}
+	var zero T
+	return zero
+}
+
+// ============================================================================
 // Internal Parse Utilities
 // ============================================================================
 
