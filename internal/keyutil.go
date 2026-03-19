@@ -3,12 +3,18 @@ package internal
 
 import "sync"
 
+// Hash constant for multiplicative hashing.
+// This is Knuth's multiplicative hash constant: 2^32 / φ (golden ratio).
+// The golden ratio φ ≈ 1.6180339887... provides good distribution properties.
+// Using this constant spreads hash values uniformly across the output space.
+const hashMultiplier = 2654435761
+
 // Key interning cache limits.
 // maxInternSize is the maximum number of keys to cache per shard.
 // maxInternKeyLen is the maximum key length to intern (longer keys are not cached
 // as they are less likely to be repeated and would waste memory).
 const (
-	maxInternSize   = 64 // Per shard
+	maxInternSize   = 128 // Per shard (increased from 64 for better hit rate)
 	maxInternKeyLen = 64
 	numShards       = 8 // Increased from 4 for better concurrency on modern CPUs
 )
@@ -18,9 +24,10 @@ const (
 // simpler lock management. The cache is small enough that RWMutex
 // overhead outweighs its benefits.
 type internShard struct {
-	mu    sync.Mutex
-	cache map[string]string
-	order []string // Used for FIFO eviction
+	mu         sync.Mutex
+	cache      map[string]string
+	order      []string // Used for FIFO eviction
+	orderStart int      // Start index for circular buffer behavior
 }
 
 var internShards [numShards]internShard
@@ -39,79 +46,60 @@ func init() {
 // Performance optimizations:
 // - Uses branchless bit manipulation for keys 1-4 chars (most common case)
 // - Avoids conditional branches in the hot path
-// - Uses lookup table for power-of-two shard counts (8, 16, 32, 64)
+// - Single optimization point for numShards==8 at function exit
 func HashKey(key string, numShards int) uint32 {
 	keyLen := len(key)
 	if keyLen == 0 {
 		return 0
 	}
 
+	var hash uint32
+
 	// Fast path for very short keys (1-4 chars): branchless implementation
 	// This is the most common case for environment variable keys
-	// Uses conditional moves instead of branches for better pipelining
 	if keyLen <= 4 {
-		// Load bytes with zero-padding for shorter keys
-		// This avoids branches while maintaining correctness
 		var b [4]byte
-		// Copy key bytes (compiler optimizes this)
 		for i := 0; i < keyLen; i++ {
 			b[i] = key[i]
 		}
-		// Combine bytes into a 32-bit value using bit shifts
-		hash := uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
-		// Mix with length to differentiate keys of different lengths with same prefix
-		hash ^= uint32(keyLen) * 2654435761
-		// Use bit mask for power-of-two shard counts (most common: 8)
-		// This avoids the expensive modulo operation
-		if numShards == 8 {
-			return hash & 7
-		}
-		return hash % uint32(numShards)
-	}
-
-	// Fast path for short keys (5-8 chars)
-	if keyLen <= 8 {
-		hash := uint32(key[0])
-		hash |= uint32(key[1]) << 8
-		hash |= uint32(key[2]) << 16
-		hash |= uint32(key[3]) << 24
-		// Mix in remaining bytes using multiplicative hashing
-		hash ^= uint32(key[4]) * 2654435761
+		hash = uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+		hash ^= uint32(keyLen) * hashMultiplier
+	} else if keyLen <= 8 {
+		// Fast path for short keys (5-8 chars)
+		hash = uint32(key[0]) | uint32(key[1])<<8 | uint32(key[2])<<16 | uint32(key[3])<<24
+		hash ^= uint32(key[4]) * hashMultiplier
 		if keyLen > 5 {
-			hash ^= uint32(key[5]) * 2654435761
+			hash ^= uint32(key[5]) * hashMultiplier
 		}
 		if keyLen > 6 {
-			hash ^= uint32(key[6]) * 2654435761
+			hash ^= uint32(key[6]) * hashMultiplier
 		}
 		if keyLen > 7 {
-			hash ^= uint32(key[7]) * 2654435761
+			hash ^= uint32(key[7]) * hashMultiplier
 		}
-		hash ^= uint32(keyLen) * 2654435761
-		if numShards == 8 {
-			return hash & 7
-		}
-		return hash % uint32(numShards)
-	}
-
-	// FNV-1a hash for longer keys with sampling
-	hash := uint32(2166136261) // FNV offset basis
-
-	// For longer keys, sample first 8 and last 8 characters
-	if keyLen <= 16 {
-		for i := 0; i < keyLen; i++ {
-			hash ^= uint32(key[i])
-			hash *= 16777619 // FNV prime
-		}
+		hash ^= uint32(keyLen) * hashMultiplier
 	} else {
-		for i := 0; i < 8; i++ {
-			hash ^= uint32(key[i])
-			hash *= 16777619
-		}
-		for i := keyLen - 8; i < keyLen; i++ {
-			hash ^= uint32(key[i])
-			hash *= 16777619
+		// FNV-1a hash for longer keys with sampling
+		hash = uint32(2166136261) // FNV offset basis
+		if keyLen <= 16 {
+			for i := 0; i < keyLen; i++ {
+				hash ^= uint32(key[i])
+				hash *= 16777619 // FNV prime
+			}
+		} else {
+			// Sample first 8 and last 8 characters for long keys
+			for i := 0; i < 8; i++ {
+				hash ^= uint32(key[i])
+				hash *= 16777619
+			}
+			for i := keyLen - 8; i < keyLen; i++ {
+				hash ^= uint32(key[i])
+				hash *= 16777619
+			}
 		}
 	}
+
+	// Single optimization point for numShards==8
 	if numShards == 8 {
 		return hash & 7
 	}
@@ -130,7 +118,7 @@ func getShard(key string) *internShard {
 // concurrency performance.
 //
 // Optimization: Uses sync.Mutex instead of sync.RWMutex because:
-// 1. The cache is small (64 entries per shard), making lookup very fast
+// 1. The cache is small (128 entries per shard), making lookup very fast
 // 2. RWMutex has higher overhead for the common case of cache hit + small cache
 // 3. Simpler lock management improves cache locality
 func InternKey(key string) string {
@@ -149,26 +137,28 @@ func InternKey(key string) string {
 
 	// FIFO eviction if cache is full
 	if len(shard.cache) >= maxInternSize {
-		// Remove oldest 1/4 of entries
+		// Remove oldest 1/4 of entries using circular buffer approach
 		evictCount := maxInternSize / 4
-		for i := 0; i < evictCount && i < len(shard.order); i++ {
-			keyToEvict := shard.order[i]
+		for i := 0; i < evictCount; i++ {
+			idx := (shard.orderStart + i) % len(shard.order)
+			keyToEvict := shard.order[idx]
 			delete(shard.cache, keyToEvict)
+			shard.order[idx] = "" // Clear reference for GC
 		}
-		// Create a new slice to allow GC to reclaim evicted key strings.
-		// Simply reslicing (shard.order[evictCount:]) would keep references
-		// to evicted keys in the underlying array, preventing GC collection.
-		if evictCount >= len(shard.order) {
-			shard.order = nil
-		} else {
-			remaining := len(shard.order) - evictCount
+		// Move start pointer forward (circular buffer)
+		shard.orderStart = (shard.orderStart + evictCount) % len(shard.order)
+
+		// Compact if we've wrapped around too many times
+		if shard.orderStart > 0 && len(shard.order) >= maxInternSize*3/4 {
 			newOrder := make([]string, 0, maxInternSize)
-			newOrder = append(newOrder, shard.order[evictCount:]...)
-			shard.order = newOrder
-			// Verify slice length matches expected remaining count
-			if len(shard.order) != remaining {
-				shard.order = shard.order[:0] // Reset on mismatch (defensive)
+			for i := 0; i < len(shard.order); i++ {
+				idx := (shard.orderStart + i) % len(shard.order)
+				if shard.order[idx] != "" {
+					newOrder = append(newOrder, shard.order[idx])
+				}
 			}
+			shard.order = newOrder
+			shard.orderStart = 0
 		}
 	}
 
@@ -254,6 +244,7 @@ func ClearInternCache() {
 		shard.mu.Lock()
 		shard.cache = make(map[string]string, maxInternSize)
 		shard.order = nil
+		shard.orderStart = 0
 		shard.mu.Unlock()
 	}
 }
@@ -299,6 +290,14 @@ func TrimSpace(s string) string {
 // This is faster than strings.ToUpper for ASCII-only strings.
 // Uses single-pass algorithm: convert while detecting lowercase.
 // Returns the uppercase string (shares backing array if already uppercase).
+//
+// SECURITY WARNING: This function is designed for ASCII-only input.
+// Non-ASCII bytes (>= 0x80) are passed through unchanged without validation.
+// Callers must validate input if ASCII-only keys are required for security.
+// For environment variable keys, this is acceptable because:
+// 1. Environment variable names are conventionally ASCII
+// 2. Key validation elsewhere rejects non-ASCII keys
+// 3. Visual spoofing attacks with Unicode are mitigated by key pattern validation
 func ToUpperASCII(s string) string {
 	// Single-pass: convert to uppercase while detecting if conversion is needed
 	// This avoids the double-pass of check-then-convert

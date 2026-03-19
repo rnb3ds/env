@@ -91,12 +91,25 @@ func (c *Config) Validate() error {
 	}
 
 	// Validate key pattern if provided
-	// Test that the pattern can match a typical valid key
 	if c.KeyPattern != nil {
+		// Test that the pattern can match a typical valid key
 		testKey := "TEST_KEY"
 		if !c.KeyPattern.MatchString(testKey) {
 			return newValidationError("KeyPattern", c.KeyPattern.String(), "valid_pattern",
 				"key pattern must be able to match valid keys like TEST_KEY")
+		}
+
+		// Test that the pattern does not match empty strings
+		if c.KeyPattern.MatchString("") {
+			return newValidationError("KeyPattern", c.KeyPattern.String(), "reject_empty",
+				"key pattern must not match empty strings")
+		}
+
+		// Test that the pattern does not match keys starting with numbers
+		// (standard env var convention: must start with letter)
+		if c.KeyPattern.MatchString("123_INVALID") {
+			return newValidationError("KeyPattern", c.KeyPattern.String(), "reject_numeric_start",
+				"key pattern must not match keys starting with numbers")
 		}
 	}
 

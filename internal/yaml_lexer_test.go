@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -457,28 +458,18 @@ func TestYAMLLexer_NullByte(t *testing.T) {
 	input := `key: "value\0null"`
 	lexer := NewYAMLLexer(input)
 
-	tokens, err := lexer.Tokenize()
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
+	// SECURITY FIX: \0 escape should now return an error at lexer level
+	// for defense in depth. Null bytes can cause:
+	// - Log injection (log entries truncated at null byte)
+	// - String truncation vulnerabilities in C interop
+	// - Bypass of security controls that don't expect nulls
+	_, err := lexer.Tokenize()
+	if err == nil {
+		t.Error("SECURITY: expected error for \\0 escape - null bytes are not allowed")
+		return
 	}
-
-	// Find value token
-	for _, tok := range tokens {
-		if tok.Type == TokenValue {
-			// SECURITY FIX: \0 escape should be ignored (not converted to null byte)
-			// Null bytes can cause log injection, string truncation, and bypass security controls
-			for _, c := range tok.Value {
-				if c == 0 {
-					t.Error("SECURITY: null byte should NOT be present in value - \\0 escape is disabled for security")
-					return
-				}
-			}
-			// The value should be "valuenull" (without the \0)
-			if tok.Value != "valuenull" {
-				t.Errorf("value = %q, want %q", tok.Value, "valuenull")
-			}
-			return
-		}
+	// Verify the error message mentions null byte
+	if !strings.Contains(err.Error(), "null byte") {
+		t.Errorf("error message should mention null byte, got: %v", err)
 	}
-	t.Error("no value token found")
 }

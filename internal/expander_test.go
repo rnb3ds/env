@@ -802,3 +802,68 @@ func TestExpansionError_Message(t *testing.T) {
 		t.Errorf("Error message should contain depth and limit info, got: %s", msg)
 	}
 }
+
+// TestBuildChain_MasksSensitiveKeys verifies that sensitive keys are masked
+// in the expansion chain for error messages.
+func TestBuildChain_MasksSensitiveKeys(t *testing.T) {
+	lookup := func(key string) (string, bool) {
+		return "", false
+	}
+
+	exp := NewExpander(ExpanderConfig{
+		MaxDepth: 5,
+		Lookup:   lookup,
+		Mode:     ModeAll,
+	})
+
+	tests := []struct {
+		name             string
+		visited          map[string]bool
+		shouldContain    string
+		shouldNotContain string
+	}{
+		{
+			name:             "sensitive key PASSWORD is masked",
+			visited:          map[string]bool{"HOST": true, "DB_PASSWORD": true, "PORT": true},
+			shouldContain:    "HOST", // Non-sensitive, not masked
+			shouldNotContain: "DB_PASSWORD",
+		},
+		{
+			name:             "sensitive key SECRET is masked",
+			visited:          map[string]bool{"APP_SECRET": true, "TOKEN": true},
+			shouldContain:    "AP***", // Masked APP_SECRET
+			shouldNotContain: "APP_SECRET",
+		},
+		{
+			name:             "non-sensitive keys are not masked",
+			visited:          map[string]bool{"VAR1": true, "VAR2": true},
+			shouldContain:    "VAR1",
+			shouldNotContain: "",
+		},
+		{
+			name:             "empty visited returns empty",
+			visited:          map[string]bool{},
+			shouldContain:    "",
+			shouldNotContain: "anything",
+		},
+		{
+			name:             "API_KEY is masked (sensitive)",
+			visited:          map[string]bool{"API_KEY": true},
+			shouldContain:    "AP***",
+			shouldNotContain: "API_KEY",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chain := exp.buildChain(tt.visited)
+
+			if tt.shouldContain != "" && !strings.Contains(chain, tt.shouldContain) {
+				t.Errorf("buildChain() = %q, should contain %q", chain, tt.shouldContain)
+			}
+			if tt.shouldNotContain != "" && strings.Contains(chain, tt.shouldNotContain) {
+				t.Errorf("buildChain() = %q, should NOT contain %q", chain, tt.shouldNotContain)
+			}
+		})
+	}
+}

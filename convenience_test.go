@@ -19,123 +19,106 @@ func setupTestLoader(t *testing.T) *Loader {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	t.Cleanup(ResetDefaultLoader)
+	t.Cleanup(func() { _ = ResetDefaultLoader() })
 	return loader
 }
 
 // ============================================================================
-// Convenience Function Tests
+// Convenience Getter Tests (Table-Driven)
 // ============================================================================
 
-func TestConvenienceGetString(t *testing.T) {
-	loader := setupTestLoader(t)
+func TestConvenienceGet(t *testing.T) {
+	tests := []struct {
+		name       string
+		key        string
+		value      string
+		getter     string // "string", "int", "bool", "duration"
+		defaultVal interface{}
+		wantValue  interface{}
+	}{
+		// String tests
+		{"get string existing", "KEY", "value", "string", nil, "value"},
+		{"get string with default", "MISSING", "", "string", "default_value", "default_value"},
+		{"get string missing no default", "MISSING", "", "string", nil, ""},
 
-	if err := loader.Set("KEY", "value"); err != nil {
-		t.Fatalf("Set() error = %v", err)
+		// Int tests
+		{"get int existing", "PORT", "8080", "int", nil, int64(8080)},
+		{"get int with default", "MISSING", "", "int", int64(9999), int64(9999)},
+		{"get int missing no default", "NOT_EXISTS", "", "int", nil, int64(0)},
+
+		// Bool tests
+		{"get bool true", "DEBUG", "true", "bool", nil, true},
+		{"get bool false", "DEBUG", "false", "bool", nil, false},
+		{"get bool with default", "MISSING", "", "bool", true, true},
+		{"get bool missing no default", "NOT_EXISTS", "", "bool", nil, false},
+
+		// Duration tests
+		{"get duration existing", "TIMEOUT", "30s", "duration", nil, 30 * time.Second},
+		{"get duration with default", "MISSING", "", "duration", 5 * time.Minute, 5 * time.Minute},
+		{"get duration missing no default", "NOT_EXISTS", "", "duration", nil, time.Duration(0)},
 	}
 
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loader := setupTestLoader(t)
 
-	// Test GetString with existing value
-	if got := GetString("KEY"); got != "value" {
-		t.Errorf("GetString(\"KEY\") = %q, want %q", got, "value")
-	}
+			// Set value if provided
+			if tt.value != "" {
+				if err := loader.Set(tt.key, tt.value); err != nil {
+					t.Fatalf("Set() error = %v", err)
+				}
+			}
 
-	// Test GetString with default
-	if got := GetString("MISSING", "default_value"); got != "default_value" {
-		t.Errorf("GetString(\"MISSING\", \"default_value\") = %q, want %q", got, "default_value")
-	}
-}
+			if err := setDefaultLoader(loader); err != nil {
+				t.Fatalf("setDefaultLoader() error = %v", err)
+			}
 
-func TestConvenienceGetInt(t *testing.T) {
-	loader := setupTestLoader(t)
+			switch tt.getter {
+			case "string":
+				var got string
+				if tt.defaultVal != nil {
+					got = GetString(tt.key, tt.defaultVal.(string))
+				} else {
+					got = GetString(tt.key)
+				}
+				if got != tt.wantValue.(string) {
+					t.Errorf("GetString() = %v, want %v", got, tt.wantValue)
+				}
 
-	if err := loader.Set("PORT", "8080"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
+			case "int":
+				var got int64
+				if tt.defaultVal != nil {
+					got = GetInt(tt.key, tt.defaultVal.(int64))
+				} else {
+					got = GetInt(tt.key)
+				}
+				if got != tt.wantValue.(int64) {
+					t.Errorf("GetInt() = %v, want %v", got, tt.wantValue)
+				}
 
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
+			case "bool":
+				var got bool
+				if tt.defaultVal != nil {
+					got = GetBool(tt.key, tt.defaultVal.(bool))
+				} else {
+					got = GetBool(tt.key)
+				}
+				if got != tt.wantValue.(bool) {
+					t.Errorf("GetBool() = %v, want %v", got, tt.wantValue)
+				}
 
-	// Test GetInt with existing value
-	got := GetInt("PORT")
-	if got != 8080 {
-		t.Errorf("GetInt(\"PORT\") = %d, want 8080", got)
-	}
-
-	// Test GetInt with default
-	got = GetInt("MISSING", 9999)
-	if got != 9999 {
-		t.Errorf("GetInt(\"MISSING\", 9999) = %d, want 9999", got)
-	}
-
-	// Test GetInt without default for missing key
-	got = GetInt("NOT_EXISTS")
-	if got != 0 {
-		t.Errorf("GetInt(\"NOT_EXISTS\") = %d, want 0", got)
-	}
-}
-
-func TestConvenienceGetBool(t *testing.T) {
-	loader := setupTestLoader(t)
-
-	if err := loader.Set("DEBUG", "true"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	// Test GetBool with existing value
-	got := GetBool("DEBUG")
-	if got != true {
-		t.Errorf("GetBool(\"DEBUG\") = %v, want true", got)
-	}
-
-	// Test GetBool with default
-	got = GetBool("MISSING", true)
-	if got != true {
-		t.Errorf("GetBool(\"MISSING\", true) = %v, want true", got)
-	}
-
-	// Test GetBool without default for missing key
-	got = GetBool("NOT_EXISTS")
-	if got != false {
-		t.Errorf("GetBool(\"NOT_EXISTS\") = %v, want false", got)
-	}
-}
-
-func TestConvenienceGetDuration(t *testing.T) {
-	loader := setupTestLoader(t)
-
-	if err := loader.Set("TIMEOUT", "30s"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	// Test GetDuration with existing value
-	got := GetDuration("TIMEOUT")
-	if got != 30*time.Second {
-		t.Errorf("GetDuration(\"TIMEOUT\") = %v, want 30s", got)
-	}
-
-	// Test GetDuration with default
-	got = GetDuration("MISSING", 5*time.Minute)
-	if got != 5*time.Minute {
-		t.Errorf("GetDuration(\"MISSING\", 5m) = %v, want 5m", got)
-	}
-
-	// Test GetDuration without default for missing key
-	got = GetDuration("NOT_EXISTS")
-	if got != 0 {
-		t.Errorf("GetDuration(\"NOT_EXISTS\") = %v, want 0", got)
+			case "duration":
+				var got time.Duration
+				if tt.defaultVal != nil {
+					got = GetDuration(tt.key, tt.defaultVal.(time.Duration))
+				} else {
+					got = GetDuration(tt.key)
+				}
+				if got != tt.wantValue.(time.Duration) {
+					t.Errorf("GetDuration() = %v, want %v", got, tt.wantValue)
+				}
+			}
+		})
 	}
 }
 
@@ -228,6 +211,14 @@ func TestConvenienceNoLoader(t *testing.T) {
 	gotInt := GetInt("KEY", 123)
 	if gotInt != 123 {
 		t.Errorf("GetInt with no loader = %d, want 123", gotInt)
+	}
+
+	// Without defaults
+	if GetString("KEY") != "" {
+		t.Error("GetString with no loader and no default should return \"\"")
+	}
+	if GetInt("KEY") != 0 {
+		t.Error("GetInt with no loader and no default should return 0")
 	}
 
 	gotBool := GetBool("KEY", true)

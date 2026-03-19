@@ -85,13 +85,18 @@ cfg.AuditHandler = env.NewJSONAuditHandler(auditFile)
 cfg.RequiredKeys = []string{"DATABASE_URL", "API_KEY"}
 ```
 
+> **Warning**: Do NOT use `os.Stdout` with `JSONAuditHandler` in production.
+> The handler's `Close()` method will close the underlying writer, which would
+> close stdout. Use a file or custom writer instead. For testing, use
+> `NewNopAuditHandler()` to avoid this issue.
+
 ### Security Settings
 
 ```go
 cfg := env.DefaultConfig()
 
 // Key validation
-cfg.Security.KeyPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]+$`)
+cfg.KeyPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]+$`)
 cfg.ValidateValues = true
 
 // Key restrictions
@@ -101,8 +106,8 @@ cfg.ForbiddenKeys = []string{"PATH", "HOME"}
 // Limits
 cfg.MaxFileSize = 64 * 1024      // 64KB
 cfg.MaxVariables = 50
-cfg.Parsing.MaxKeyLength = 32
-cfg.Parsing.MaxValueLength = 1024
+cfg.MaxKeyLength = 32
+cfg.MaxValueLength = 1024
 ```
 
 ---
@@ -147,7 +152,13 @@ sv.Close() // Zero memory immediately
 ```go
 cfg := env.ProductionConfig()
 cfg.AuditEnabled = true
-cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
+
+// Use a file for audit output (recommended for production)
+auditFile, _ := os.Create("/var/log/app/audit.json")
+cfg.AuditHandler = env.NewJSONAuditHandler(auditFile)
+
+// Or use NopAuditHandler for testing
+cfg.AuditHandler = env.NewNopAuditHandler()
 ```
 
 ### Audit Output Format
@@ -157,7 +168,7 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
     "timestamp": "2026-03-11T10:30:00Z",
     "action": "set",
     "key": "AP***",
-    "message": "loaded",
+    "reason": "loaded",
     "success": true
 }
 ```

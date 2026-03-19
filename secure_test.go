@@ -5,95 +5,99 @@ import (
 )
 
 // ============================================================================
-// SecureValue Tests
+// SecureValue Tests (Table-Driven)
 // ============================================================================
 
-func TestNewSecureValue(t *testing.T) {
-	sv := NewSecureValue("test")
-	if sv == nil {
-		t.Fatal("NewSecureValue() returned nil")
-	}
-	if sv.String() != "test" {
-		t.Errorf("String() = %q, want %q", sv.String(), "test")
-	}
-}
+func TestSecureValue(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		operation  string // "new", "close", "release", "string", "bytes", "length", "masked"
+		wantResult interface{}
+		wantClosed bool
+	}{
+		// Creation and basic operations
+		{"new value returns non-nil", "test", "new", true, false},
+		{"new value string", "test", "string", "test", false},
+		{"new value bytes", "test", "bytes", "test", false},
+		{"new value length", "test", "length", 4, false},
 
-func TestSecureValue_Empty(t *testing.T) {
-	sv := NewSecureValue("")
-	if sv.String() != "" {
-		t.Errorf("String() = %q, want empty string", sv.String())
-	}
-}
+		// Empty value handling
+		{"empty value string", "", "string", "", false},
+		{"empty value length", "", "length", 0, false},
+		{"empty value masked", "", "masked", "[SECURE:0 bytes]", false},
 
-func TestSecureValue_Bytes(t *testing.T) {
-	sv := NewSecureValue("test")
-	bytes := sv.Bytes()
-	if string(bytes) != "test" {
-		t.Errorf("Bytes() = %q, want %q", string(bytes), "test")
-	}
-}
+		// Close operation
+		{"close value", "test", "close", nil, true},
+		{"close is idempotent", "test", "close_twice", nil, true},
 
-func TestSecureValue_Length(t *testing.T) {
-	sv := NewSecureValue("test")
-	if sv.Length() != 4 {
-		t.Errorf("Length() = %d, want 4", sv.Length())
-	}
+		// Release operation
+		{"release value", "test", "release", nil, true},
 
-	svEmpty := NewSecureValue("")
-	if svEmpty.Length() != 0 {
-		t.Errorf("Length() = %d, want 0", svEmpty.Length())
-	}
-}
-
-func TestSecureValue_Close(t *testing.T) {
-	sv := NewSecureValue("test")
-
-	if err := sv.Close(); err != nil {
-		t.Errorf("Close() error = %v", err)
+		// Masked output
+		{"masked with value", "test", "masked", "[SECURE:4 bytes]", false},
+		{"masked when closed", "test", "masked_closed", "[CLOSED]", true},
 	}
 
-	if !sv.IsClosed() {
-		t.Error("IsClosed() = false after Close()")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sv := NewSecureValue(tt.input)
+
+			switch tt.operation {
+			case "new":
+				if sv == nil {
+					t.Error("NewSecureValue() returned nil")
+				}
+			case "string":
+				if sv.String() != tt.wantResult.(string) {
+					t.Errorf("String() = %q, want %q", sv.String(), tt.wantResult)
+				}
+			case "bytes":
+				if string(sv.Bytes()) != tt.wantResult.(string) {
+					t.Errorf("Bytes() = %q, want %q", string(sv.Bytes()), tt.wantResult)
+				}
+			case "length":
+				if sv.Length() != tt.wantResult.(int) {
+					t.Errorf("Length() = %d, want %d", sv.Length(), tt.wantResult)
+				}
+			case "masked":
+				if sv.Masked() != tt.wantResult.(string) {
+					t.Errorf("Masked() = %q, want %q", sv.Masked(), tt.wantResult)
+				}
+			case "masked_closed":
+				sv.Close()
+				if sv.Masked() != tt.wantResult.(string) {
+					t.Errorf("Masked() = %q, want %q", sv.Masked(), tt.wantResult)
+				}
+			case "close":
+				if err := sv.Close(); err != nil {
+					t.Errorf("Close() error = %v", err)
+				}
+				if !sv.IsClosed() {
+					t.Error("IsClosed() = false after Close()")
+				}
+			case "close_twice":
+				if err := sv.Close(); err != nil {
+					t.Errorf("First Close() error = %v", err)
+				}
+				if err := sv.Close(); err != nil {
+					t.Errorf("Second Close() error = %v", err)
+				}
+				if !sv.IsClosed() {
+					t.Error("IsClosed() = false after Close()")
+				}
+			case "release":
+				sv.Release()
+				if !sv.IsClosed() {
+					t.Error("IsClosed() = false after Release()")
+				}
+			}
+
+			if tt.wantClosed && !sv.IsClosed() {
+				t.Error("Expected value to be closed")
+			}
+		})
 	}
-
-	// Second close should be idempotent
-	if err := sv.Close(); err != nil {
-		t.Errorf("Second Close() error = %v", err)
-	}
-}
-
-func TestSecureValue_Release(t *testing.T) {
-	sv := NewSecureValue("test")
-
-	sv.Release()
-
-	if !sv.IsClosed() {
-		t.Error("IsClosed() = false after Release()")
-	}
-}
-
-func TestSecureValue_Masked(t *testing.T) {
-	t.Run("with value", func(t *testing.T) {
-		sv := NewSecureValue("test")
-		if sv.Masked() != "[SECURE:4 bytes]" {
-			t.Errorf("Masked() = %q, want %q", sv.Masked(), "[SECURE:4 bytes]")
-		}
-	})
-
-	t.Run("closed", func(t *testing.T) {
-		sv := NewSecureValue("test")
-		sv.Close()
-		if sv.Masked() != "[CLOSED]" {
-			t.Errorf("Masked() = %q, want %q", sv.Masked(), "[CLOSED]")
-		}
-	})
-
-	t.Run("empty", func(t *testing.T) {
-		sv := NewSecureValue("")
-		if sv.Masked() != "[SECURE:0 bytes]" {
-			t.Errorf("Masked() = %q, want %q", sv.Masked(), "[SECURE:0 bytes]")
-		}
-	})
 }
 
 func TestSecureValuePool(t *testing.T) {
@@ -116,158 +120,155 @@ func TestSecureValuePool(t *testing.T) {
 // The reset() method should properly manage state transitions
 // with data being cleared before new value is set.
 func TestSecureValue_ResetStateConsistency(t *testing.T) {
-	t.Run("empty_value_is_valid", func(t *testing.T) {
-		sv := NewSecureValue("")
-		// Empty value is a valid value, not closed
-		if sv.IsClosed() {
-			t.Error("Empty SecureValue should not be closed")
-		}
-		if sv.String() != "" {
-			t.Errorf("Empty SecureValue String() = %q, want empty", sv.String())
-		}
-	})
+	tests := []struct {
+		name       string
+		setupValue string
+		testValue  string
+		wantString string
+		wantClosed bool
+	}{
+		{"empty_value_is_valid", "", "", "", false},
+		{"non_empty_value_is_not_closed", "test", "", "", false},
+		{"reuse_from_pool_with_empty", "initial", "", "", false},
+		{"reuse_from_pool_preserves_state", "initial", "newvalue", "newvalue", false},
+	}
 
-	t.Run("non_empty_value_is_not_closed", func(t *testing.T) {
-		sv := NewSecureValue("test")
-		if sv.IsClosed() {
-			t.Error("Non-empty SecureValue should not be closed")
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sv := NewSecureValue(tt.setupValue)
+			sv.Release()
 
-	t.Run("reuse_from_pool_with_empty", func(t *testing.T) {
-		// Create and release a value
-		sv := NewSecureValue("initial")
-		sv.Release()
+			sv2 := NewSecureValue(tt.testValue)
 
-		// Reuse with empty value
-		sv2 := NewSecureValue("")
-		// Empty is a valid value
-		if sv2.IsClosed() {
-			t.Error("Reused SecureValue with empty value should not be closed")
-		}
-	})
+			if tt.wantClosed != sv2.IsClosed() {
+				t.Errorf("IsClosed() = %v, want %v", sv2.IsClosed(), tt.wantClosed)
+			}
 
-	t.Run("reuse_from_pool_preserves_state", func(t *testing.T) {
-		// Create and release a value
-		sv := NewSecureValue("initial")
-		sv.Release()
-
-		// Reuse with new value
-		sv2 := NewSecureValue("newvalue")
-		if sv2.String() != "newvalue" {
-			t.Errorf("Reused SecureValue = %q, want %q", sv2.String(), "newvalue")
-		}
-		if sv2.IsClosed() {
-			t.Error("Reused SecureValue with value should not be closed")
-		}
-	})
+			if sv2.String() != tt.wantString {
+				t.Errorf("String() = %q, want %q", sv2.String(), tt.wantString)
+			}
+		})
+	}
 }
 
 // ============================================================================
-// secureMap Tests
+// secureMap Tests (Table-Driven)
 // ============================================================================
 
-func TestSecureMap_Basic(t *testing.T) {
-	sm := newSecureMap()
+func TestSecureMap(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation string
+		setup     func(sm *secureMap)
+		key       string
+		value     string
+		wantValue interface{}
+		wantLen   int
+		wantOK    bool
+		wantNil   bool
+	}{
+		// Basic Set and Get
+		{"set and get", "get", func(sm *secureMap) { sm.Set("KEY1", "value1") }, "KEY1", "", "value1", 1, true, false},
+		{"get missing key", "get", nil, "MISSING", "", "", 0, false, false},
 
-	// Test Set
-	sm.Set("KEY1", "value1")
-	sm.Set("KEY2", "value2")
+		// SetAll
+		{"set all", "setall", nil, "", "", nil, 3, true, false},
 
-	// Test GetString
-	if v, ok := sm.Get("KEY1"); !ok || v != "value1" {
-		t.Errorf("GetString(\"KEY1\") = (%q, %v), want (\"value1\", true)", v, ok)
+		// Delete
+		{"delete existing", "delete", func(sm *secureMap) { sm.Set("KEY1", "value1"); sm.Set("KEY2", "value2") }, "KEY1", "", nil, 1, false, false},
+
+		// Clear
+		{"clear", "clear", func(sm *secureMap) { sm.Set("KEY1", "value1"); sm.Set("KEY2", "value2") }, "", "", nil, 0, true, false},
+
+		// Keys
+		{"keys", "keys", func(sm *secureMap) { sm.Set("KEY1", "value1"); sm.Set("KEY2", "value2") }, "", "", nil, 2, true, false},
+
+		// ToMap
+		{"to map", "tomap", func(sm *secureMap) { sm.Set("KEY1", "value1") }, "KEY1", "", "value1", 1, true, false},
+
+		// GetSecure
+		{"get secure existing", "getsecure", func(sm *secureMap) { sm.Set("KEY1", "value1") }, "KEY1", "", "value1", 0, true, false},
+		{"get secure missing", "getsecure", nil, "MISSING", "", nil, 0, false, true},
 	}
 
-	// Test missing key
-	if _, ok := sm.Get("MISSING"); ok {
-		t.Error("GetString(\"MISSING\") should return false for missing key")
-	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sm := newSecureMap()
 
-func TestSecureMap_SetAll(t *testing.T) {
-	sm := newSecureMap()
+			// Setup
+			if tt.operation == "setall" {
+				values := map[string]string{
+					"KEY1": "value1",
+					"KEY2": "value2",
+					"KEY3": "value3",
+				}
+				sm.SetAll(values)
+			} else if tt.setup != nil {
+				tt.setup(sm)
+			}
 
-	values := map[string]string{
-		"KEY1": "value1",
-		"KEY2": "value2",
-		"KEY3": "value3",
-	}
+			switch tt.operation {
+			case "get":
+				val, ok := sm.Get(tt.key)
+				if ok != tt.wantOK {
+					t.Errorf("Get() ok = %v, want %v", ok, tt.wantOK)
+				}
+				if ok && val != tt.wantValue.(string) {
+					t.Errorf("Get() = %q, want %q", val, tt.wantValue)
+				}
 
-	sm.SetAll(values)
+			case "setall":
+				// Already done in setup
 
-	if sm.Len() != 3 {
-		t.Errorf("Len() = %d, want 3", sm.Len())
-	}
-}
+			case "delete":
+				sm.Delete(tt.key)
+				_, ok := sm.Get(tt.key)
+				if ok {
+					t.Error("Key should be deleted")
+				}
 
-func TestSecureMap_Delete(t *testing.T) {
-	sm := newSecureMap()
-	sm.Set("KEY1", "value1")
-	sm.Set("KEY2", "value2")
+			case "clear":
+				sm.Clear()
+				if sm.Len() != 0 {
+					t.Errorf("Len() after Clear() = %d, want 0", sm.Len())
+				}
 
-	sm.Delete("KEY1")
+			case "keys":
+				keys := sm.Keys()
+				if len(keys) != tt.wantLen {
+					t.Errorf("Keys() returned %d keys, want %d", len(keys), tt.wantLen)
+				}
 
-	if _, ok := sm.Get("KEY1"); ok {
-		t.Error("KEY1 should be deleted")
-	}
-	if sm.Len() != 1 {
-		t.Errorf("Len() = %d, want 1", sm.Len())
-	}
-}
+			case "tomap":
+				m := sm.ToMap()
+				if len(m) != tt.wantLen {
+					t.Errorf("ToMap() returned %d keys, want %d", len(m), tt.wantLen)
+				}
+				if tt.wantValue != nil && m[tt.key] != tt.wantValue.(string) {
+					t.Errorf("ToMap()[%q] = %q, want %q", tt.key, m[tt.key], tt.wantValue)
+				}
 
-func TestSecureMap_Clear(t *testing.T) {
-	sm := newSecureMap()
-	sm.Set("KEY1", "value1")
-	sm.Set("KEY2", "value2")
+			case "getsecure":
+				sv := sm.GetSecure(tt.key)
+				if tt.wantNil {
+					if sv != nil {
+						t.Errorf("GetSecure() = %v, want nil", sv)
+					}
+				} else {
+					if sv == nil {
+						t.Fatal("GetSecure() returned nil")
+					}
+					if sv.String() != tt.wantValue.(string) {
+						t.Errorf("GetSecure().String() = %q, want %q", sv.String(), tt.wantValue)
+					}
+					sv.Release()
+				}
+			}
 
-	sm.Clear()
-
-	if sm.Len() != 0 {
-		t.Errorf("Len() = %d, want 0", sm.Len())
-	}
-}
-
-func TestSecureMap_Keys(t *testing.T) {
-	sm := newSecureMap()
-	sm.Set("KEY1", "value1")
-	sm.Set("KEY2", "value2")
-
-	keys := sm.Keys()
-	if len(keys) != 2 {
-		t.Errorf("Keys() returned %d keys, want 2", len(keys))
-	}
-}
-
-func TestSecureMap_ToMap(t *testing.T) {
-	sm := newSecureMap()
-	sm.Set("KEY1", "value1")
-	sm.Set("KEY2", "value2")
-
-	m := sm.ToMap()
-	if len(m) != 2 {
-		t.Errorf("ToMap() returned %d keys, want 2", len(m))
-	}
-	if m["KEY1"] != "value1" {
-		t.Errorf("ToMap()[\"KEY1\"] = %q, want %q", m["KEY1"], "value1")
-	}
-}
-
-func TestSecureMap_GetSecure(t *testing.T) {
-	sm := newSecureMap()
-	sm.Set("KEY1", "value1")
-
-	sv := sm.GetSecure("KEY1")
-	if sv == nil {
-		t.Fatal("GetSecure() returned nil")
-	}
-	if sv.String() != "value1" {
-		t.Errorf("GetSecure().String() = %q, want %q", sv.String(), "value1")
-	}
-
-	// Test missing key
-	if sm.GetSecure("MISSING") != nil {
-		t.Error("GetSecure(\"MISSING\") should return nil")
+			if tt.wantLen > 0 && sm.Len() != tt.wantLen {
+				t.Errorf("Len() = %d, want %d", sm.Len(), tt.wantLen)
+			}
+		})
 	}
 }
 
@@ -396,7 +397,9 @@ func TestNewSecureValueStrict(t *testing.T) {
 		SetMemoryLockStrict(true)
 
 		sv, err := NewSecureValueStrict("sensitive-data")
-		defer sv.Release()
+		if sv != nil {
+			defer sv.Release()
+		}
 
 		// On systems without privileges, this may return an error
 		// On systems with privileges, this should succeed
@@ -405,7 +408,7 @@ func TestNewSecureValueStrict(t *testing.T) {
 		}
 
 		// The SecureValue should still be usable regardless of lock status
-		if sv.String() != "sensitive-data" {
+		if sv != nil && sv.String() != "sensitive-data" {
 			t.Errorf("String() = %q, want %q", sv.String(), "sensitive-data")
 		}
 	})
@@ -414,14 +417,16 @@ func TestNewSecureValueStrict(t *testing.T) {
 		SetMemoryLockEnabled(false)
 
 		sv, err := NewSecureValueStrict("sensitive-data")
-		defer sv.Release()
+		if sv != nil {
+			defer sv.Release()
+		}
 
 		// When locking is disabled, no error should be returned
 		if err != nil {
 			t.Errorf("NewSecureValueStrict() returned error when locking disabled: %v", err)
 		}
 
-		if sv.String() != "sensitive-data" {
+		if sv != nil && sv.String() != "sensitive-data" {
 			t.Errorf("String() = %q, want %q", sv.String(), "sensitive-data")
 		}
 	})

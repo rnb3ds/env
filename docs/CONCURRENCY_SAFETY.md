@@ -85,9 +85,11 @@ type Loader struct {
 
 ```go
 type SecureValue struct {
-    mu     sync.RWMutex     // Protects data access
-    data   []byte           // Sensitive value
-    closed atomic.Bool      // Lock-free closed state check
+    mu      sync.RWMutex     // Protects data access
+    data    []byte           // Sensitive value
+    closed  atomic.Bool      // Lock-free closed state check
+    locked  bool             // Tracks if memory is mlock'd
+    lockErr error            // Stores any mlock error for strict mode
 }
 ```
 
@@ -95,6 +97,7 @@ type SecureValue struct {
 - Thread-safe read access via `RLock()`
 - Safe concurrent close via `atomic.Bool`
 - GC-safe cleanup with `runtime.SetFinalizer`
+- Optional memory locking (mlock) to prevent swapping
 
 ### 4. Singleton Pattern (Default Loader)
 

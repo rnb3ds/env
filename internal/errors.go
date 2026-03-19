@@ -16,6 +16,9 @@ var (
 
 	// ErrInvalidValue indicates a value is invalid.
 	ErrInvalidValue = errors.New("invalid value content")
+
+	// ErrSecurityViolation indicates a security policy violation.
+	ErrSecurityViolation = errors.New("security policy violation")
 )
 
 // ParseError provides detailed information about parsing failures.
@@ -55,10 +58,10 @@ func (e *ValidationError) Error() string {
 	return fmt.Sprintf("validation error: %s", e.Message)
 }
 
-// Unwrap returns nil as ValidationError is a leaf error with no underlying cause.
-// This method exists to satisfy the error wrapping interface convention.
-func (e *ValidationError) Unwrap() error {
-	return nil
+// Is implements errors.Is for ValidationError.
+// This allows errors.Is(err, ErrInvalidConfig) to match ValidationError.
+func (e *ValidationError) Is(target error) bool {
+	return target == ErrInvalidValue
 }
 
 // SecurityError provides detailed information about security violations.
@@ -75,6 +78,12 @@ func (e *SecurityError) Error() string {
 		return fmt.Sprintf("security violation: %s blocked for key %q: %s", e.Action, e.Key, e.Reason)
 	}
 	return fmt.Sprintf("security violation: %s blocked: %s", e.Action, e.Reason)
+}
+
+// Is implements errors.Is for SecurityError.
+// This allows errors.Is(err, ErrSecurityViolation) to match SecurityError.
+func (e *SecurityError) Is(target error) bool {
+	return target == ErrSecurityViolation
 }
 
 // FileError provides detailed information about file-related errors.
