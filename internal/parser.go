@@ -17,20 +17,37 @@ type LineParserConfig struct {
 
 // LineParser handles parsing of individual lines.
 type LineParser struct {
-	config    LineParserConfig
-	validator *Validator
-	auditor   *Auditor
-	expander  *Expander
+	config         LineParserConfig
+	keyValidator   LineKeyValidator
+	valueValidator LineValueValidator
+	auditor        LineAuditLogger
+	expander       LineExpander
 }
 
 // NewLineParser creates a new LineParser.
-func NewLineParser(cfg LineParserConfig, v *Validator, a *Auditor, e *Expander) *LineParser {
-	return &LineParser{
-		config:    cfg,
-		validator: v,
-		auditor:   a,
-		expander:  e,
+// The validators, auditor, and expander parameters accept interfaces rather than concrete types,
+// allowing for better testability and flexibility.
+// For the keyValidator parameter, you can pass the same object as valueValidator if it implements both interfaces.
+func NewLineParser(cfg LineParserConfig, keyValidator LineKeyValidator, auditor LineAuditLogger, expander LineExpander) *LineParser {
+	// If keyValidator also implements LineValueValidator, use it for both
+	var valueValidator LineValueValidator
+	if vv, ok := keyValidator.(LineValueValidator); ok {
+		valueValidator = vv
 	}
+
+	return &LineParser{
+		config:         cfg,
+		keyValidator:   keyValidator,
+		valueValidator: valueValidator,
+		auditor:        auditor,
+		expander:       expander,
+	}
+}
+
+// SetValueValidator sets a separate value validator if needed.
+// This is useful when key and value validation are handled by different objects.
+func (p *LineParser) SetValueValidator(v LineValueValidator) {
+	p.valueValidator = v
 }
 
 // ParseLine parses a single line and returns the key and value.
@@ -58,7 +75,7 @@ func (p *LineParser) ParseLine(line string) (string, string, error) {
 	key := line[keyStart:keyEnd]
 
 	// Validate key
-	if err := p.validator.ValidateKey(key); err != nil {
+	if err := p.keyValidator.ValidateKey(key); err != nil {
 		return "", "", err
 	}
 
@@ -71,8 +88,10 @@ func (p *LineParser) ParseLine(line string) (string, string, error) {
 	}
 
 	// Validate value
-	if err := p.validator.ValidateValue(parsedValue); err != nil {
-		return "", "", err
+	if p.valueValidator != nil {
+		if err := p.valueValidator.ValidateValue(parsedValue); err != nil {
+			return "", "", err
+		}
 	}
 
 	return key, parsedValue, nil
@@ -124,7 +143,7 @@ func (p *LineParser) ParseLineBytes(line []byte) (string, string, error) {
 	key := InternKey(string(line[keyStart:keyEnd]))
 
 	// Validate key
-	if err := p.validator.ValidateKey(key); err != nil {
+	if err := p.keyValidator.ValidateKey(key); err != nil {
 		return "", "", err
 	}
 
@@ -136,8 +155,10 @@ func (p *LineParser) ParseLineBytes(line []byte) (string, string, error) {
 	}
 
 	// Validate value
-	if err := p.validator.ValidateValue(parsedValue); err != nil {
-		return "", "", err
+	if p.valueValidator != nil {
+		if err := p.valueValidator.ValidateValue(parsedValue); err != nil {
+			return "", "", err
+		}
 	}
 
 	return key, parsedValue, nil
@@ -248,10 +269,11 @@ func (p *LineParser) ParseValueBytes(value []byte) (string, error) {
 		value = value[:end]
 	}
 
-	// SECURITY: Must copy the value string because it's a slice of the scanner buffer.
-	// The scanner reuses its buffer on each Scan() call, so using bytesToString here
-	// would cause the returned string to be corrupted when the next line is scanned.
-	// The small allocation cost is necessary for memory safety.
+	// SECURITY: The string() conversion creates an independent copy of the bytes.
+	// value is a slice into the scanner's reusable buffer, which will be
+	// overwritten on the next Scan() call. Without this copy, the returned
+	// string would become corrupted when the buffer is reused.
+	// The allocation cost is necessary for memory safety.
 	return string(value), nil
 }
 
@@ -322,9 +344,16 @@ func ParseDoubleQuotedBytes(value []byte) (string, error) {
 	// Extract content between quotes
 	content := value[1 : len(value)-1]
 
-	// Fast path: no escape sequences - must copy because content is a slice
-	// of the scanner buffer which will be reused on the next Scan() call.
-	// Using bytesToString here would cause data corruption.
+	// Fast path: no escape sequences
+	//
+	// SECURITY: The string(content) conversion is essential here.
+	// content is a slice into the scanner's reusable buffer, which will be
+	// overwritten on the next Scan() call. The string() conversion creates
+	// an independent copy of the bytes, ensuring the returned string remains
+	// valid after the scanner buffer is reused.
+	//
+	// DO NOT optimize this to use unsafe.StringData or similar - the copy
+	// is necessary for memory safety.
 	if bytes.IndexByte(content, '\\') == -1 {
 		return string(content), nil
 	}
@@ -369,8 +398,10 @@ func ParseSingleQuotedBytes(value []byte) (string, error) {
 		return "", ErrInvalidValue
 	}
 
-	// SECURITY: Must copy the value because it's a slice of the scanner buffer.
-	// Using bytesToString here would cause data corruption when the scanner buffer is reused.
+	// SECURITY: The string() conversion creates an independent copy of the bytes.
+	// value is a slice into the scanner's reusable buffer, which will be
+	// overwritten on the next Scan() call. Without this copy, the returned
+	// string would become corrupted when the buffer is reused.
 	return string(value[1 : len(value)-1]), nil
 }
 
@@ -463,9 +494,30 @@ func IsYamlNumber(s string) bool {
 
 // ExpandAll expands all variables in the map.
 // Returns the original map if no expansion is needed, avoiding unnecessary allocations.
+// This method delegates to Expander.ExpandAllInMap for the actual expansion logic.
 func (p *LineParser) ExpandAll(vars map[string]string) (map[string]string, error) {
-	// Fast path: first check if any values need expansion
-	// This avoids expensive cycle detection when no expansion is needed
+	// Type assert to concrete Expander type to access optimized ExpandAllInMap
+	// This is safe because we always use *Expander internally
+	if expander, ok := p.expander.(*Expander); ok {
+		result, err := expander.ExpandAllInMap(vars)
+		if err != nil {
+			// Log cycle detection errors
+			if expErr, ok := err.(*ExpansionError); ok && expErr.Key != "" {
+				p.auditor.LogError(ActionExpand, expErr.Key, "cycle detected")
+			}
+			return nil, err
+		}
+		return result, nil
+	}
+
+	// Fallback: expand manually using the interface method
+	return p.expandAllUsingInterface(vars)
+}
+
+// expandAllUsingInterface expands all variables using the VariableExpander interface.
+// This is used when the expander is not the built-in *Expander type.
+func (p *LineParser) expandAllUsingInterface(vars map[string]string) (map[string]string, error) {
+	// Fast path: check if any values need expansion
 	needsExpansion := false
 	for _, value := range vars {
 		if strings.IndexByte(value, '$') != -1 {
@@ -479,26 +531,14 @@ func (p *LineParser) ExpandAll(vars map[string]string) (map[string]string, error
 		return vars, nil
 	}
 
-	// Check for cycles only when expansion is needed
-	if cycle, found := DetectCycle(vars); found {
-		p.auditor.LogError(ActionExpand, cycle, "cycle detected")
-		return nil, &ExpansionError{
-			Key:   cycle,
-			Chain: "cycle detected",
-		}
-	}
-
-	// Pre-allocate result map with exact size
+	// Expand all values using the interface method
 	result := make(map[string]string, len(vars))
-
-	// Expand all values
 	for key, value := range vars {
 		expanded, err := p.expander.Expand(value)
 		if err != nil {
 			p.auditor.LogError(ActionExpand, key, err.Error())
 			return nil, err
 		}
-		// Store expanded value (may be same as original)
 		result[key] = expanded
 	}
 

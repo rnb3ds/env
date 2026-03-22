@@ -2,7 +2,6 @@ package env
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"time"
 
@@ -11,18 +10,17 @@ import (
 
 // jsonParser handles parsing of JSON configuration files.
 type jsonParser struct {
-	config      Config
-	validator   Validator
-	auditor     AuditLogger
-	flatten     internal.JSONFlattenConfig
-	factory     *ComponentFactory
-	ownsFactory bool
+	config    Config
+	validator Validator
+	auditor   FullAuditLogger
+	flatten   internal.JSONFlattenConfig
 }
 
 // Compile-time check that jsonParser implements EnvParser.
 var _ EnvParser = (*jsonParser)(nil)
 
 // newJSONParserWithFactory creates a new jsonParser with a ComponentFactory.
+// The factory lifecycle is managed by the caller (typically the Loader), not by the parser.
 func newJSONParserWithFactory(cfg Config, factory *ComponentFactory) (*jsonParser, error) {
 	maxDepth := cfg.JSONMaxDepth
 	if maxDepth <= 0 {
@@ -38,12 +36,10 @@ func newJSONParserWithFactory(cfg Config, factory *ComponentFactory) (*jsonParse
 		MaxDepth:         maxDepth,
 	}
 	return &jsonParser{
-		config:      cfg,
-		validator:   factory.Validator(),
-		auditor:     factory.Auditor(),
-		flatten:     flattenCfg,
-		factory:     factory,
-		ownsFactory: false, // factory lifecycle managed by caller
+		config:    cfg,
+		validator: factory.Validator(),
+		auditor:   factory.Auditor(),
+		flatten:   flattenCfg,
 	}, nil
 }
 
@@ -73,41 +69,12 @@ func (p *jsonParser) Parse(r io.Reader, filename string) (map[string]string, err
 		return nil, err
 	}
 
-	// Check result size against config
-	if len(result) > p.config.MaxVariables {
-		_ = p.auditor.LogError(internal.ActionParse, "", "maximum variables exceeded")
-		return nil, &ValidationError{
-			Field:   "variables",
-			Message: fmt.Sprintf("exceeded maximum of %d variables", p.config.MaxVariables),
-		}
-	}
-
-	// Validate each key and value using fast byte-level validation
-	for key, val := range result {
-		// Use fast byte-level validation (allows @, -, ., [] etc.)
-		if !internal.IsValidJSONKey(key) {
-			_ = p.auditor.LogError(internal.ActionParse, key, "key does not match JSON key pattern")
-			return nil, &ValidationError{
-				Field:   "key",
-				Value:   MaskSensitiveInString(key),
-				Rule:    "pattern",
-				Message: "key does not match required pattern",
-			}
-		}
-		if p.config.ValidateValues {
-			if err := p.validator.ValidateValue(val); err != nil {
-				_ = p.auditor.LogError(internal.ActionParse, key, err.Error())
-				return nil, err
-			}
-		}
-	}
-
-	// Validate required keys
-	upperKeys := internal.KeysToUpperPooled(result)
-	err = p.validator.ValidateRequired(upperKeys)
-	internal.PutKeysToUpperMap(upperKeys)
-	if err != nil {
-		_ = p.auditor.LogError(internal.ActionValidate, "", err.Error())
+	// Validate parsed result using shared validation logic
+	if err := (&structuredParserConfig{
+		config:    p.config,
+		validator: p.validator,
+		auditor:   p.auditor,
+	}).validateResult(result, "JSON"); err != nil {
 		return nil, err
 	}
 
@@ -116,10 +83,7 @@ func (p *jsonParser) Parse(r io.Reader, filename string) (map[string]string, err
 }
 
 // Close releases resources held by the parser.
-// If the parser owns its ComponentFactory, it will also close the factory.
+// Note: The parser does not own the ComponentFactory; it is managed by the caller.
 func (p *jsonParser) Close() error {
-	if p.ownsFactory && p.factory != nil {
-		return p.factory.Close()
-	}
 	return nil
 }

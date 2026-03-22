@@ -1,6 +1,36 @@
 // Package internal provides security limits for the env package.
 package internal
 
+// ============================================================================
+// Default Security Limits
+// ============================================================================
+
+// Default security limits for high-security configurations.
+// These values are intentionally conservative to prevent various attacks.
+const (
+	// DefaultMaxFileSize is the maximum allowed file size (2 MB).
+	DefaultMaxFileSize int64 = 2 * 1024 * 1024
+
+	// DefaultMaxLineLength is the maximum allowed line length.
+	DefaultMaxLineLength int = 1024
+
+	// DefaultMaxKeyLength is the maximum allowed key length.
+	DefaultMaxKeyLength int = 64
+
+	// DefaultMaxValueLength is the maximum allowed value length.
+	DefaultMaxValueLength int = 4096
+
+	// DefaultMaxVariables is the maximum number of variables per file.
+	DefaultMaxVariables int = 500
+
+	// DefaultMaxExpansionDepth is the maximum variable expansion depth.
+	DefaultMaxExpansionDepth int = 5
+)
+
+// ============================================================================
+// Hard Security Limits
+// ============================================================================
+
 // Hard security limits that cannot be exceeded.
 // These are absolute maximums for safety and are used across all packages.
 const (

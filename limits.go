@@ -7,51 +7,29 @@ import (
 )
 
 // ============================================================================
-// Security Limits
+// Security Limits (re-exported from internal/limits)
 // ============================================================================
 
 // Default security limits for high-security configurations.
 // These values are intentionally conservative to prevent various attacks.
 const (
 	// DefaultMaxFileSize is the maximum allowed file size (2 MB).
-	DefaultMaxFileSize int64 = 2 * 1024 * 1024
+	DefaultMaxFileSize = internal.DefaultMaxFileSize
 
 	// DefaultMaxLineLength is the maximum allowed line length.
-	DefaultMaxLineLength int = 1024
+	DefaultMaxLineLength = internal.DefaultMaxLineLength
 
 	// DefaultMaxKeyLength is the maximum allowed key length.
-	DefaultMaxKeyLength int = 64
+	DefaultMaxKeyLength = internal.DefaultMaxKeyLength
 
 	// DefaultMaxValueLength is the maximum allowed value length.
-	DefaultMaxValueLength int = 4096
+	DefaultMaxValueLength = internal.DefaultMaxValueLength
 
 	// DefaultMaxVariables is the maximum number of variables per file.
-	DefaultMaxVariables int = 500
+	DefaultMaxVariables = internal.DefaultMaxVariables
 
 	// DefaultMaxExpansionDepth is the maximum variable expansion depth.
-	DefaultMaxExpansionDepth int = 5
-)
-
-// Hard limits that cannot be exceeded even with custom configuration.
-// These are re-exported from internal/limits for public API compatibility.
-const (
-	// HardMaxFileSize is the absolute maximum file size (100 MB).
-	HardMaxFileSize = internal.HardMaxFileSize
-
-	// HardMaxLineLength is the absolute maximum line length.
-	HardMaxLineLength = internal.HardMaxLineLength
-
-	// HardMaxKeyLength is the absolute maximum key length.
-	HardMaxKeyLength = internal.HardMaxKeyLength
-
-	// HardMaxValueLength is the absolute maximum value length.
-	HardMaxValueLength = internal.HardMaxValueLength
-
-	// HardMaxVariables is the absolute maximum variables per file.
-	HardMaxVariables = internal.HardMaxVariables
-
-	// HardMaxExpansionDepth is the absolute maximum expansion depth.
-	HardMaxExpansionDepth = internal.HardMaxExpansionDepth
+	DefaultMaxExpansionDepth = internal.DefaultMaxExpansionDepth
 )
 
 // ============================================================================
@@ -66,13 +44,13 @@ const (
 //	var defaultKeyPatternRegex = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*$`)
 var DefaultKeyPattern *regexp.Regexp = nil
 
-// DefaultForbiddenKeys contains keys that could affect system behavior.
+// defaultForbiddenKeys contains keys that could affect system behavior.
 // These keys are forbidden by default to prevent:
 //   - PATH injection attacks
 //   - Library preloading attacks (LD_PRELOAD, LD_LIBRARY_PATH, DYLD_*)
 //   - Shell escape attacks (SHELL, ENV, BASH_ENV, IFS)
 //   - Language-specific injection (PYTHONPATH, PERL5OPT, RUBYLIB, NODE_PATH)
-var DefaultForbiddenKeys = map[string]bool{
+var defaultForbiddenKeys = map[string]bool{
 	"PATH":                  true,
 	"LD_PRELOAD":            true,
 	"LD_LIBRARY_PATH":       true,
@@ -93,3 +71,13 @@ var DefaultForbiddenKeys = map[string]bool{
 	"RUBYLIB":               true,
 	"NODE_PATH":             true,
 }
+
+// defaultForbiddenKeysSlice is a pre-computed slice of defaultForbiddenKeys.
+// This avoids map iteration on every factory creation.
+var defaultForbiddenKeysSlice = func() []string {
+	keys := make([]string, 0, len(defaultForbiddenKeys))
+	for k := range defaultForbiddenKeys {
+		keys = append(keys, k)
+	}
+	return keys
+}()

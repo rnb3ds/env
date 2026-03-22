@@ -679,3 +679,54 @@ func TestConfig_OverwriteExisting(t *testing.T) {
 		}
 	})
 }
+
+// ============================================================================
+// Config.IsZero Completeness Tests
+// ============================================================================
+
+func TestConfigIsZero_Completeness(t *testing.T) {
+	// Zero-value config should be detected as zero
+	var zeroCfg Config
+	if !zeroCfg.IsZero() {
+		t.Error("Zero-value Config should return true for IsZero()")
+	}
+
+	// DefaultConfig should NOT be zero
+	defaultCfg := DefaultConfig()
+	if defaultCfg.IsZero() {
+		t.Error("DefaultConfig() should return non-zero Config")
+	}
+
+	// Each non-zero-default field should make IsZero return false
+	tests := []struct {
+		name string
+		cfg  Config
+	}{
+		{"MaxFileSize", Config{LimitsConfig: LimitsConfig{MaxFileSize: 1}}},
+		{"MaxVariables", Config{LimitsConfig: LimitsConfig{MaxVariables: 1}}},
+		{"MaxLineLength", Config{LimitsConfig: LimitsConfig{MaxLineLength: 1}}},
+		{"MaxKeyLength", Config{LimitsConfig: LimitsConfig{MaxKeyLength: 1}}},
+		{"MaxValueLength", Config{LimitsConfig: LimitsConfig{MaxValueLength: 1}}},
+		{"MaxExpansionDepth", Config{LimitsConfig: LimitsConfig{MaxExpansionDepth: 1}}},
+		{"ValidateValues", Config{ValidationConfig: ValidationConfig{ValidateValues: true}}},
+		{"JSONNullAsEmpty", Config{JSONConfig: JSONConfig{JSONNullAsEmpty: true}}},
+		{"JSONNumberAsString", Config{JSONConfig: JSONConfig{JSONNumberAsString: true}}},
+		{"JSONBoolAsString", Config{JSONConfig: JSONConfig{JSONBoolAsString: true}}},
+		{"YAMLNullAsEmpty", Config{YAMLConfig: YAMLConfig{YAMLNullAsEmpty: true}}},
+		{"YAMLNumberAsString", Config{YAMLConfig: YAMLConfig{YAMLNumberAsString: true}}},
+		{"YAMLBoolAsString", Config{YAMLConfig: YAMLConfig{YAMLBoolAsString: true}}},
+		{"AllowExportPrefix", Config{ParsingConfig: ParsingConfig{AllowExportPrefix: true}}},
+		{"ExpandVariables", Config{ParsingConfig: ParsingConfig{ExpandVariables: true}}},
+		{"KeyPattern", Config{ValidationConfig: ValidationConfig{KeyPattern: regexp.MustCompile(".")}}},
+		{"Filenames", Config{FileConfig: FileConfig{Filenames: []string{".env"}}}},
+		{"FileSystem", Config{ComponentConfig: ComponentConfig{FileSystem: DefaultFileSystem}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.cfg.IsZero() {
+				t.Errorf("Config with %s set should not be detected as zero", tt.name)
+			}
+		})
+	}
+}

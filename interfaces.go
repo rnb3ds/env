@@ -3,58 +3,65 @@ package env
 import (
 	"io"
 	"time"
+
+	"github.com/cybergodev/env/internal"
 )
 
-// KeyValidator defines the interface for validating environment variable keys.
+// ============================================================================
+// Validation Interfaces (Interface Segregation Principle)
+// ============================================================================
+
+// KeyValidator is an alias for internal.KeyValidator.
 // Implementations can enforce naming conventions, security policies, and length limits.
-type KeyValidator interface {
-	// ValidateKey checks if the key is valid.
-	// Returns an error if the key violates any validation rules.
-	ValidateKey(key string) error
-}
+type KeyValidator = internal.KeyValidator
 
-// ValueValidator defines the interface for validating environment variable values.
+// ValueValidator is an alias for internal.ValueValidator.
 // Implementations can check for security issues like null bytes or control characters.
-type ValueValidator interface {
-	// ValidateValue checks if the value is valid.
-	// Returns an error if the value violates any validation rules.
-	ValidateValue(value string) error
-}
+type ValueValidator = internal.ValueValidator
 
-// Validator combines key and value validation.
-type Validator interface {
-	KeyValidator
-	ValueValidator
+// RequiredValidator defines the interface for validating required keys.
+type RequiredValidator interface {
 	// ValidateRequired checks that all required keys are present.
 	ValidateRequired(keys map[string]bool) error
 }
 
-// AuditLogger defines the interface for audit logging.
-// Implementations can log to different destinations (file, stdout, external services).
-type AuditLogger interface {
+// Validator combines all validation capabilities.
+// Implementations should implement all three methods for full functionality.
+// Partial implementations (only KeyValidator) will return ErrValidateRequiredUnsupported
+// from ValidateRequired.
+type Validator interface {
+	KeyValidator
+	ValueValidator
+	RequiredValidator
+}
+
+// ============================================================================
+// Audit Logger Interfaces
+// ============================================================================
+
+// AuditLogger is an alias for internal.AuditLogger.
+// This interface requires only LogError, making it easy to implement custom loggers.
+// For full audit capabilities, see FullAuditLogger.
+type AuditLogger = internal.AuditLogger
+
+// FullAuditLogger provides extended audit logging capabilities.
+// It extends AuditLogger with additional methods for detailed logging.
+// The built-in internal.Auditor implements this interface.
+type FullAuditLogger interface {
+	AuditLogger
 	// Log records an audit event.
 	Log(action AuditAction, key, reason string, success bool) error
-
-	// LogError records an error event.
-	LogError(action AuditAction, key, errMsg string) error
-
 	// LogWithFile records an audit event with file information.
 	LogWithFile(action AuditAction, key, file, reason string, success bool) error
-
 	// LogWithDuration records an audit event with timing information.
 	LogWithDuration(action AuditAction, key, reason string, success bool, duration time.Duration) error
-
 	// Close closes the audit logger and releases resources.
 	Close() error
 }
 
-// VariableExpander defines the interface for variable expansion.
+// VariableExpander is an alias for internal.VariableExpander.
 // Implementations can support different expansion syntaxes ($VAR, ${VAR}, etc.).
-type VariableExpander interface {
-	// Expand performs variable expansion on the input string.
-	// Returns the expanded string or an error if expansion fails.
-	Expand(s string) (string, error)
-}
+type VariableExpander = internal.VariableExpander
 
 // EnvParser defines the interface for parsing environment files.
 type EnvParser interface {

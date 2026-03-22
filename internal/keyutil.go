@@ -1,7 +1,10 @@
 // Package internal provides key validation utilities.
 package internal
 
-import "sync"
+import (
+	"errors"
+	"sync"
+)
 
 // Hash constant for multiplicative hashing.
 // This is Knuth's multiplicative hash constant: 2^32 / φ (golden ratio).
@@ -58,6 +61,12 @@ func HashKey(key string, numShards int) uint32 {
 	// Fast path for very short keys (1-4 chars): branchless implementation
 	// This is the most common case for environment variable keys
 	if keyLen <= 4 {
+		// SAFETY: Go guarantees zero-initialization for local variables.
+		// The array b is fully initialized to zeros before we copy key bytes.
+		// For keys shorter than 4 chars, unused positions remain zero.
+		// The hash calculation correctly incorporates keyLen to ensure
+		// different-length keys produce different hashes even if their
+		// common prefix bytes are identical.
 		var b [4]byte
 		for i := 0; i < keyLen; i++ {
 			b[i] = key[i]
@@ -121,6 +130,9 @@ func getShard(key string) *internShard {
 // 1. The cache is small (128 entries per shard), making lookup very fast
 // 2. RWMutex has higher overhead for the common case of cache hit + small cache
 // 3. Simpler lock management improves cache locality
+//
+// SECURITY: This function maintains strict consistency between the cache map
+// and order slice to prevent memory leaks and ensure correct FIFO eviction.
 func InternKey(key string) string {
 	if len(key) == 0 || len(key) > maxInternKeyLen {
 		return key // Don't intern empty or very long keys
@@ -137,28 +149,33 @@ func InternKey(key string) string {
 
 	// FIFO eviction if cache is full
 	if len(shard.cache) >= maxInternSize {
-		// Remove oldest 1/4 of entries using circular buffer approach
-		evictCount := maxInternSize / 4
-		for i := 0; i < evictCount; i++ {
-			idx := (shard.orderStart + i) % len(shard.order)
-			keyToEvict := shard.order[idx]
-			delete(shard.cache, keyToEvict)
-			shard.order[idx] = "" // Clear reference for GC
+		// SECURITY: Ensure order slice is consistent with cache before eviction.
+		// This handles edge cases where order might have gotten out of sync.
+		// We check both conditions:
+		// 1. order is shorter than cache (entries added without order tracking)
+		// 2. order is longer than cache (entries deleted without order tracking)
+		if len(shard.order) != len(shard.cache) {
+			shard.rebuildOrder()
 		}
-		// Move start pointer forward (circular buffer)
-		shard.orderStart = (shard.orderStart + evictCount) % len(shard.order)
 
-		// Compact if we've wrapped around too many times
-		if shard.orderStart > 0 && len(shard.order) >= maxInternSize*3/4 {
-			newOrder := make([]string, 0, maxInternSize)
-			for i := 0; i < len(shard.order); i++ {
+		// Remove oldest 1/4 of entries using circular buffer approach
+		// SECURITY: Use min() to ensure evictCount doesn't exceed len(shard.order)
+		// This prevents index out of bounds if shard.order is shorter than expected
+		evictCount := min(maxInternSize/4, len(shard.order))
+		if evictCount > 0 {
+			for i := 0; i < evictCount; i++ {
 				idx := (shard.orderStart + i) % len(shard.order)
-				if shard.order[idx] != "" {
-					newOrder = append(newOrder, shard.order[idx])
-				}
+				keyToEvict := shard.order[idx]
+				delete(shard.cache, keyToEvict)
+				shard.order[idx] = "" // Clear reference for GC
 			}
-			shard.order = newOrder
-			shard.orderStart = 0
+			// Move start pointer forward (circular buffer)
+			shard.orderStart = (shard.orderStart + evictCount) % len(shard.order)
+
+			// Compact if we've wrapped around too many times
+			if shard.orderStart > 0 && len(shard.order) >= maxInternSize*3/4 {
+				shard.compactOrder()
+			}
 		}
 	}
 
@@ -168,9 +185,43 @@ func InternKey(key string) string {
 	return key
 }
 
-// isValidDefaultKey checks if a key matches the default pattern ^[A-Za-z][A-Za-z0-9_]*$
-// This is faster than using regex for the common case.
-// This function is used by both Validator and Expander for consistent key validation.
+// rebuildOrder rebuilds the order slice from cache keys to restore consistency.
+// Must be called with shard.mu held.
+func (s *internShard) rebuildOrder() {
+	s.order = s.order[:0]
+	for k := range s.cache {
+		s.order = append(s.order, k)
+	}
+	s.orderStart = 0
+}
+
+// compactOrder compacts the order slice by removing empty slots.
+// Must be called with shard.mu held.
+func (s *internShard) compactOrder() {
+	newOrder := make([]string, 0, maxInternSize)
+	for i := 0; i < len(s.order); i++ {
+		idx := (s.orderStart + i) % len(s.order)
+		if s.order[idx] != "" {
+			newOrder = append(newOrder, s.order[idx])
+		}
+	}
+	s.order = newOrder
+	s.orderStart = 0
+}
+
+// isValidDefaultKey is the canonical implementation for validating environment variable
+// keys against the default pattern ^[A-Za-z][A-Za-z0-9_]*$.
+//
+// This function is used by:
+//   - Validator.ValidateKey() when no custom KeyPattern is configured
+//   - Expander for validating variable names during expansion
+//
+// Performance: This byte-level implementation is significantly faster than regexp
+// for the common case of standard environment variable names.
+//
+// Ownership: This is the single source of truth for default key validation logic.
+// Do not duplicate this logic elsewhere; all components should call this function
+// when using the default pattern.
 func isValidDefaultKey(key string) bool {
 	if len(key) == 0 {
 		return false
@@ -298,6 +349,8 @@ func TrimSpace(s string) string {
 // 1. Environment variable names are conventionally ASCII
 // 2. Key validation elsewhere rejects non-ASCII keys
 // 3. Visual spoofing attacks with Unicode are mitigated by key pattern validation
+//
+// For use cases requiring strict ASCII validation, use ToUpperASCIISafe instead.
 func ToUpperASCII(s string) string {
 	// Single-pass: convert to uppercase while detecting if conversion is needed
 	// This avoids the double-pass of check-then-convert
@@ -326,4 +379,68 @@ func ToUpperASCII(s string) string {
 	}
 	// No lowercase characters found, return original
 	return s
+}
+
+// ErrNonASCII is returned when a string contains non-ASCII characters
+// in functions that require ASCII-only input.
+var ErrNonASCII = errors.New("string contains non-ASCII characters")
+
+// ToUpperASCIISafe converts an ASCII string to uppercase with strict ASCII validation.
+// Returns ErrNonASCII if the input contains any bytes >= 0x80.
+// This is the safe version of ToUpperASCII for use when input validation is required.
+//
+// Performance: This function has minimal overhead compared to ToUpperASCII
+// (single additional bounds check per character that was already being performed).
+func ToUpperASCIISafe(s string) (string, error) {
+	// Single-pass: validate ASCII and convert to uppercase
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		// SECURITY: Check for non-ASCII bytes first
+		if c >= 0x80 {
+			return "", ErrNonASCII
+		}
+		if c >= 'a' && c <= 'z' {
+			// Found a lowercase character, need to convert
+			b := make([]byte, len(s))
+			for j := 0; j < i; j++ {
+				b[j] = s[j]
+			}
+			b[i] = c - 32
+			for j := i + 1; j < len(s); j++ {
+				c2 := s[j]
+				// SECURITY: Validate remaining characters too
+				if c2 >= 0x80 {
+					return "", ErrNonASCII
+				}
+				if c2 >= 'a' && c2 <= 'z' {
+					b[j] = c2 - 32
+				} else {
+					b[j] = c2
+				}
+			}
+			return string(b), nil
+		}
+	}
+	return s, nil
+}
+
+// IsASCII checks if a string contains only ASCII characters (bytes < 0x80).
+// This is a fast path function used for input validation.
+func IsASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// DefaultMaskKey masks a key name for safe logging and error reporting.
+// Shows only the first 2 characters followed by "***" for keys longer than 3 characters.
+// This is the default masking function used by validators and path validators.
+func DefaultMaskKey(key string) string {
+	if len(key) <= 3 {
+		return "***"
+	}
+	return key[:2] + "***"
 }

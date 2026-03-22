@@ -30,11 +30,6 @@ func withLoaderError[T any](fn func(*Loader) (T, error)) (T, error) {
 	return fn(loader)
 }
 
-// defaultString extracts the first string from a variadic slice or returns empty string.
-func defaultString(defaultValue []string) string {
-	return firstOrZero(defaultValue...)
-}
-
 // GetString retrieves a value from the default loader with optional default.
 // Returns an empty string if the loader cannot be initialized or the key is not found
 // and no default is provided.
@@ -47,7 +42,7 @@ func defaultString(defaultValue []string) string {
 func GetString(key string, defaultValue ...string) string {
 	return withLoader(func(l *Loader) string {
 		return l.GetString(key, defaultValue...)
-	}, defaultString(defaultValue))
+	}, firstOrZero(defaultValue...))
 }
 
 // GetInt retrieves an integer value from the default loader with optional default.
@@ -228,9 +223,15 @@ func Validate() error {
 // Quick Load Functions
 // ============================================================================
 
-// Load loads environment files in order and applies them to os.Environ.
+// Load initializes the default loader with the given files.
+//
+// IMPORTANT: This function:
+//  1. Sets the package-level default loader (used by GetString, GetInt, etc.)
+//  2. Auto-applies all loaded variables to os.Environ
+//
+// For isolated instances without auto-apply, use New().
+//
 // Files are loaded sequentially; later files can override values from earlier files.
-// All loaded variables are applied to os.Environ.
 //
 // Supported file formats:
 //   - .env files (dotenv format)
@@ -244,28 +245,60 @@ func Validate() error {
 //	host := env.GetString("database.host") // "localhost"
 //	port := env.GetInt("database.port")    // 5432
 //
-// The loader is set as the default for package-level functions (GetString, GetInt, etc.).
-// It returns ErrAlreadyInitialized if the default loader has already been initialized.
+// Returns ErrAlreadyInitialized if the default loader has already been initialized.
 //
 // Example:
 //
-//	// Load default .env file
+//	// Initialize with default .env file
 //	if err := env.Load(); err != nil {
 //	    log.Fatal(err)
 //	}
 //
-//	// Load .env first, then config.json (overrides)
-//	if err := env.Load(".env", "config.json"); err != nil {
+//	// Initialize with multiple files
+//	if err := env.Load(".env", ".env.local"); err != nil {
 //	    log.Fatal(err)
 //	}
 //	// Now use package-level functions
 //	port := env.GetInt("PORT", 8080)
-//	host := env.GetString("database.host")
 func Load(filenames ...string) error {
 	cfg := DefaultConfig()
 	cfg.Filenames = filenames
 	cfg.AutoApply = true
 
+	loader, err := New(cfg)
+	if err != nil {
+		return err
+	}
+
+	// Set as default loader for package-level functions
+	if err := setDefaultLoader(loader); err != nil {
+		_ = loader.Close() // best-effort cleanup; error not actionable
+		return err
+	}
+
+	return nil
+}
+
+// LoadWithConfig initializes the default loader with a custom configuration.
+//
+// IMPORTANT: This function:
+//  1. Sets the package-level default loader (used by GetString, GetInt, etc.)
+//  2. Forces AutoApply=true regardless of cfg.AutoApply value
+//
+// For isolated instances without setting the default, use New().
+//
+// Returns ErrAlreadyInitialized if the default loader has already been initialized.
+//
+// Example:
+//
+//	cfg := env.DefaultConfig()
+//	cfg.Filenames = []string{".env.production"}
+//	cfg.OverwriteExisting = true
+//	if err := env.LoadWithConfig(cfg); err != nil {
+//	    log.Fatal(err)
+//	}
+func LoadWithConfig(cfg Config) error {
+	cfg.AutoApply = true
 	loader, err := New(cfg)
 	if err != nil {
 		return err

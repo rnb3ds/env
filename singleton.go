@@ -4,28 +4,54 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ErrAlreadyInitialized is returned when attempting to set a default loader
 // when one has already been initialized.
 var ErrAlreadyInitialized = errors.New("default loader already initialized")
 
+// cachedError wraps an error with a timestamp for expiration tracking.
+type cachedError struct {
+	err       error
+	timestamp time.Time
+}
+
+// Error cache expiration duration.
+// Errors older than this will be discarded, allowing retry.
+// This prevents permanent failure from transient errors (e.g., file temporarily unavailable).
+const errorCacheTTL = 30 * time.Second
+
 // ============================================================================
 // Default Loader Singleton
 // ============================================================================
 
 var (
-	defaultLoader atomic.Pointer[Loader]
-	defaultMu     sync.Mutex
+	defaultLoader     atomic.Pointer[Loader]
+	defaultErrWrapper atomic.Pointer[cachedError] // Cached initialization error with timestamp
+	defaultMu         sync.Mutex
 )
 
 // getDefaultLoader returns the default loader, creating it if necessary.
 // This function is thread-safe using atomic.Pointer and mutex for initialization.
-// Unlike traditional singletons, it allows retry after initialization errors.
+//
+// Error Caching: Initialization errors are cached for errorCacheTTL duration to prevent
+// infinite retry loops while still allowing recovery from transient failures.
+// Use ResetDefaultLoader() to immediately clear the cached error and retry initialization.
 func getDefaultLoader() (*Loader, error) {
 	// Fast path: check if already initialized
 	if loader := defaultLoader.Load(); loader != nil {
 		return loader, nil
+	}
+
+	// Fast path: check cached error with expiration
+	// SECURITY: Only check expiration here, don't try to clear
+	// This avoids TOCTOU race with concurrent error updates
+	if errWrapper := defaultErrWrapper.Load(); errWrapper != nil {
+		if time.Since(errWrapper.timestamp) < errorCacheTTL {
+			return nil, errWrapper.err
+		}
+		// Error expired - let slow path handle proper clearing under lock
 	}
 
 	// Slow path: acquire lock for initialization
@@ -37,9 +63,23 @@ func getDefaultLoader() (*Loader, error) {
 		return loader, nil
 	}
 
+	// Double-check cached error with expiration
+	if errWrapper := defaultErrWrapper.Load(); errWrapper != nil {
+		if time.Since(errWrapper.timestamp) < errorCacheTTL {
+			return nil, errWrapper.err
+		}
+		// Error expired, clear it
+		defaultErrWrapper.Store(nil)
+	}
+
 	loader, err := New(DefaultConfig())
 	if err != nil {
-		// Don't cache errors - allow retry on next call
+		// Cache error with timestamp to allow recovery from transient failures
+		wrapper := &cachedError{
+			err:       err,
+			timestamp: time.Now(),
+		}
+		defaultErrWrapper.Store(wrapper)
 		return nil, err
 	}
 
@@ -47,7 +87,7 @@ func getDefaultLoader() (*Loader, error) {
 	return loader, nil
 }
 
-// ResetDefaultLoader resets the default loader singleton.
+// ResetDefaultLoader resets the default loader singleton and clears any cached error.
 // This function is intended for use in tests to ensure isolation between test cases.
 // It is safe for concurrent use.
 //
@@ -58,6 +98,7 @@ func getDefaultLoader() (*Loader, error) {
 // then closes the old loader outside the lock. This design choice:
 //   - Ensures only one reset can happen at a time (mutex protected)
 //   - Allows new loaders to be created immediately after the swap
+//   - Clears cached initialization errors to allow retry
 //   - Avoids blocking concurrent operations during potentially slow Close()
 //   - The old and new loaders are completely independent
 //
@@ -81,6 +122,8 @@ func ResetDefaultLoader() error {
 	// Atomically swap to nil while holding the lock.
 	// This ensures only one reset can happen at a time.
 	oldLoader := defaultLoader.Swap(nil)
+	// Clear cached error to allow retry after reset
+	defaultErrWrapper.Store(nil)
 	defaultMu.Unlock()
 
 	// Close outside the lock to avoid blocking concurrent operations.
@@ -94,16 +137,18 @@ func ResetDefaultLoader() error {
 }
 
 // setDefaultLoader sets the given loader as the default loader.
-// This is an internal function used by LoadWithConfig.
 // Returns ErrAlreadyInitialized if already initialized.
+// Uses atomic Swap to avoid TOCTOU race condition between check and store.
 func setDefaultLoader(loader *Loader) error {
 	defaultMu.Lock()
 	defer defaultMu.Unlock()
 
-	if defaultLoader.Load() != nil {
+	// Use Swap to atomically check-and-set.
+	// If swap returns non-nil, another loader was already set.
+	if old := defaultLoader.Swap(loader); old != nil {
+		// Swap back to preserve the original loader
+		defaultLoader.Store(old)
 		return ErrAlreadyInitialized
 	}
-
-	defaultLoader.Store(loader)
 	return nil
 }

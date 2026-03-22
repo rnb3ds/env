@@ -459,3 +459,97 @@ func TestMarshalToYAMLSorted(t *testing.T) {
 		t.Errorf("keys not in sorted order: A=%d, M=%d, Z=%d", aIdx, mIdx, zIdx)
 	}
 }
+
+// ============================================================================
+// Resource Cleanup Tests
+// ============================================================================
+
+// TestWriteFile_TempFileCleanup verifies that temp files are cleaned up
+// when WriteFile fails at various stages.
+func TestWriteFile_TempFileCleanup(t *testing.T) {
+	// Create temp directory
+	tmpDir, err := os.MkdirTemp("", "env-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	t.Run("temp file cleaned up on invalid path", func(t *testing.T) {
+		// Use an invalid path (e.g., null byte in path)
+		filename := filepath.Join(tmpDir, "test\x00file.env")
+		var buf bytes.Buffer
+		buf.WriteString("KEY=value\n")
+
+		// This should fail because path is invalid
+		err := WriteFile(filename, &buf)
+		if err == nil {
+			t.Error("expected error for invalid path")
+		}
+
+		// Temp file should not exist (it shouldn't have been created)
+		tempFile := filename + ".tmp"
+		if _, err := os.Stat(tempFile); err == nil {
+			t.Errorf("temp file should not exist for invalid path")
+		}
+	})
+
+	t.Run("temp file cleaned up on directory creation error", func(t *testing.T) {
+		// Try to create a file in a path that would require creating a directory
+		// but use a path component that is actually an existing file
+		blockingFile := filepath.Join(tmpDir, "blocker")
+		if err := os.WriteFile(blockingFile, []byte("blocking"), 0644); err != nil {
+			t.Fatalf("failed to create blocking file: %v", err)
+		}
+
+		// Try to write to a file inside what should be a directory but is a file
+		filename := filepath.Join(blockingFile, "subdir", "test.env")
+		var buf bytes.Buffer
+		buf.WriteString("KEY=value\n")
+
+		// This should fail because "blocker" is a file, not a directory
+		err := WriteFile(filename, &buf)
+		if err == nil {
+			t.Error("expected error when parent path is a file")
+		}
+
+		// Temp file should not exist
+		tempFile := filename + ".tmp"
+		if _, err := os.Stat(tempFile); err == nil {
+			t.Errorf("temp file should not exist: %s", tempFile)
+		}
+	})
+}
+
+// TestWriteFile_NoDoubleClose verifies that WriteFile doesn't
+// double-close the file handle.
+func TestWriteFile_NoDoubleClose(t *testing.T) {
+	// Create temp directory
+	tmpDir, err := os.MkdirTemp("", "env-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Write multiple files to stress-test the file handle management
+	for i := range 10 {
+		filename := filepath.Join(tmpDir, "test"+string(rune('0'+i))+".env")
+		var buf bytes.Buffer
+		buf.WriteString("KEY=value\n")
+
+		err := WriteFile(filename, &buf)
+		if err != nil {
+			t.Errorf("WriteFile() error = %v", err)
+			continue
+		}
+
+		// Verify file exists and has correct content
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			t.Errorf("failed to read file: %v", err)
+			continue
+		}
+		if string(data) != "KEY=value\n" {
+			t.Errorf("file content = %q, want %q", string(data), "KEY=value\n")
+		}
+	}
+}

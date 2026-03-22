@@ -12,17 +12,16 @@ import (
 )
 
 func main() {
-	fmt.Println("=== SecureValue Basics ===")
+
 	demonstrateBasics()
 
-	fmt.Println("\n=== SecureValue from Loader ===")
 	demonstrateFromLoader()
 
-	fmt.Println("\n=== Lifecycle: Close vs Release ===")
 	demonstrateLifecycle()
 }
 
 func demonstrateBasics() {
+	fmt.Println("=== SecureValue Basics ===")
 	// Create a SecureValue from a sensitive string
 	password := env.NewSecureValue("super_secret_password_123")
 
@@ -40,6 +39,7 @@ func demonstrateBasics() {
 }
 
 func demonstrateFromLoader() {
+	fmt.Println("\n=== SecureValue from Loader ===")
 	cfg := env.DefaultConfig()
 	cfg.Filenames = []string{"examples/data/config.env"}
 
@@ -64,6 +64,7 @@ func demonstrateFromLoader() {
 }
 
 func demonstrateLifecycle() {
+	fmt.Println("\n=== Lifecycle: Close vs Release ===")
 	// Close() zeros memory but doesn't return to pool
 	secret := env.NewSecureValue("temporary_secret")
 	fmt.Printf("Before close: %s\n", secret.Masked())

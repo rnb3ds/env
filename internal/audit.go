@@ -26,6 +26,7 @@ var (
 // Action represents the type of action being audited.
 type Action string
 
+// Audit action constants.
 const (
 	ActionLoad       Action = "load"
 	ActionParse      Action = "parse"
@@ -230,10 +231,19 @@ func (h *CloseableChannelHandler) Channel() <-chan Event {
 // Log sends an audit event to the channel.
 // Returns an error if the handler has been closed.
 // This method blocks if the channel is full.
-func (h *CloseableChannelHandler) Log(event Event) error {
+// Uses recover to safely handle the race between Log and Close.
+func (h *CloseableChannelHandler) Log(event Event) (err error) {
 	if h.closed.Load() {
 		return fmt.Errorf("handler is closed")
 	}
+
+	// Use recover to handle the race between Log and Close
+	// This is safe because sending to a closed channel panics
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("handler is closed")
+		}
+	}()
 
 	h.ch <- event
 	return nil
@@ -284,8 +294,35 @@ type Auditor struct {
 	handler     Handler
 	masker      MaskerFunc
 	isSensitive IsSensitiveFunc
-	enabled     bool
+	enabled     atomic.Bool
 	mu          sync.RWMutex
+}
+
+// auditEventPool provides a pool of reusable Event structs.
+// This reduces allocations for high-frequency audit logging.
+var auditEventPool = sync.Pool{
+	New: func() interface{} {
+		return &Event{}
+	},
+}
+
+// getAuditEvent retrieves an Event from the pool.
+func getAuditEvent() *Event {
+	ev, ok := auditEventPool.Get().(*Event)
+	if !ok {
+		return &Event{}
+	}
+	return ev
+}
+
+// putAuditEvent returns an Event to the pool after resetting it.
+func putAuditEvent(ev *Event) {
+	if ev == nil {
+		return
+	}
+	// Clear the event to allow GC to collect referenced strings
+	*ev = Event{}
+	auditEventPool.Put(ev)
 }
 
 // NewAuditor creates a new Auditor with the specified handler.
@@ -299,37 +336,48 @@ func NewAuditor(handler Handler, isSensitive IsSensitiveFunc, masker MaskerFunc,
 	if masker == nil {
 		masker = func(key, value string) string { return value }
 	}
-	return &Auditor{
+	a := &Auditor{
 		handler:     handler,
 		masker:      masker,
 		isSensitive: isSensitive,
-		enabled:     enabled,
 	}
+	a.enabled.Store(enabled)
+	return a
 }
 
 // Log records an audit event.
 func (a *Auditor) Log(action Action, key, reason string, success bool) error {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	if !a.enabled {
+	// Fast path: atomic read for enabled check (thread-safe without lock overhead)
+	if !a.enabled.Load() {
 		return nil
 	}
-	event := Event{
-		Timestamp: time.Now(),
-		Action:    action,
-		Key:       a.maskKey(key),
-		Reason:    reason,
-		Success:   success,
-		Masked:    key != "" && a.isSensitive(key),
+	a.mu.RLock()
+	if !a.enabled.Load() {
+		a.mu.RUnlock()
+		return nil
 	}
-	return a.handler.Log(event)
+	// Get pooled event and populate it
+	event := getAuditEvent()
+	event.Timestamp = time.Now()
+	event.Action = action
+	event.Key = a.maskKey(key)
+	event.File = ""
+	event.Reason = reason
+	event.Success = success
+	event.Details = ""
+	event.Duration = 0
+	event.Masked = key != "" && a.isSensitive(key)
+	err := a.handler.Log(*event)
+	putAuditEvent(event)
+	a.mu.RUnlock()
+	return err
 }
 
 // LogWithFile records an audit event with file information.
 func (a *Auditor) LogWithFile(action Action, key, file, reason string, success bool) error {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if !a.enabled {
+	if !a.enabled.Load() {
 		return nil
 	}
 	event := Event{
@@ -348,7 +396,7 @@ func (a *Auditor) LogWithFile(action Action, key, file, reason string, success b
 func (a *Auditor) LogWithDuration(action Action, key, reason string, success bool, duration time.Duration) error {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if !a.enabled {
+	if !a.enabled.Load() {
 		return nil
 	}
 	event := Event{
@@ -377,14 +425,14 @@ func (a *Auditor) LogSecurity(key, reason string) error {
 func (a *Auditor) SetEnabled(enabled bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.enabled = enabled
+	a.enabled.Store(enabled)
 }
 
 // IsEnabled returns whether audit logging is enabled.
 func (a *Auditor) IsEnabled() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.enabled
+	return a.enabled.Load()
 }
 
 // Close closes the underlying handler.

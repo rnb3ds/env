@@ -38,25 +38,22 @@ type FullConfig struct {
 }
 
 func main() {
-	// Load environment file
+	// Initialize environment file
 	if err := env.Load("examples/data/config.yaml"); err != nil {
 		log.Fatalf("Failed to load: %v", err)
 	}
 
-	fmt.Println("=== Simple Struct Unmarshal ===")
 	demonstrateSimpleUnmarshal()
 
-	fmt.Println("\n=== Struct with Defaults ===")
 	demonstrateStructWithDefaults()
 
-	fmt.Println("\n=== Nested Struct ===")
 	demonstrateNestedStruct()
 
-	fmt.Println("\n=== Struct to Env (Marshal) ===")
 	demonstrateStructMarshal()
 }
 
 func demonstrateSimpleUnmarshal() {
+	fmt.Println("=== Simple Struct Unmarshal ===")
 	var cfg AppConfig
 
 	// Automatically populate struct from loaded environment variables
@@ -71,6 +68,7 @@ func demonstrateSimpleUnmarshal() {
 }
 
 func demonstrateStructWithDefaults() {
+	fmt.Println("\n=== Struct with Defaults ===")
 	var cfg DatabaseConfig
 
 	// Automatically populate with defaults from envDefault tags
@@ -86,6 +84,7 @@ func demonstrateStructWithDefaults() {
 }
 
 func demonstrateNestedStruct() {
+	fmt.Println("\n=== Nested Struct ===")
 	// Nested structs are populated from loaded environment variables
 	// The env tags map flat keys to nested struct fields
 	var cfg FullConfig
@@ -99,6 +98,7 @@ func demonstrateNestedStruct() {
 }
 
 func demonstrateStructMarshal() {
+	fmt.Println("\n=== Struct to Env (Marshal) ===")
 	// Convert struct back to environment map
 	cfg := DatabaseConfig{
 		Host:           "production.db.example.com",

@@ -40,7 +40,7 @@ go get github.com/cybergodev/env
 
 ---
 
-## 🚀 快速开始（2 分钟上手）
+## 🚀 快速开始
 
 ### 第一步：创建 `.env` 文件
 
@@ -73,7 +73,7 @@ import (
 )
 
 func main() {
-    // 一行加载并应用到 os.Environ
+    // 一行初始化 - 加载并应用到 os.Environ
     if err := env.Load(".env"); err != nil {
         log.Fatalf("加载失败: %v", err)
     }
@@ -95,7 +95,7 @@ func main() {
 ### 基础操作
 
 ```go
-// 多文件加载（后加载的覆盖先加载的）
+// 多文件初始化（后加载的覆盖先加载的）
 env.Load(".env", "config.json", ".env.local")
 
 // 检查存在性
@@ -295,6 +295,13 @@ if sv != nil {
 // 直接创建 SecureValue
 secret := env.NewSecureValue("super_secret")
 defer secret.Release()
+
+// 创建并检查错误（严格模式）
+secret, err := env.NewSecureValueStrict("super_secret")
+if err != nil {
+    log.Fatal("内存锁定失败:", err)
+}
+defer secret.Release()
 ```
 
 ### SecureValue 方法
@@ -376,6 +383,9 @@ env.MaskKey("DB_PASSWORD")  // "DB_***"
 
 // 日志安全处理
 safe := env.SanitizeForLog(userInput)
+
+// 掩码字符串中的敏感内容
+masked := env.MaskSensitiveInString(logMessage)
 
 // 格式检测
 env.DetectFormat("config.yaml")  // FormatYAML
@@ -474,6 +484,7 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | 函数 | 说明 |
 |:-----|:-----|
 | `Load(files...)` | 加载文件并应用到 `os.Environ` |
+| `LoadWithConfig(cfg)` | 使用自定义配置加载 |
 | `GetString(key, def...)` | 获取字符串值 |
 | `GetInt(key, def...)` | 获取 `int64` 值 |
 | `GetBool(key, def...)` | 获取布尔值 |
@@ -496,8 +507,17 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `MarshalStruct(struct)` | 将结构体转换为 map |
 | `New(cfg)` | 使用配置创建新加载器 |
 | `NewSecureValue(string)` | 从字符串创建 SecureValue |
+| `NewSecureValueStrict(string)` | 创建 SecureValue，锁定失败时返回错误 |
 | `ResetDefaultLoader()` | 重置单例（测试用） |
 | `ClearBytes([]byte)` | 安全清零字节切片 |
+| `SetMemoryLockEnabled(bool)` | 启用/禁用内存锁定 |
+| `IsMemoryLockEnabled()` | 检查内存锁定是否启用 |
+| `SetMemoryLockStrict(bool)` | 启用锁定失败的严格模式 |
+| `IsMemoryLockStrict()` | 检查严格模式是否启用 |
+| `IsMemoryLockSupported()` | 检查平台是否支持内存锁定 |
+| `RegisterParser(format, factory)` | 注册自定义解析器 |
+| `ForceRegisterParser(format, factory)` | 覆盖内置解析器 |
+| `MaskSensitiveInString(string)` | 掩码字符串中的敏感内容 |
 
 ### Loader 方法
 
@@ -511,6 +531,54 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `IsClosed()` | 检查是否已关闭 |
 | `LoadTime()` | 获取最后加载时间 |
 | `Config()` | 获取 loader 配置 |
+
+---
+
+## 🔐 内存锁定（高级）
+
+对于高安全性应用，启用内存锁定以防止敏感数据被交换到磁盘：
+
+```go
+// 在启动时启用内存锁定
+env.SetMemoryLockEnabled(true)
+
+// 可选：启用严格模式，锁定失败时报错
+env.SetMemoryLockStrict(true)
+
+// 检查平台支持
+if env.IsMemoryLockSupported() {
+    // 平台支持 mlock/VirtualLock
+}
+
+// 创建带锁定的 SecureValue
+sv := env.NewSecureValue("api_secret")
+defer sv.Release()
+
+// 检查内存是否实际被锁定
+if sv.IsMemoryLocked() {
+    fmt.Println("内存已保护，不会被交换到磁盘")
+}
+```
+
+**要求：**
+- **Unix**: 需要 `CAP_IPC_LOCK` 权限或 root 权限
+- **Windows**: 需要 `SE_LOCK_MEMORY_NAME` 权限
+
+---
+
+## 🔌 自定义解析器（高级）
+
+为其他文件格式注册自定义解析器：
+
+```go
+// 注册自定义解析器（不能覆盖内置格式）
+err := env.RegisterParser(customFormat, func(cfg env.Config, factory *env.ComponentFactory) (env.EnvParser, error) {
+    return &MyCustomParser{validator: factory.Validator()}, nil
+})
+
+// 强制覆盖内置解析器（谨慎使用！）
+err := env.ForceRegisterParser(env.FormatEnv, customFactory)
+```
 
 ---
 

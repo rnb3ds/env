@@ -355,10 +355,19 @@ func BenchmarkExpander_BracedVariable(b *testing.B) {
 
 func BenchmarkExpander_MultipleVariables(b *testing.B) {
 	input := "prefix_${VAR1}_middle_${VAR2}_suffix_${VAR3}"
+	// Pre-compute lookup values to avoid fmt.Sprintf overhead in benchmark
+	lookupValues := map[string]string{
+		"VAR1": "VAR1_value",
+		"VAR2": "VAR2_value",
+		"VAR3": "VAR3_value",
+	}
 	expander := internal.NewExpander(internal.ExpanderConfig{
 		MaxDepth: 5,
 		Lookup: func(key string) (string, bool) {
-			return fmt.Sprintf("%s_value", key), true
+			if v, ok := lookupValues[key]; ok {
+				return v, true
+			}
+			return "", false
 		},
 		Mode: internal.ModeEnv,
 	})
@@ -577,16 +586,19 @@ func BenchmarkLoader_ConcurrentGet(b *testing.B) {
 	}
 	defer loader.Close()
 
-	// Pre-populate with 100 variables
+	// Pre-populate with 100 variables and pre-compute keys
+	keys := make([]string, 100)
 	for i := 0; i < 100; i++ {
-		loader.Set(fmt.Sprintf("VAR_%d", i), fmt.Sprintf("value_%d", i))
+		key := fmt.Sprintf("VAR_%d", i)
+		keys[i] = key
+		loader.Set(key, "value")
 	}
 
+	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		i := 0
 		for pb.Next() {
-			key := fmt.Sprintf("VAR_%d", i%100)
-			_ = loader.GetString(key)
+			_ = loader.GetString(keys[i%100])
 			i++
 		}
 	})
@@ -714,11 +726,17 @@ func BenchmarkLoader_ConcurrentSet(b *testing.B) {
 	}
 	defer loader.Close()
 
+	// Pre-compute keys to avoid fmt.Sprintf in hot path
+	keys := make([]string, 100)
+	for i := 0; i < 100; i++ {
+		keys[i] = fmt.Sprintf("VAR_%d", i)
+	}
+
+	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		i := 0
 		for pb.Next() {
-			key := fmt.Sprintf("VAR_%d", i%100)
-			loader.Set(key, fmt.Sprintf("value_%d", i))
+			loader.Set(keys[i%100], "value")
 			i++
 		}
 	})

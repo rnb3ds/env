@@ -540,8 +540,16 @@ func (l *Lexer) scanComment() (Token, error) {
 }
 
 // Tokenize returns all tokens from the input.
+// Pre-allocates token slice based on input length for efficiency.
 func (l *Lexer) Tokenize() ([]Token, error) {
-	var tokens []Token
+	// Estimate token count based on input length
+	// Average: ~1 token per 20 characters (conservative estimate)
+	estimatedTokens := len(l.input)/20 + 10
+	if estimatedTokens > 1024 {
+		estimatedTokens = 1024 // Cap to prevent over-allocation
+	}
+	tokens := make([]Token, 0, estimatedTokens)
+
 	for {
 		tok, err := l.NextToken()
 		if err != nil {

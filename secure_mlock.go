@@ -6,20 +6,17 @@ import (
 	"github.com/cybergodev/env/internal"
 )
 
-// MemoryLockConfig controls memory locking behavior for SecureValue.
+// memoryLockConfig controls memory locking behavior for SecureValue.
 // Memory locking prevents sensitive data from being swapped to disk,
 // which is important for high-security applications handling passwords,
 // API keys, and other sensitive credentials.
 //
-// Usage:
-//
-//	// Enable memory locking globally (call once at application startup)
-//	env.SetMemoryLockEnabled(true)
-//
-//	// Check if memory locking is supported on this platform
-//	if env.IsMemoryLockSupported() {
-//	    // Memory locking is available
-//	}
+// Users control memory locking through package-level functions:
+//   - SetMemoryLockEnabled(bool) - Enable/disable globally
+//   - IsMemoryLockEnabled() bool - Check current state
+//   - SetMemoryLockStrict(bool) - Enable strict mode
+//   - IsMemoryLockStrict() bool - Check strict mode
+//   - IsMemoryLockSupported() bool - Check platform support
 //
 // Security Considerations:
 //   - On Unix systems, mlock() requires CAP_IPC_LOCK capability or root privileges
@@ -31,7 +28,7 @@ import (
 //   - Memory locking has minimal overhead during allocation
 //   - Locked pages cannot be paged out, which may increase memory pressure
 //   - Recommended to keep SecureValue objects small and short-lived
-type MemoryLockConfig struct {
+type memoryLockConfig struct {
 	// enabled controls whether memory locking is attempted
 	enabled atomic.Bool
 
@@ -46,7 +43,7 @@ type MemoryLockConfig struct {
 }
 
 // memLockConfig is the global memory lock configuration.
-var memLockConfig = MemoryLockConfig{
+var memLockConfig = memoryLockConfig{
 	supported: internal.MemLockSupported(),
 }
 

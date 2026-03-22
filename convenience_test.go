@@ -1,6 +1,7 @@
 package env
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -546,6 +547,111 @@ func TestParseInto_EdgeCases(t *testing.T) {
 		err = loader.ParseInto(&str)
 		if err == nil {
 			t.Error("ParseInto(pointer to string) should return error")
+		}
+	})
+}
+
+// ============================================================================
+// Load() Function Tests
+// ============================================================================
+
+func TestInit_EquivalentToLoad(t *testing.T) {
+	ResetDefaultLoader()
+	defer ResetDefaultLoader()
+
+	// Create test file system
+	fs := newTestFileSystem()
+	fs.files["init.env"] = "INIT_KEY=init_value\nPORT=3000"
+
+	// Use Load() via config with custom filesystem
+	cfg := DefaultConfig()
+	cfg.Filenames = []string{"init.env"}
+	cfg.FileSystem = fs
+
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if err := loader.LoadFiles("init.env"); err != nil {
+		t.Fatalf("LoadFiles() error = %v", err)
+	}
+
+	if err := setDefaultLoader(loader); err != nil {
+		t.Fatalf("setDefaultLoader() error = %v", err)
+	}
+
+	// Verify values via package-level functions
+	if v := GetString("INIT_KEY"); v != "init_value" {
+		t.Errorf("GetString(INIT_KEY) = %q, want %q", v, "init_value")
+	}
+
+	if v := GetInt("PORT", 0); v != 3000 {
+		t.Errorf("GetInt(PORT) = %d, want %d", v, 3000)
+	}
+}
+
+func TestInit_AlreadyInitialized(t *testing.T) {
+	ResetDefaultLoader()
+	defer ResetDefaultLoader()
+
+	// First, initialize the default loader
+	cfg := DefaultConfig()
+	cfg.Filenames = []string{"first.env"}
+	cfg.FileSystem = newTestFileSystem()
+
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if err := setDefaultLoader(loader); err != nil {
+		t.Fatalf("setDefaultLoader() error = %v", err)
+	}
+
+	// Second Load() should fail
+	err = Load("second.env")
+	if err == nil {
+		t.Error("Load() should fail when already initialized")
+	}
+	if err != ErrAlreadyInitialized {
+		t.Errorf("Load() error = %v, want %v", err, ErrAlreadyInitialized)
+	}
+}
+
+func TestInitWithConfig(t *testing.T) {
+	ResetDefaultLoader()
+	defer ResetDefaultLoader()
+
+	// Create test file system
+	fs := newTestFileSystem()
+	fs.files["custom.env"] = "CUSTOM_KEY=custom_value"
+
+	// Use LoadWithConfig - this actually calls the function
+	cfg := DefaultConfig()
+	cfg.Filenames = []string{"custom.env"}
+	cfg.FileSystem = fs
+	cfg.OverwriteExisting = true
+
+	// Call the actual LoadWithConfig function
+	err := LoadWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("LoadWithConfig() error = %v", err)
+	}
+
+	// Verify value via convenience function
+	if v := GetString("CUSTOM_KEY"); v != "custom_value" {
+		t.Errorf("GetString(CUSTOM_KEY) = %q, want %q", v, "custom_value")
+	}
+
+	t.Run("already initialized error", func(t *testing.T) {
+		// Second call should fail
+		err := LoadWithConfig(cfg)
+		if err == nil {
+			t.Error("LoadWithConfig() should fail when already initialized")
+		}
+		if !errors.Is(err, ErrAlreadyInitialized) {
+			t.Errorf("LoadWithConfig() error = %v, want ErrAlreadyInitialized", err)
 		}
 	})
 }
@@ -1439,4 +1545,63 @@ func TestGetString_CommaSeparatedIndex(t *testing.T) {
 	if ok {
 		t.Errorf("Lookup with out of range index = (%q, %v), want (\"\", false)", got, ok)
 	}
+}
+
+// ============================================================================
+// New Isolation Tests
+// ============================================================================
+
+func TestNewIsolation(t *testing.T) {
+	t.Run("creates new loader with default config", func(t *testing.T) {
+		loader, err := New()
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		if loader == nil {
+			t.Fatal("New() returned nil")
+		}
+		defer loader.Close()
+	})
+
+	t.Run("creates new loader with custom config", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.MaxVariables = 100
+
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		if loader == nil {
+			t.Fatal("New() returned nil")
+		}
+		defer loader.Close()
+
+		returnedCfg := loader.Config()
+		if returnedCfg.MaxVariables != 100 {
+			t.Errorf("MaxVariables = %d, want 100", returnedCfg.MaxVariables)
+		}
+	})
+
+	t.Run("does not affect default loader", func(t *testing.T) {
+		ResetDefaultLoader()
+		defer ResetDefaultLoader()
+
+		// Create isolated loader and set a value
+		loader, err := New()
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer loader.Close()
+
+		if err := loader.Set("ISOLATED_KEY", "isolated_value"); err != nil {
+			t.Fatalf("Set() error = %v", err)
+		}
+
+		// Default loader should not have this key
+		// (getDefaultLoader creates a new loader, so it won't have ISOLATED_KEY)
+		defaultVal := GetString("ISOLATED_KEY")
+		if defaultVal != "" {
+			t.Errorf("GetString(\"ISOLATED_KEY\") = %q, want empty (isolated loader should not affect default)", defaultVal)
+		}
+	})
 }

@@ -14,17 +14,16 @@ import (
 )
 
 func main() {
-	fmt.Println("=== JSON Audit Handler ===")
+
 	demonstrateJSONAudit()
 
-	fmt.Println("\n=== Log Audit Handler ===")
 	demonstrateLogAudit()
 
-	fmt.Println("\n=== Production Audit Setup ===")
 	demonstrateProductionAudit()
 }
 
 func demonstrateJSONAudit() {
+	fmt.Println("=== JSON Audit Handler ===")
 	// Create a buffer to capture JSON output
 	// In production, use a file instead of bytes.Buffer
 	var buf bytes.Buffer
@@ -51,6 +50,7 @@ func demonstrateJSONAudit() {
 }
 
 func demonstrateLogAudit() {
+	fmt.Println("\n=== Log Audit Handler ===")
 	// Use standard log for audit output
 	logger := log.New(os.Stdout, "[AUDIT] ", log.LstdFlags)
 	auditHandler := env.NewLogAuditHandler(logger)
@@ -72,6 +72,7 @@ func demonstrateLogAudit() {
 }
 
 func demonstrateProductionAudit() {
+	fmt.Println("\n=== Production Audit Setup ===")
 	// Production setup with file-based audit logging
 	auditFile, err := os.CreateTemp("", "audit-*.json")
 	if err != nil {

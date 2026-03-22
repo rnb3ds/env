@@ -37,16 +37,19 @@ func GetBuilder() *strings.Builder {
 // The builder is reset before returning to pool for hygiene and to allow
 // GC to reclaim the previous string data.
 //
-// SECURITY NOTE: This function depends on strings.Builder.Reset() preserving
-// the underlying buffer capacity. The Go standard library guarantees this
-// behavior (Reset() only sets len to 0, does not free the buffer).
-// If this behavior changes, we would need explicit capacity tracking
-// to prevent pooling of oversized builders.
+// SECURITY LIMITATION: strings.Builder does not expose its internal buffer,
+// so we cannot directly clear the contents before pooling. However, the data
+// will be overwritten when the builder is reused. For environments requiring
+// strict data clearing, consider not using the pool for sensitive operations.
+// The Go standard library guarantees that Reset() only sets len to 0,
+// preserving the underlying buffer capacity.
 func PutBuilder(sb *strings.Builder) {
 	if sb == nil {
 		return
 	}
 	// Reset before capacity check and pooling for hygiene
+	// Note: Reset() sets len=0 but doesn't clear the underlying buffer
+	// The data will be overwritten when the builder is reused
 	sb.Reset()
 	// Don't pool very large builders
 	if sb.Cap() <= MaxPooledBuilderSize {
@@ -82,13 +85,17 @@ func GetByteSlice() *[]byte {
 // PutByteSlice returns a byte slice to the pool.
 // Slices with capacity exceeding MaxPooledByteSliceSize are discarded.
 //
-// SECURITY NOTE: This function checks capacity before pooling to prevent
-// memory bloat from holding onto large buffers. The capacity check is
-// performed after resetting the slice length to 0.
+// SECURITY NOTE: This function clears the slice contents before pooling
+// to prevent sensitive data from persisting in pooled buffers. This is
+// important because byte slices may contain parsed environment variable values.
+// The capacity check is performed after clearing to prevent memory bloat.
 func PutByteSlice(buf *[]byte) {
 	if buf == nil {
 		return
 	}
+	// SECURITY: Clear the slice contents before pooling to prevent sensitive data leakage
+	// This is important for environment variable values which may contain secrets
+	clear(*buf)
 	// Don't pool very large slices
 	if cap(*buf) <= MaxPooledByteSliceSize {
 		byteSlicePool.Put(buf)

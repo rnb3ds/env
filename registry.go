@@ -48,6 +48,47 @@ func RegisterParser(format FileFormat, factory ParserFactory) error {
 	return nil
 }
 
+// ForceRegisterParser registers a parser factory, allowing override of
+// built-in parsers (FormatEnv, FormatJSON, FormatYAML).
+//
+// WARNING: Use with caution. Overriding built-in parsers may introduce
+// security vulnerabilities if the replacement parser doesn't implement
+// the same security checks (key validation, value validation, size limits, etc.).
+// Ensure your custom parser properly validates all input.
+//
+// This is intended for advanced use cases where you need complete control
+// over parsing behavior, such as:
+//   - Adding custom security checks to the built-in parser
+//   - Implementing format extensions (e.g., HEREDOC support, multi-line values)
+//   - Testing with mock parsers
+//
+// Example:
+//
+//	// Override the default .env parser with a custom implementation
+//	err := env.ForceRegisterParser(env.FormatEnv, func(cfg env.Config, factory *env.ComponentFactory) (env.EnvParser, error) {
+//	    return &MyCustomEnvParser{
+//	        validator: factory.Validator(),
+//	        auditor:   factory.Auditor(),
+//	    }, nil
+//	})
+func ForceRegisterParser(format FileFormat, factory ParserFactory) error {
+	globalParserRegistry.mu.Lock()
+	defer globalParserRegistry.mu.Unlock()
+
+	if factory == nil {
+		return fmt.Errorf("factory cannot be nil for format: %s", format.String())
+	}
+
+	globalParserRegistry.factories[format] = factory
+	return nil
+}
+
+// registerBuiltin registers a built-in parser factory without lock checking.
+// This is used internally during init() to register default parsers.
+func (r *parserRegistry) registerBuiltin(format FileFormat, factory ParserFactory) {
+	r.factories[format] = factory
+}
+
 // createParsers creates all registered parsers for the given configuration.
 // Returns a map of parsers keyed by file format.
 func createParsers(cfg Config, factory *ComponentFactory) (map[FileFormat]EnvParser, error) {
@@ -75,21 +116,21 @@ func createParsers(cfg Config, factory *ComponentFactory) (map[FileFormat]EnvPar
 }
 
 // init registers the built-in parsers.
-// Built-in parsers are registered directly to the factories map to bypass
+// Built-in parsers are registered using registerBuiltin to bypass
 // the security check in RegisterParser that prevents overriding built-in formats.
 func init() {
 	// Register dot-env parser
-	globalParserRegistry.factories[FormatEnv] = func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
+	globalParserRegistry.registerBuiltin(FormatEnv, func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
 		return newParserWithFactory(cfg, factory)
-	}
+	})
 
 	// Register JSON parser
-	globalParserRegistry.factories[FormatJSON] = func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
+	globalParserRegistry.registerBuiltin(FormatJSON, func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
 		return newJSONParserWithFactory(cfg, factory)
-	}
+	})
 
 	// Register YAML parser
-	globalParserRegistry.factories[FormatYAML] = func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
+	globalParserRegistry.registerBuiltin(FormatYAML, func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
 		return newYAMLParserWithFactory(cfg, factory)
-	}
+	})
 }

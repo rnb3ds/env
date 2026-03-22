@@ -32,12 +32,17 @@ func WriteFile(filename string, buf *bytes.Buffer) (err error) {
 		return &FileError{Path: filename, Op: "create", Err: err}
 	}
 
+	// Track whether file is still open for cleanup purposes
+	fileClosed := false
+
 	// Use named return parameter to ensure cleanup on error
 	defer func() {
 		if err != nil {
-			// Best effort cleanup on error
-			file.Close()
-			os.Remove(tempFile)
+			// Best effort cleanup on error - only close if still open
+			if !fileClosed {
+				_ = file.Close() /* best-effort cleanup; error not actionable */
+			}
+			_ = os.Remove(tempFile) /* best-effort cleanup; error not actionable */
 		}
 	}()
 
@@ -52,13 +57,15 @@ func WriteFile(filename string, buf *bytes.Buffer) (err error) {
 	}
 
 	// Close before rename (required on Windows)
-	if err = file.Close(); err != nil {
-		return &FileError{Path: filename, Op: "close", Err: err}
+	if closeErr := file.Close(); closeErr != nil {
+		err = closeErr
+		return &FileError{Path: filename, Op: "close", Err: closeErr}
 	}
+	fileClosed = true
 
 	// Atomic rename
 	if err = os.Rename(tempFile, filename); err != nil {
-		os.Remove(tempFile)
+		_ = os.Remove(tempFile) /* best-effort cleanup; error not actionable */
 		return &FileError{Path: filename, Op: "rename", Err: err}
 	}
 

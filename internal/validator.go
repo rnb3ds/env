@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -16,6 +17,7 @@ type ValidatorConfig struct {
 	RequiredKeys   []string
 	MaxKeyLength   int
 	MaxValueLength int
+	ValidateUTF8   bool              // Validate that values are valid UTF-8
 	IsSensitive    func(string) bool // Injected from root package
 	MaskKey        func(string) string
 	MaskSensitive  func(string) string
@@ -29,6 +31,7 @@ type Validator struct {
 	requiredKeys       map[string]bool
 	maxKeyLength       int
 	maxValueLength     int
+	validateUTF8       bool
 	isSensitive        func(string) bool
 	maskKey            func(string) string
 	maskSensitive      func(string) string
@@ -37,14 +40,6 @@ type Validator struct {
 
 // defaultIsSensitive is the default sensitive key check function.
 func defaultIsSensitive(key string) bool { return false }
-
-// defaultMaskKey is the default key masking function.
-func defaultMaskKey(key string) string {
-	if len(key) <= 3 {
-		return "***"
-	}
-	return key[:2] + "***"
-}
 
 // defaultMaskSensitive is the default sensitive value masking function.
 func defaultMaskSensitive(s string) string {
@@ -61,6 +56,7 @@ func NewValidator(cfg ValidatorConfig) *Validator {
 		keyPattern:         cfg.KeyPattern,
 		maxKeyLength:       cfg.MaxKeyLength,
 		maxValueLength:     cfg.MaxValueLength,
+		validateUTF8:       cfg.ValidateUTF8,
 		useDefaultKeyCheck: cfg.KeyPattern == nil,
 	}
 
@@ -73,7 +69,7 @@ func NewValidator(cfg ValidatorConfig) *Validator {
 	if cfg.MaskKey != nil {
 		v.maskKey = cfg.MaskKey
 	} else {
-		v.maskKey = defaultMaskKey
+		v.maskKey = DefaultMaskKey
 	}
 	if cfg.MaskSensitive != nil {
 		v.maskSensitive = cfg.MaskSensitive
@@ -117,6 +113,15 @@ func (v *Validator) ValidateKey(key string) error {
 		return v.newValidationError("key", key, "max_length", "key exceeds maximum length")
 	}
 
+	// SECURITY: Check for non-ASCII characters to prevent Unicode homograph attacks
+	// This must be done before pattern validation to avoid bypass via lookalike characters
+	// e.g., ℌOST (U+210C) looks similar to HOST but would bypass ASCII-only validation
+	for i := 0; i < len(key); i++ {
+		if key[i] >= 0x80 {
+			return v.newValidationError("key", key, "ascii_only", "key contains non-ASCII characters")
+		}
+	}
+
 	// Check pattern - use fast byte-level check for default pattern
 	if v.useDefaultKeyCheck {
 		// Fast path: validate default pattern ^[A-Za-z][A-Za-z0-9_]*$ without regex
@@ -153,9 +158,44 @@ func (v *Validator) ValidateValue(value string) error {
 		return v.newValidationError("value", "", "max_length", "value exceeds maximum length")
 	}
 
+	// Optional: Validate UTF-8 encoding
+	if v.validateUTF8 && !utf8.ValidString(value) {
+		return v.newValidationError("value", "", "utf8", "value contains invalid UTF-8 encoding")
+	}
+
 	// Fast path: check for problematic control characters using optimized scan
 	// This uses a lookup table for O(1) character classification
 	return validateValueChars(value)
+}
+
+// stringToBytesSafe converts a string to a byte slice without allocation.
+// This is a safer wrapper around unsafe operations with clear documentation.
+//
+// SECURITY: This function includes a defensive check for empty strings.
+// While the caller should check len(s) > 0, this defense-in-depth approach
+// prevents potential undefined behavior if the precondition is violated.
+//
+// PERFORMANCE: This function is inlined by the compiler and has minimal overhead
+// (one additional length check). It exists to:
+// 1. Document the safety invariants in one place
+// 2. Make the code more maintainable
+// 3. Provide a single point of change if unsafe semantics ever need updating
+//
+// The returned slice is read-only; modifying it causes undefined behavior.
+func stringToBytesSafe(s string) []byte {
+	// SECURITY: Defensive check - return nil for empty strings
+	// This prevents potential undefined behavior with unsafe.StringData
+	// on empty strings, even though the caller should already check this.
+	if len(s) == 0 {
+		return nil
+	}
+	// SAFETY ANALYSIS:
+	// - len(s) > 0 guaranteed by check above
+	// - unsafe.StringData returns valid pointer for non-empty strings
+	// - unsafe.Slice creates a slice with correct length
+	// - All subsequent accesses are bounds-checked via the slice
+	// - The slice is only used for reading, never writing
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
 // badCharTable is a lookup table for invalid characters.
@@ -202,15 +242,9 @@ func validateValueChars(value string) error {
 		return nil
 	}
 
-	// SECURITY: unsafe is used here for performance-critical validation.
-	// This usage is safe because:
-	// 1. We create a slice with exactly the same length as the string
-	// 2. The slice is only used for reading, never writing
-	// 3. The underlying string data is guaranteed to be valid for the string's lifetime
-	// This avoids bounds checking overhead in tight loops when processing
-	// large values (up to MaxValueLength, typically 1MB).
-	ptr := unsafe.StringData(value)
-	sl := unsafe.Slice(ptr, len(value))
+	// Use the safe helper function that encapsulates the unsafe operation
+	// with proper guards and documentation.
+	sl := stringToBytesSafe(value)
 
 	// SIMD-style processing: check 8 bytes at a time
 	// This reduces loop iterations by 8x for long values

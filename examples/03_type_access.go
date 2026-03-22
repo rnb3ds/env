@@ -13,38 +13,33 @@ import (
 )
 
 func main() {
-	// Load configuration from JSON file
+	// Initialize configuration from JSON file
 	if err := env.Load("examples/data/config.json"); err != nil {
 		log.Fatalf("Failed to load: %v", err)
 	}
 
-	fmt.Println("=== String Access ===")
 	demonstrateStringAccess()
 
-	fmt.Println("\n=== Integer Access ===")
 	demonstrateIntAccess()
 
-	fmt.Println("\n=== Boolean Access ===")
 	demonstrateBoolAccess()
 
-	fmt.Println("\n=== Duration Access ===")
 	demonstrateDurationAccess()
 
-	fmt.Println("\n=== Slice Access ===")
 	demonstrateSliceAccess()
 
-	fmt.Println("\n=== Lookup and Existence ===")
 	demonstrateLookup()
 }
 
 func demonstrateStringAccess() {
+	fmt.Println("=== String Access ===")
 	// Simple string get
 	name := env.GetString("app.name")
 	fmt.Printf("app.name: %q\n", name)
 
-	// With default value
-	envType := env.GetString("config.env", "development")
-	fmt.Printf("config.env: %q\n", envType)
+	// With default value (demonstrates fallback when key missing)
+	missing := env.GetString("missing.key", "default_value")
+	fmt.Printf("missing.key (default): %q\n", missing)
 
 	// Nested path access (dot notation)
 	dbHost := env.GetString("db.host", "localhost")
@@ -52,6 +47,7 @@ func demonstrateStringAccess() {
 }
 
 func demonstrateIntAccess() {
+	fmt.Println("\n=== Integer Access ===")
 	// Integer with default
 	port := env.GetInt("app.port", 9090)
 	fmt.Printf("app.port: %d\n", port)
@@ -66,6 +62,7 @@ func demonstrateIntAccess() {
 }
 
 func demonstrateBoolAccess() {
+	fmt.Println("\n=== Boolean Access ===")
 	// Boolean values
 	debug := env.GetBool("app.debug", false)
 	fmt.Printf("app.debug: %v\n", debug)
@@ -79,6 +76,7 @@ func demonstrateBoolAccess() {
 }
 
 func demonstrateDurationAccess() {
+	fmt.Println("\n=== Duration Access ===")
 	// Duration parsing
 	timeout := env.GetDuration("db.timeout", 10*time.Second)
 	fmt.Printf("db.timeout: %v\n", timeout)
@@ -93,6 +91,7 @@ func demonstrateDurationAccess() {
 }
 
 func demonstrateSliceAccess() {
+	fmt.Println("\n=== Slice Access ===")
 	// Indexed access (arrays in JSON/YAML)
 	host0 := env.GetString("cache.hosts.0")
 	fmt.Printf("cache.hosts.0: %q\n", host0)
@@ -107,6 +106,7 @@ func demonstrateSliceAccess() {
 }
 
 func demonstrateLookup() {
+	fmt.Println("\n=== Lookup and Existence ===")
 	// Check existence and get value
 	if value, exists := env.Lookup("app.port"); exists {
 		fmt.Printf("app.port exists: %v\n", value)

@@ -14,20 +14,18 @@ import (
 )
 
 func main() {
-	fmt.Println("=== Unmarshal: String to Map ===")
+
 	demonstrateUnmarshal()
 
-	fmt.Println("\n=== Marshal: Map/Struct to String ===")
 	demonstrateMarshal()
 
-	fmt.Println("\n=== Multi-Format Output ===")
 	demonstrateFormats()
 
-	fmt.Println("\n=== Round Trip ===")
 	demonstrateRoundTrip()
 }
 
 func demonstrateUnmarshal() {
+	fmt.Println("=== Unmarshal: String to Map ===")
 	// Parse .env format string into map
 	envString := `APP_NAME=myapp
 APP_PORT=8080
@@ -55,6 +53,7 @@ DEBUG=true`
 }
 
 func demonstrateMarshal() {
+	fmt.Println("\n=== Marshal: Map/Struct to String ===")
 	// Map to .env format (keys sorted)
 	envMap := map[string]string{
 		"APP_NAME": "myapp",
@@ -76,6 +75,7 @@ func demonstrateMarshal() {
 }
 
 func demonstrateFormats() {
+	fmt.Println("\n=== Multi-Format Output ===")
 	envMap := map[string]string{
 		"APP_NAME": "myapp",
 		"APP_PORT": "8080",
@@ -92,6 +92,7 @@ func demonstrateFormats() {
 }
 
 func demonstrateRoundTrip() {
+	fmt.Println("\n=== Round Trip ===")
 	type ServerConfig struct {
 		Host    string        `env:"SERVER_HOST"`
 		Port    int           `env:"SERVER_PORT"`

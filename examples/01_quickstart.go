@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	// Load environment variables from a .env file.
+	// Initialize environment variables from a .env file.
 	// This is a one-liner that loads and applies variables to os.Environ.
 	if err := env.Load("examples/data/config.env"); err != nil {
 		log.Fatalf("Failed to load env: %v", err)

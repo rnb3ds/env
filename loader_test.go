@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/cybergodev/env/internal"
 )
 
 // ============================================================================
@@ -1534,7 +1536,13 @@ func TestAuditorAdapter(t *testing.T) {
 	factory := cfg.buildComponentFactory()
 	defer factory.Close()
 
-	adapter := newAuditorAdapter(factory.internalAuditor())
+	// Use the public accessor method to get the internal auditor
+	// Type assert to get the internal *Auditor
+	aud, ok := factory.auditor.(*internal.Auditor)
+	if !ok {
+		t.Skipf("factory.auditor is not the built-in *internal.Auditor")
+	}
+	adapter := newAuditorAdapter(aud)
 
 	t.Run("Log", func(t *testing.T) {
 		if err := adapter.Log(ActionSet, "KEY", "test", true); err != nil {
@@ -2157,20 +2165,24 @@ func TestValidateFilePath_SymlinkEscape(t *testing.T) {
 	}
 }
 
-// TestValidateResolvedPath tests the resolved path validation function.
+// TestValidateResolvedPath tests path validation through validateFilePath.
+// Note: validateResolvedPath is now an internal method of PathValidator,
+// so we test it indirectly through the public validateFilePath function.
 func TestValidateResolvedPath(t *testing.T) {
 	tests := []struct {
-		name     string
-		resolved string
-		wantErr  bool
-		skipWin  bool // skip on Windows
+		name    string
+		path    string
+		wantErr bool
+		skipWin bool // skip on Windows
 	}{
 		{"relative path", "config/.env", false, false},
 		{"simple filename", ".env", false, false},
 		{"subdirectory", "config/local/.env", false, false},
 		{"absolute Unix path", "/etc/passwd", true, true}, // Not absolute on Windows
-		{"path traversal remaining", "config/../..", true, false},
+		{"path traversal", "../etc/passwd", true, false},
 		{"Windows absolute", "C:\\Windows\\System32", true, false},
+		{"empty path", "", true, false},
+		{"null byte", "config\x00.env", true, false},
 	}
 
 	for _, tt := range tests {
@@ -2178,9 +2190,9 @@ func TestValidateResolvedPath(t *testing.T) {
 			if tt.skipWin && runtime.GOOS == "windows" {
 				t.Skip("test not applicable on Windows")
 			}
-			err := validateResolvedPath(tt.resolved)
+			err := validateFilePath(tt.path)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("validateResolvedPath(%q) error = %v, wantErr %v", tt.resolved, err, tt.wantErr)
+				t.Errorf("validateFilePath(%q) error = %v, wantErr %v", tt.path, err, tt.wantErr)
 			}
 		})
 	}
@@ -2580,6 +2592,46 @@ func TestRegisterParser(t *testing.T) {
 		})
 		if err == nil {
 			t.Error("RegisterParser should fail for duplicate custom format")
+		}
+	})
+}
+
+func TestForceRegisterParser(t *testing.T) {
+	t.Run("force register overwrites existing", func(t *testing.T) {
+		customFormat := nextTestFormat()
+
+		// First registration
+		err := RegisterParser(customFormat, func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
+			return nil, nil
+		})
+		if err != nil {
+			t.Fatalf("RegisterParser() error = %v", err)
+		}
+
+		// Force register should overwrite without error
+		err = ForceRegisterParser(customFormat, func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
+			return nil, nil
+		})
+		if err != nil {
+			t.Errorf("ForceRegisterParser() error = %v", err)
+		}
+	})
+
+	t.Run("force register nil factory returns error", func(t *testing.T) {
+		err := ForceRegisterParser(FormatEnv, nil)
+		if err == nil {
+			t.Error("ForceRegisterParser() with nil factory should return error")
+		}
+	})
+
+	t.Run("force register new format", func(t *testing.T) {
+		customFormat := nextTestFormat()
+
+		err := ForceRegisterParser(customFormat, func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
+			return nil, nil
+		})
+		if err != nil {
+			t.Errorf("ForceRegisterParser() error = %v", err)
 		}
 	})
 }

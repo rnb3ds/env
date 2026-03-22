@@ -12,20 +12,18 @@ import (
 )
 
 func main() {
-	fmt.Println("=== Default Configuration ===")
+
 	demonstrateDefaultConfig()
 
-	fmt.Println("\n=== Development Configuration ===")
 	demonstrateDevelopmentConfig()
 
-	fmt.Println("\n=== Production Configuration ===")
 	demonstrateProductionConfig()
 
-	fmt.Println("\n=== Custom Configuration ===")
 	demonstrateCustomConfig()
 }
 
 func demonstrateDefaultConfig() {
+	fmt.Println("=== Default Configuration ===")
 	// DefaultConfig provides secure defaults suitable for most use cases.
 	// Files configured in cfg.Filenames are automatically loaded by New().
 	cfg := env.DefaultConfig()
@@ -42,6 +40,7 @@ func demonstrateDefaultConfig() {
 }
 
 func demonstrateDevelopmentConfig() {
+	fmt.Println("\n=== Development Configuration ===")
 	// DevelopmentConfig is optimized for development:
 	// - FailOnMissingFile: false (graceful handling)
 	// - OverwriteExisting: true (easy iteration)
@@ -60,6 +59,7 @@ func demonstrateDevelopmentConfig() {
 }
 
 func demonstrateProductionConfig() {
+	fmt.Println("\n=== Production Configuration ===")
 	// ProductionConfig provides maximum security:
 	// - FailOnMissingFile: true (fail fast)
 	// - AuditEnabled: true (compliance)
@@ -83,6 +83,7 @@ func demonstrateProductionConfig() {
 }
 
 func demonstrateCustomConfig() {
+	fmt.Println("\n=== Custom Configuration ===")
 	// Create a fully custom configuration.
 	// Files configured in cfg.Filenames are automatically loaded by New().
 	cfg := env.DefaultConfig()
