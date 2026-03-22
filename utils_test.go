@@ -817,3 +817,500 @@ func TestDetectDataFormat(t *testing.T) {
 		})
 	}
 }
+
+// ============================================================================
+// Mock Validators for Testing (from adapters_test.go)
+// ============================================================================
+
+// mockLineKeyValidator only implements ValidateKey (LineKeyValidator).
+// Used for testing the validatorInterfaceWrapper with minimal interface.
+type mockLineKeyValidator struct {
+	err error
+}
+
+func (m *mockLineKeyValidator) ValidateKey(key string) error {
+	return m.err
+}
+
+// mockLineKeyValueValidator implements ValidateKey and ValidateValue but not ValidateRequired.
+type mockLineKeyValueValidator struct {
+	keyErr   error
+	valueErr error
+}
+
+func (v *mockLineKeyValueValidator) ValidateKey(key string) error {
+	return v.keyErr
+}
+
+func (v *mockLineKeyValueValidator) ValidateValue(value string) error {
+	return v.valueErr
+}
+
+// fullMockValidator implements the complete Validator interface.
+type fullMockValidator struct {
+	keyErr      error
+	valueErr    error
+	requiredErr error
+}
+
+func (f *fullMockValidator) ValidateKey(key string) error {
+	return f.keyErr
+}
+
+func (f *fullMockValidator) ValidateValue(value string) error {
+	return f.valueErr
+}
+
+func (f *fullMockValidator) ValidateRequired(keys map[string]bool) error {
+	return f.requiredErr
+}
+
+// minimalMockValidator implements Validator but ValidateRequired returns ErrValidateRequiredUnsupported.
+type minimalMockValidator struct {
+	keyErr   error
+	valueErr error
+}
+
+func (m *minimalMockValidator) ValidateKey(key string) error {
+	return m.keyErr
+}
+
+func (m *minimalMockValidator) ValidateValue(value string) error {
+	return m.valueErr
+}
+
+func (m *minimalMockValidator) ValidateRequired(keys map[string]bool) error {
+	return ErrValidateRequiredUnsupported
+}
+
+// ============================================================================
+// validatorInterfaceWrapper Tests
+// ============================================================================
+
+func TestValidatorInterfaceWrapper_ValidateKey(t *testing.T) {
+	tests := []struct {
+		name    string
+		wrapper *validatorInterfaceWrapper
+		key     string
+		wantErr bool
+	}{
+		{
+			name:    "passes validation",
+			wrapper: &validatorInterfaceWrapper{&mockLineKeyValidator{}},
+			key:     "TEST_KEY",
+			wantErr: false,
+		},
+		{
+			name:    "fails validation",
+			wrapper: &validatorInterfaceWrapper{&mockLineKeyValidator{err: errors.New("invalid key")}},
+			key:     "BAD_KEY",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.wrapper.ValidateKey(tt.key)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateKey() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidatorInterfaceWrapper_ValidateValue(t *testing.T) {
+	t.Run("minimal validator returns nil", func(t *testing.T) {
+		wrapper := &validatorInterfaceWrapper{&mockLineKeyValidator{}}
+		err := wrapper.ValidateValue("test value")
+		if err != nil {
+			t.Errorf("ValidateValue() should return nil for minimal validator, got %v", err)
+		}
+	})
+
+	t.Run("validator with LineValueValidator delegates", func(t *testing.T) {
+		// mockLineKeyValueValidator implements both LineKeyValidator and LineValueValidator
+		val := &mockLineKeyValueValidator{valueErr: errors.New("bad value")}
+		wrapper := &validatorInterfaceWrapper{val}
+
+		err := wrapper.ValidateValue("bad")
+		if err == nil {
+			t.Error("ValidateValue() should delegate to LineValueValidator")
+		}
+		if err.Error() != "bad value" {
+			t.Errorf("ValidateValue() error = %v, want 'bad value'", err)
+		}
+	})
+
+	t.Run("validator without LineValueValidator returns nil", func(t *testing.T) {
+		wrapper := &validatorInterfaceWrapper{&mockLineKeyValidator{}}
+		err := wrapper.ValidateValue("any value")
+		if err != nil {
+			t.Errorf("ValidateValue() should return nil when LineValueValidator not implemented, got %v", err)
+		}
+	})
+}
+
+func TestValidatorInterfaceWrapper_ValidateRequired(t *testing.T) {
+	t.Run("returns ErrValidateRequiredUnsupported", func(t *testing.T) {
+		wrapper := &validatorInterfaceWrapper{&mockLineKeyValidator{}}
+		keys := map[string]bool{"KEY1": true, "KEY2": true}
+
+		err := wrapper.ValidateRequired(keys)
+		if !errors.Is(err, ErrValidateRequiredUnsupported) {
+			t.Errorf("ValidateRequired() error = %v, want ErrValidateRequiredUnsupported", err)
+		}
+	})
+
+	t.Run("error message is descriptive", func(t *testing.T) {
+		wrapper := &validatorInterfaceWrapper{&mockLineKeyValidator{}}
+		keys := map[string]bool{"KEY": true}
+
+		err := wrapper.ValidateRequired(keys)
+		if err == nil {
+			t.Fatal("ValidateRequired() should return error")
+		}
+		// Check that error message contains guidance
+		errMsg := err.Error()
+		if !containsString(errMsg, "ValidateRequired") {
+			t.Errorf("Error message should mention ValidateRequired, got: %s", errMsg)
+		}
+		if !containsString(errMsg, "Validator") {
+			t.Errorf("Error message should mention Validator interface, got: %s", errMsg)
+		}
+	})
+}
+
+// ============================================================================
+// Integration Tests with ComponentFactory
+// ============================================================================
+
+func TestComponentFactory_Validator_WithMinimalCustomValidator(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CustomValidator = &minimalMockValidator{}
+
+	factory := cfg.buildComponentFactory()
+	defer factory.Close()
+
+	validator := factory.Validator()
+
+	// ValidateKey should work
+	if err := validator.ValidateKey("TEST_KEY"); err != nil {
+		t.Errorf("ValidateKey() error = %v", err)
+	}
+
+	// ValidateRequired should return explicit error
+	err := validator.ValidateRequired(map[string]bool{"KEY": true})
+	if !errors.Is(err, ErrValidateRequiredUnsupported) {
+		t.Errorf("ValidateRequired() error = %v, want ErrValidateRequiredUnsupported", err)
+	}
+}
+
+func TestComponentFactory_Validator_WithFullCustomValidator(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CustomValidator = &fullMockValidator{requiredErr: errors.New("missing keys")}
+
+	factory := cfg.buildComponentFactory()
+	defer factory.Close()
+
+	validator := factory.Validator()
+
+	// ValidateRequired should delegate to custom implementation
+	err := validator.ValidateRequired(map[string]bool{"KEY": true})
+	if err == nil || err.Error() != "missing keys" {
+		t.Errorf("ValidateRequired() should delegate to full validator, got %v", err)
+	}
+
+	// Should NOT be ErrValidateRequiredUnsupported
+	if errors.Is(err, ErrValidateRequiredUnsupported) {
+		t.Error("ValidateRequired() should not return ErrValidateRequiredUnsupported for full validator")
+	}
+}
+
+func TestComponentFactory_Validator_WithBuiltInValidator(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.RequiredKeys = []string{"REQUIRED_KEY"}
+
+	factory := cfg.buildComponentFactory()
+	defer factory.Close()
+
+	validator := factory.Validator()
+
+	// ValidateRequired should fail for missing required key
+	err := validator.ValidateRequired(map[string]bool{"OTHER_KEY": true})
+	if err == nil {
+		t.Error("ValidateRequired() should fail for missing required key")
+	}
+
+	// Should NOT be ErrValidateRequiredUnsupported
+	if errors.Is(err, ErrValidateRequiredUnsupported) {
+		t.Error("Built-in validator should not return ErrValidateRequiredUnsupported")
+	}
+}
+
+// ============================================================================
+// Integration Tests with Loader
+// ============================================================================
+
+func TestLoader_New_WithMinimalCustomValidatorAndRequiredKeys(t *testing.T) {
+	fs := newTestFileSystem()
+	fs.files["test.env"] = "EXISTING_KEY=value"
+
+	cfg := DefaultConfig()
+	cfg.FileSystem = fs
+	cfg.Filenames = []string{"test.env"}
+	cfg.RequiredKeys = []string{"REQUIRED_KEY"}
+	cfg.CustomValidator = &minimalMockValidator{} // Returns ErrValidateRequiredUnsupported
+
+	// New() should fail because ValidateRequired is called during file parsing
+	// and minimalMockValidator returns ErrValidateRequiredUnsupported
+	_, err := New(cfg)
+	if !errors.Is(err, ErrValidateRequiredUnsupported) {
+		t.Errorf("New() error = %v, want ErrValidateRequiredUnsupported", err)
+	}
+}
+
+func TestLoader_New_WithMinimalCustomValidatorNoFiles(t *testing.T) {
+	// When no files are loaded, ValidateRequired is not called during New()
+	cfg := DefaultConfig()
+	cfg.Filenames = []string{} // No files to load
+	cfg.CustomValidator = &minimalMockValidator{}
+
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer loader.Close()
+
+	// Validate() should still return ErrValidateRequiredUnsupported
+	err = loader.Validate()
+	if !errors.Is(err, ErrValidateRequiredUnsupported) {
+		t.Errorf("Validate() error = %v, want ErrValidateRequiredUnsupported", err)
+	}
+}
+
+func TestLoader_Validate_WithFullCustomValidator(t *testing.T) {
+	fs := newTestFileSystem()
+	fs.files["test.env"] = "EXISTING_KEY=value"
+
+	cfg := DefaultConfig()
+	cfg.FileSystem = fs
+	cfg.Filenames = []string{"test.env"}
+	cfg.RequiredKeys = []string{"REQUIRED_KEY"}
+	cfg.CustomValidator = &fullMockValidator{} // Implements full Validator
+
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer loader.Close()
+
+	// Validate() should NOT return ErrValidateRequiredUnsupported
+	// (it may return a different error from the fullMockValidator, but not the unsupported error)
+	err = loader.Validate()
+	if errors.Is(err, ErrValidateRequiredUnsupported) {
+		t.Errorf("Validate() should not return ErrValidateRequiredUnsupported for full validator, got %v", err)
+	}
+}
+
+// ============================================================================
+// ErrValidateRequiredUnsupported Tests
+// ============================================================================
+
+func TestErrValidateRequiredUnsupported_ErrorMessage(t *testing.T) {
+	err := ErrValidateRequiredUnsupported
+
+	// Verify error message contains helpful guidance
+	errMsg := err.Error()
+	if !containsString(errMsg, "ValidateRequired") {
+		t.Errorf("Error message should mention ValidateRequired, got: %s", errMsg)
+	}
+	if !containsString(errMsg, "Validator") {
+		t.Errorf("Error message should mention Validator interface, got: %s", errMsg)
+	}
+}
+
+func TestErrValidateRequiredUnsupported_ErrorsIs(t *testing.T) {
+	// Verify errors.Is works correctly
+	wrappedErr := errors.Join(errors.New("context"), ErrValidateRequiredUnsupported)
+	if !errors.Is(wrappedErr, ErrValidateRequiredUnsupported) {
+		t.Error("errors.Is should match ErrValidateRequiredUnsupported in wrapped error")
+	}
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+func containsString(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > 0 && len(substr) > 0 && findSubstring(s, substr)))
+}
+
+func findSubstring(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+// ============================================================================
+// auditorAdapter Tests
+// ============================================================================
+
+func TestAuditorAdapter_Nil(t *testing.T) {
+	adapter := newAuditorAdapter(nil)
+	if adapter != nil {
+		t.Error("newAuditorAdapter(nil) should return nil")
+	}
+}
+
+func TestAuditorAdapter_CloseNil(t *testing.T) {
+	var adapter *auditorAdapter
+	if err := adapter.Close(); err != nil {
+		t.Errorf("Close() on nil adapter should return nil, got %v", err)
+	}
+}
+
+func TestAuditorAdapter_IntegrationWithLoader(t *testing.T) {
+	fs := newTestFileSystem()
+	fs.files[".env"] = "KEY=value"
+
+	cfg := DefaultConfig()
+	cfg.FileSystem = fs
+	cfg.AuditEnabled = true
+	cfg.AuditHandler = NewNopAuditHandler()
+
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer loader.Close()
+
+	// The adapter is tested through the loader's audit functionality
+	// If the loader works with audit enabled, the adapter works
+	if loader.GetString("KEY") != "value" {
+		t.Errorf("GetString(\"KEY\") = %q, want %q", loader.GetString("KEY"), "value")
+	}
+}
+
+// ============================================================================
+// auditorInterfaceWrapper Tests
+// ============================================================================
+
+type mockAuditLogger struct {
+	lastAction AuditAction
+	lastKey    string
+	lastErrMsg string
+	logError   error
+}
+
+func (m *mockAuditLogger) LogError(action AuditAction, key, errMsg string) error {
+	m.lastAction = action
+	m.lastKey = key
+	m.lastErrMsg = errMsg
+	return m.logError
+}
+
+type mockFullAuditLogger struct {
+	logs []string
+}
+
+func (m *mockFullAuditLogger) Log(action AuditAction, key, reason string, success bool) error {
+	m.logs = append(m.logs, "Log")
+	return nil
+}
+
+func (m *mockFullAuditLogger) LogError(action AuditAction, key, errMsg string) error {
+	m.logs = append(m.logs, "LogError")
+	return nil
+}
+
+func (m *mockFullAuditLogger) LogWithFile(action AuditAction, key, file, reason string, success bool) error {
+	m.logs = append(m.logs, "LogWithFile")
+	return nil
+}
+
+func (m *mockFullAuditLogger) LogWithDuration(action AuditAction, key, reason string, success bool, duration time.Duration) error {
+	m.logs = append(m.logs, "LogWithDuration")
+	return nil
+}
+
+func (m *mockFullAuditLogger) Close() error {
+	m.logs = append(m.logs, "Close")
+	return nil
+}
+
+func TestAuditorInterfaceWrapper_Log(t *testing.T) {
+	tests := []struct {
+		name     string
+		success  bool
+		expected string
+	}{
+		{"success true", true, "[ok] "},
+		{"success false", false, "[error] "},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockAuditLogger{}
+			wrapper := &auditorInterfaceWrapper{AuditLogger: mock}
+
+			if err := wrapper.Log(ActionSet, "KEY", "reason", tt.success); err != nil {
+				t.Errorf("Log() error = %v", err)
+			}
+			if mock.lastErrMsg != tt.expected+"reason" {
+				t.Errorf("Log() errMsg = %q, want %q", mock.lastErrMsg, tt.expected+"reason")
+			}
+		})
+	}
+}
+
+func TestAuditorInterfaceWrapper_LogWithFile(t *testing.T) {
+	mock := &mockAuditLogger{}
+	wrapper := &auditorInterfaceWrapper{AuditLogger: mock}
+
+	if err := wrapper.LogWithFile(ActionSet, "KEY", "test.env", "reason", true); err != nil {
+		t.Errorf("LogWithFile() error = %v", err)
+	}
+	expected := "[ok] reason (file: test.env)"
+	if mock.lastErrMsg != expected {
+		t.Errorf("LogWithFile() errMsg = %q, want %q", mock.lastErrMsg, expected)
+	}
+}
+
+func TestAuditorInterfaceWrapper_LogWithDuration(t *testing.T) {
+	mock := &mockAuditLogger{}
+	wrapper := &auditorInterfaceWrapper{AuditLogger: mock}
+
+	if err := wrapper.LogWithDuration(ActionSet, "KEY", "reason", true, 100*time.Millisecond); err != nil {
+		t.Errorf("LogWithDuration() error = %v", err)
+	}
+	if mock.lastErrMsg == "" {
+		t.Error("LogWithDuration() should produce non-empty message")
+	}
+}
+
+func TestAuditorInterfaceWrapper_Close(t *testing.T) {
+	t.Run("non-closer returns nil", func(t *testing.T) {
+		mock := &mockAuditLogger{}
+		wrapper := &auditorInterfaceWrapper{AuditLogger: mock}
+
+		if err := wrapper.Close(); err != nil {
+			t.Errorf("Close() error = %v, want nil", err)
+		}
+	})
+
+	t.Run("closer delegates", func(t *testing.T) {
+		mock := &mockFullAuditLogger{}
+		wrapper := &auditorInterfaceWrapper{AuditLogger: mock}
+
+		if err := wrapper.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+		if len(mock.logs) != 1 || mock.logs[0] != "Close" {
+			t.Errorf("Close() should delegate, logs = %v", mock.logs)
+		}
+	})
+}

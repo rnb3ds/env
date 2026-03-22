@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -60,5 +61,105 @@ func TestIsValidJSONKey(t *testing.T) {
 				t.Errorf("IsValidJSONKey(%q) = %v, want %v", tt.key, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestToUpperASCIISafe(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+		wantErr  bool
+	}{
+		// Valid ASCII cases
+		{"lowercase", "hello", "HELLO", false},
+		{"uppercase", "HELLO", "HELLO", false},
+		{"mixed", "HeLLo", "HELLO", false},
+		{"empty", "", "", false},
+		{"with numbers", "abc123", "ABC123", false},
+		{"with symbols", "abc-xyz", "ABC-XYZ", false},
+
+		// Non-ASCII cases (should error)
+		{"unicode letter", "héllo", "", true},
+		{"unicode at start", "éabc", "", true},
+		{"unicode at end", "abcé", "", true},
+		{"unicode in middle", "abéc", "", true},
+		{"chinese", "你好", "", true},
+		{"emoji", "test🔥", "", true},
+		{"mixed unicode", "test世界", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := ToUpperASCIISafe(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ToUpperASCIISafe(%q) expected error, got nil", tt.input)
+				}
+				if err != ErrNonASCII {
+					t.Errorf("ToUpperASCIISafe(%q) error = %v, want ErrNonASCII", tt.input, err)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("ToUpperASCIISafe(%q) unexpected error: %v", tt.input, err)
+				}
+				if result != tt.expected {
+					t.Errorf("ToUpperASCIISafe(%q) = %q, want %q", tt.input, result, tt.expected)
+				}
+			}
+		})
+	}
+}
+
+func TestIsASCII(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		{"empty", "", true},
+		{"simple", "hello", true},
+		{"with symbols", "hello-world_123!", true},
+		{"all printable ASCII", strings.Repeat("a", 128), true},
+		{"unicode", "héllo", false},
+		{"chinese", "你好", false},
+		{"emoji", "🔥", false},
+		{"mixed", "hello世界", false},
+		{"byte 128", string([]byte{128}), false},
+		{"byte 255", string([]byte{255}), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsASCII(tt.input)
+			if result != tt.expected {
+				t.Errorf("IsASCII(%q) = %v, want %v", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestInternKeyConsistency(t *testing.T) {
+	// Clear cache before test
+	ClearInternCache()
+
+	// Test that cache and order slice remain consistent
+	keys := make([]string, 0, maxInternSize+10)
+
+	// Fill cache beyond capacity to trigger eviction
+	for i := 0; i < maxInternSize+50; i++ {
+		key := "KEY_" + strings.Repeat("A", i%10)
+		keys = append(keys, key)
+		interned := InternKey(key)
+		if interned != key {
+			t.Errorf("InternKey(%q) = %q, want %q", key, interned, key)
+		}
+	}
+
+	// Verify we can still intern new keys after eviction
+	newKey := "NEW_TEST_KEY"
+	interned := InternKey(newKey)
+	if interned != newKey {
+		t.Errorf("InternKey(%q) = %q, want %q", newKey, interned, newKey)
 	}
 }

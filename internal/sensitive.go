@@ -3,8 +3,8 @@ package internal
 
 import (
 	"fmt"
+	"sort"
 	"strings"
-	"unicode"
 )
 
 // Patterns defines patterns that indicate sensitive data.
@@ -134,7 +134,8 @@ func IsKey(key string) bool {
 }
 
 // containsIgnoreCase checks if s contains pattern (case-insensitive, ASCII only).
-// Pattern must be uppercase. This function avoids any heap allocations.
+// Pattern must be uppercase. This function avoids any heap allocations for ASCII input.
+// For non-ASCII input, falls back to strings.Contains + strings.ToUpper for correctness.
 func containsIgnoreCase(s, pattern string) bool {
 	patternLen := len(pattern)
 	sLen := len(s)
@@ -142,7 +143,23 @@ func containsIgnoreCase(s, pattern string) bool {
 		return false
 	}
 
-	// Slide window through s
+	// Fast path: check for non-ASCII characters in the search window
+	// If found, fall back to standard library for correct Unicode handling
+	for i := 0; i <= sLen-patternLen; i++ {
+		hasNonASCII := false
+		for j := 0; j < patternLen; j++ {
+			if s[i+j] >= 0x80 {
+				hasNonASCII = true
+				break
+			}
+		}
+		if hasNonASCII {
+			// Fallback: use standard library for non-ASCII input
+			return strings.Contains(strings.ToUpper(s), pattern)
+		}
+	}
+
+	// ASCII-only fast path: slide window through s
 	for i := 0; i <= sLen-patternLen; i++ {
 		match := true
 		for j := 0; j < patternLen; j++ {
@@ -194,36 +211,113 @@ func MaskInString(s string) string {
 
 // SanitizeForLog removes potentially sensitive information from a string.
 // It scans for patterns that might indicate sensitive data and masks them.
+//
+// Performance: Uses single-pass scanning with strings.Builder to avoid
+// O(n*m) complexity from multiple string scans and allocations.
 func SanitizeForLog(s string) string {
-	result := s
-	// Convert to lowercase once for pattern matching
-	lowerResult := strings.ToLower(result)
+	if len(s) == 0 {
+		return s
+	}
 
+	// Convert to lowercase for pattern matching
+	lowerS := strings.ToLower(s)
+
+	// Find all replacements needed (pattern end position -> mask position)
+	// Use a slice of structs to avoid map allocation for small number of matches
+	type replacement struct {
+		valueStart int // start of value to mask (after pattern)
+		valueEnd   int // end of value to mask
+	}
+	var replacements []replacement
+
+	// Single pass: find all pattern matches
 	for _, pattern := range sanitizePatterns {
-		idx := strings.Index(lowerResult, pattern)
-		if idx != -1 {
-			// Find the value after the pattern
-			start := idx + len(pattern)
-			end := start
-			for end < len(result) && result[end] != ' ' && result[end] != '\n' && result[end] != '\t' {
-				end++
+		patternLen := len(pattern)
+		searchStart := 0
+
+		for {
+			idx := strings.Index(lowerS[searchStart:], pattern)
+			if idx == -1 {
+				break
 			}
-			if end > start {
-				// Update both result and lowerResult to keep them in sync
-				maskedPattern := "[MASKED]"
-				result = result[:start] + maskedPattern + result[end:]
-				lowerResult = lowerResult[:start] + strings.ToLower(maskedPattern) + lowerResult[end:]
+			idx += searchStart // Adjust to absolute position
+
+			// Find the value after the pattern
+			valueStart := idx + patternLen
+			valueEnd := valueStart
+
+			// Find end of value (space, newline, tab, or end of string)
+			for valueEnd < len(s) && s[valueEnd] != ' ' && s[valueEnd] != '\n' && s[valueEnd] != '\t' {
+				valueEnd++
+			}
+
+			if valueEnd > valueStart {
+				replacements = append(replacements, replacement{valueStart, valueEnd})
+			}
+
+			// Continue searching after this match
+			searchStart = valueStart + 1
+			if searchStart >= len(lowerS) {
+				break
 			}
 		}
 	}
 
-	// Remove control characters
-	result = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) && r != '\n' && r != '\t' {
-			return -1
-		}
-		return r
-	}, result)
+	// If no replacements needed, just remove control characters
+	if len(replacements) == 0 {
+		return removeControlChars(s)
+	}
 
-	return result
+	// Sort replacements by position (they may be out of order due to multiple patterns)
+	sort.Slice(replacements, func(i, j int) bool {
+		return replacements[i].valueStart < replacements[j].valueStart
+	})
+
+	// Build result with strings.Builder
+	var result strings.Builder
+	result.Grow(len(s))
+
+	lastEnd := 0
+	for _, r := range replacements {
+		// Skip overlapping replacements
+		if r.valueStart < lastEnd {
+			continue
+		}
+		// Write unchanged portion
+		result.WriteString(s[lastEnd:r.valueStart])
+		// Write mask
+		result.WriteString("[MASKED]")
+		lastEnd = r.valueEnd
+	}
+	// Write remaining portion
+	if lastEnd < len(s) {
+		result.WriteString(s[lastEnd:])
+	}
+
+	return removeControlChars(result.String())
+}
+
+// removeControlChars removes control characters except newline and tab.
+func removeControlChars(s string) string {
+	// Fast path: check if any control characters exist
+	hasControl := false
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 && s[i] != '\n' && s[i] != '\t' {
+			hasControl = true
+			break
+		}
+	}
+	if !hasControl {
+		return s
+	}
+
+	// Slow path: remove control characters
+	var result strings.Builder
+	result.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x20 || s[i] == '\n' || s[i] == '\t' {
+			result.WriteByte(s[i])
+		}
+	}
+	return result.String()
 }

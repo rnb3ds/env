@@ -407,9 +407,9 @@ func TestDefaultMaskKey(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			result := defaultMaskKey(tt.input)
+			result := DefaultMaskKey(tt.input)
 			if result != tt.expected {
-				t.Errorf("defaultMaskKey(%q) = %q, want %q", tt.input, result, tt.expected)
+				t.Errorf("DefaultMaskKey(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
 	}

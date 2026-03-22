@@ -12,22 +12,20 @@ import (
 )
 
 func main() {
-	// Load environment from file
+	// Initialize environment from file
 	if err := env.Load("examples/data/config.env"); err != nil {
 		log.Fatalf("Failed to load: %v", err)
 	}
 
-	fmt.Println("=== Keys, All, Len ===")
 	demonstrateIntrospection()
 
-	fmt.Println("\n=== Delete ===")
 	demonstrateDelete()
 
-	fmt.Println("\n=== Sensitive Key Masking ===")
 	demonstrateMasking()
 }
 
 func demonstrateIntrospection() {
+	fmt.Println("=== Keys, All, Len ===")
 	// Len returns the count of loaded variables
 	fmt.Printf("Total variables: %d\n", env.Len())
 
@@ -49,8 +47,11 @@ func demonstrateIntrospection() {
 }
 
 func demonstrateDelete() {
+	fmt.Println("\n=== Delete ===")
 	// Set a temporary value
-	env.Set("TEMP_VAR", "temporary")
+	if err := env.Set("TEMP_VAR", "temporary"); err != nil {
+		log.Printf("Set failed: %v", err)
+	}
 	fmt.Printf("Before delete: %s\n", env.GetString("TEMP_VAR"))
 
 	// Delete removes the key
@@ -63,6 +64,7 @@ func demonstrateDelete() {
 }
 
 func demonstrateMasking() {
+	fmt.Println("\n=== Sensitive Key Masking ===")
 	// IsSensitiveKey checks if a key name suggests sensitive data
 	sensitiveKeys := []string{"DB_PASSWORD", "API_KEY", "APP_NAME"}
 	for _, key := range sensitiveKeys {

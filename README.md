@@ -14,7 +14,7 @@
 
 **Env** is a production-ready, zero-dependency, thread-safe Go library for environment variable management. It focuses on **security**, **concurrency**, and **developer experience**.
 
-### ✨ Highlights
+### ✨ Key Features
 
 | Feature | Description |
 |:--------|:------------|
@@ -40,7 +40,7 @@ go get github.com/cybergodev/env
 
 ---
 
-## 🚀 Quick Start (2 Minutes)
+## 🚀 Quick Start
 
 ### Step 1: Create a `.env` file
 
@@ -73,7 +73,7 @@ import (
 )
 
 func main() {
-    // One-line load and apply to os.Environ
+    // One-line initialization - loads and applies to os.Environ
     if err := env.Load(".env"); err != nil {
         log.Fatalf("Failed to load: %v", err)
     }
@@ -295,6 +295,13 @@ if sv != nil {
 // Create SecureValue directly
 secret := env.NewSecureValue("super_secret")
 defer secret.Release()
+
+// Create with strict error checking
+secret, err := env.NewSecureValueStrict("super_secret")
+if err != nil {
+    log.Fatal("Memory lock failed:", err)
+}
+defer secret.Release()
 ```
 
 ### SecureValue Methods
@@ -376,6 +383,9 @@ env.MaskKey("DB_PASSWORD")  // "DB_***"
 
 // String sanitization
 safe := env.SanitizeForLog(userInput)
+
+// Mask sensitive content in string
+masked := env.MaskSensitiveInString(logMessage)
 
 // Format detection
 env.DetectFormat("config.yaml")  // FormatYAML
@@ -474,6 +484,7 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | Function | Description |
 |:---------|:------------|
 | `Load(files...)` | Load files and apply to `os.Environ` |
+| `LoadWithConfig(cfg)` | Load with custom config |
 | `GetString(key, def...)` | Get string value |
 | `GetInt(key, def...)` | Get `int64` value |
 | `GetBool(key, def...)` | Get boolean value |
@@ -496,8 +507,17 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `MarshalStruct(struct)` | Convert struct to map |
 | `New(cfg)` | Create new loader with config |
 | `NewSecureValue(string)` | Create SecureValue from string |
+| `NewSecureValueStrict(string)` | Create SecureValue with error on lock failure |
 | `ResetDefaultLoader()` | Reset singleton (for testing) |
 | `ClearBytes([]byte)` | Securely zero byte slice |
+| `SetMemoryLockEnabled(bool)` | Enable/disable memory locking |
+| `IsMemoryLockEnabled()` | Check if memory locking is enabled |
+| `SetMemoryLockStrict(bool)` | Enable strict mode for lock failures |
+| `IsMemoryLockStrict()` | Check if strict mode is enabled |
+| `IsMemoryLockSupported()` | Check if platform supports memory locking |
+| `RegisterParser(format, factory)` | Register custom parser |
+| `ForceRegisterParser(format, factory)` | Override built-in parser |
+| `MaskSensitiveInString(string)` | Mask sensitive content in string |
 
 ### Loader Methods
 
@@ -511,6 +531,54 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `IsClosed()` | Check if closed |
 | `LoadTime()` | Get last load time |
 | `Config()` | Get loader configuration |
+
+---
+
+## 🔐 Memory Locking (Advanced)
+
+For high-security applications, enable memory locking to prevent sensitive data from being swapped to disk:
+
+```go
+// Enable memory locking at startup
+env.SetMemoryLockEnabled(true)
+
+// Optional: Enable strict mode to fail if locking fails
+env.SetMemoryLockStrict(true)
+
+// Check platform support
+if env.IsMemoryLockSupported() {
+    // Platform supports mlock/VirtualLock
+}
+
+// Create SecureValue with locking
+sv := env.NewSecureValue("api_secret")
+defer sv.Release()
+
+// Check if memory is actually locked
+if sv.IsMemoryLocked() {
+    fmt.Println("Memory is protected from swap")
+}
+```
+
+**Requirements:**
+- **Unix**: Requires `CAP_IPC_LOCK` capability or root privileges
+- **Windows**: Requires `SE_LOCK_MEMORY_NAME` privilege
+
+---
+
+## 🔌 Custom Parsers (Advanced)
+
+Register custom parsers for additional file formats:
+
+```go
+// Register a custom parser (cannot override built-in formats)
+err := env.RegisterParser(customFormat, func(cfg env.Config, factory *env.ComponentFactory) (env.EnvParser, error) {
+    return &MyCustomParser{validator: factory.Validator()}, nil
+})
+
+// Force override built-in parsers (use with caution!)
+err := env.ForceRegisterParser(env.FormatEnv, customFactory)
+```
 
 ---
 

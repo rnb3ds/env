@@ -20,7 +20,14 @@ import (
 //
 // Note: For simple keys, callers should use direct Get() with the key and its
 // uppercase version to avoid this allocation entirely.
+//
+// SECURITY: Paths exceeding HardMaxKeyLength are rejected to prevent memory exhaustion attacks.
 func ResolvePath(path string) []string {
+	// SECURITY: Reject excessively long paths to prevent memory exhaustion
+	// Uses HardMaxKeyLength from limits.go to ensure consistency across the codebase
+	if len(path) > HardMaxKeyLength {
+		return nil
+	}
 	// Fast path for simple keys (no dots)
 	// Use IndexByte which is SIMD-optimized
 	dotIdx := strings.IndexByte(path, '.')

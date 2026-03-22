@@ -154,7 +154,11 @@ cfg := env.ProductionConfig()
 cfg.AuditEnabled = true
 
 // Use a file for audit output (recommended for production)
-auditFile, _ := os.Create("/var/log/app/audit.json")
+auditFile, err := os.Create("/var/log/app/audit.json")
+if err != nil {
+    log.Fatalf("failed to create audit file: %v", err)
+}
+defer auditFile.Close() // Ensure file is closed when done
 cfg.AuditHandler = env.NewJSONAuditHandler(auditFile)
 
 // Or use NopAuditHandler for testing

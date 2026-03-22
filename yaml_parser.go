@@ -2,7 +2,6 @@ package env
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"time"
 
@@ -11,18 +10,17 @@ import (
 
 // yamlParser handles parsing of YAML configuration files.
 type yamlParser struct {
-	config      Config
-	validator   Validator
-	auditor     AuditLogger
-	flatten     internal.YAMLFlattenConfig
-	factory     *ComponentFactory
-	ownsFactory bool
+	config    Config
+	validator Validator
+	auditor   FullAuditLogger
+	flatten   internal.YAMLFlattenConfig
 }
 
 // Compile-time check that yamlParser implements EnvParser.
 var _ EnvParser = (*yamlParser)(nil)
 
 // newYAMLParserWithFactory creates a new yamlParser with a ComponentFactory.
+// The factory lifecycle is managed by the caller (typically the Loader), not by the parser.
 func newYAMLParserWithFactory(cfg Config, factory *ComponentFactory) (*yamlParser, error) {
 	maxDepth := cfg.YAMLMaxDepth
 	if maxDepth <= 0 {
@@ -39,12 +37,10 @@ func newYAMLParserWithFactory(cfg Config, factory *ComponentFactory) (*yamlParse
 	}
 
 	return &yamlParser{
-		config:      cfg,
-		validator:   factory.Validator(),
-		auditor:     factory.Auditor(),
-		flatten:     flattenCfg,
-		factory:     factory,
-		ownsFactory: false, // factory lifecycle managed by caller
+		config:    cfg,
+		validator: factory.Validator(),
+		auditor:   factory.Auditor(),
+		flatten:   flattenCfg,
 	}, nil
 }
 
@@ -81,41 +77,12 @@ func (p *yamlParser) Parse(r io.Reader, filename string) (map[string]string, err
 		return nil, err
 	}
 
-	// Check result size against config
-	if len(result) > p.config.MaxVariables {
-		_ = p.auditor.LogError(internal.ActionParse, "", "maximum variables exceeded")
-		return nil, &ValidationError{
-			Field:   "variables",
-			Message: fmt.Sprintf("exceeded maximum of %d variables", p.config.MaxVariables),
-		}
-	}
-
-	// Validate each key and value using fast byte-level validation
-	for key, val := range result {
-		// Use fast byte-level validation (allows @, -, ., [] etc.)
-		if !internal.IsValidJSONKey(key) {
-			_ = p.auditor.LogError(internal.ActionParse, key, "key does not match YAML key pattern")
-			return nil, &ValidationError{
-				Field:   "key",
-				Value:   MaskSensitiveInString(key),
-				Rule:    "pattern",
-				Message: "key does not match required pattern",
-			}
-		}
-		if p.config.ValidateValues {
-			if err := p.validator.ValidateValue(val); err != nil {
-				_ = p.auditor.LogError(internal.ActionParse, key, err.Error())
-				return nil, err
-			}
-		}
-	}
-
-	// Validate required keys
-	upperKeys := internal.KeysToUpperPooled(result)
-	err = p.validator.ValidateRequired(upperKeys)
-	internal.PutKeysToUpperMap(upperKeys)
-	if err != nil {
-		_ = p.auditor.LogError(internal.ActionValidate, "", err.Error())
+	// Validate parsed result using shared validation logic
+	if err := (&structuredParserConfig{
+		config:    p.config,
+		validator: p.validator,
+		auditor:   p.auditor,
+	}).validateResult(result, "YAML"); err != nil {
 		return nil, err
 	}
 
@@ -124,10 +91,7 @@ func (p *yamlParser) Parse(r io.Reader, filename string) (map[string]string, err
 }
 
 // Close releases resources held by the parser.
-// If the parser owns its ComponentFactory, it will also close the factory.
+// Note: The parser does not own the ComponentFactory; it is managed by the caller.
 func (p *yamlParser) Close() error {
-	if p.ownsFactory && p.factory != nil {
-		return p.factory.Close()
-	}
 	return nil
 }

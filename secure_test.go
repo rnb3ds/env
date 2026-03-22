@@ -1,6 +1,7 @@
 package env
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -452,4 +453,236 @@ func TestIsMemoryLockSupported(t *testing.T) {
 	// This test just verifies the function doesn't panic
 	supported := IsMemoryLockSupported()
 	t.Logf("IsMemoryLockSupported() = %v", supported)
+}
+
+// ============================================================================
+// Sensitive Key Detection Tests (from sensitive_export_test.go)
+// ============================================================================
+
+func TestIsSensitiveKey(t *testing.T) {
+	tests := []struct {
+		key      string
+		expected bool
+	}{
+		// Sensitive patterns
+		{"PASSWORD", true},
+		{"SECRET", true},
+		{"API_KEY", true},
+		{"PRIVATE_KEY", true},
+		{"ACCESS_TOKEN", true},
+		{"AUTH_TOKEN", true},
+		{"DATABASE_PASSWORD", true},
+		{"DB_SECRET", true},
+		{"CREDENTIAL", true},
+
+		// Non-sensitive patterns
+		{"HOST", false},
+		{"PORT", false},
+		{"DEBUG", false},
+		{"APP_NAME", false},
+		{"LOG_LEVEL", false},
+		{"TIMEOUT", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			result := IsSensitiveKey(tt.key)
+			if result != tt.expected {
+				t.Errorf("IsSensitiveKey(%q) = %v, want %v", tt.key, result, tt.expected)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// MaskValue Tests
+// ============================================================================
+
+func TestMaskValue(t *testing.T) {
+	tests := []struct {
+		name     string
+		key      string
+		value    string
+		contains string // check if result contains this
+	}{
+		{
+			name:     "sensitive key masked",
+			key:      "PASSWORD",
+			value:    "super_secret_123",
+			contains: "[MASKED",
+		},
+		{
+			name:     "non-sensitive key not masked",
+			key:      "HOST",
+			value:    "localhost",
+			contains: "localhost",
+		},
+		{
+			name:     "api key masked",
+			key:      "API_KEY",
+			value:    "sk-1234567890abcdef",
+			contains: "[MASKED",
+		},
+		{
+			name:     "empty value",
+			key:      "SECRET",
+			value:    "",
+			contains: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := MaskValue(tt.key, tt.value)
+			if tt.contains != "" && !strings.Contains(result, tt.contains) {
+				t.Errorf("MaskValue(%q, %q) = %q, should contain %q", tt.key, tt.value, result, tt.contains)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// MaskKey Tests
+// ============================================================================
+
+func TestMaskKey(t *testing.T) {
+	tests := []struct {
+		key      string
+		expected string
+	}{
+		{"AB", "***"},
+		{"ABC", "***"},
+		{"ABCD", "AB***"},
+		{"API_KEY", "AP***"},
+		{"", "***"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			result := MaskKey(tt.key)
+			if result != tt.expected {
+				t.Errorf("MaskKey(%q) = %q, want %q", tt.key, result, tt.expected)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// MaskSensitiveInString Tests
+// ============================================================================
+
+func TestMaskSensitiveInString(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "short string unchanged",
+			input:    "password=secret123",
+			expected: "password=secret123",
+		},
+		{
+			name:     "long string truncated",
+			input:    strings.Repeat("a", 60),
+			expected: strings.Repeat("a", 47) + "...",
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "exact max length",
+			input:    strings.Repeat("a", 50),
+			expected: strings.Repeat("a", 50),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := MaskSensitiveInString(tt.input)
+			if result != tt.expected {
+				t.Errorf("MaskSensitiveInString(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// SanitizeForLog Tests
+// ============================================================================
+
+func TestSanitizeForLog(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		shouldMask  bool // if true, verify value is masked
+		checkResult func(t *testing.T, result string)
+	}{
+		{
+			name:  "removes password value",
+			input: "password=my_secret_password",
+			checkResult: func(t *testing.T, result string) {
+				if strings.Contains(result, "my_secret_password") {
+					t.Errorf("SanitizeForLog() should mask password value, got %q", result)
+				}
+			},
+		},
+		{
+			name:  "removes api_key value",
+			input: "api_key=sk-1234567890",
+			checkResult: func(t *testing.T, result string) {
+				if strings.Contains(result, "sk-1234567890") {
+					t.Errorf("SanitizeForLog() should mask api_key value, got %q", result)
+				}
+			},
+		},
+		{
+			name:  "preserves non-sensitive",
+			input: "host=localhost port=8080",
+			checkResult: func(t *testing.T, result string) {
+				if !strings.Contains(result, "localhost") {
+					t.Errorf("SanitizeForLog() should preserve non-sensitive data, got %q", result)
+				}
+			},
+		},
+		{
+			name:  "empty string",
+			input: "",
+			checkResult: func(t *testing.T, result string) {
+				if result != "" {
+					t.Errorf("SanitizeForLog(\"\") = %q, want empty", result)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := SanitizeForLog(tt.input)
+			tt.checkResult(t, result)
+		})
+	}
+}
+
+// ============================================================================
+// sensitiveKeyPatterns Tests
+// ============================================================================
+
+func TestSensitiveKeyPatterns(t *testing.T) {
+	// Verify patterns exist and are non-empty
+	if len(sensitiveKeyPatterns) == 0 {
+		t.Error("sensitiveKeyPatterns should not be empty")
+	}
+
+	// Verify common patterns are included
+	patternStr := strings.ToLower(strings.Join(sensitiveKeyPatterns, " "))
+	expectedPatterns := []string{"password", "secret", "key", "token", "credential"}
+
+	for _, pattern := range expectedPatterns {
+		if !strings.Contains(patternStr, pattern) {
+			t.Errorf("sensitiveKeyPatterns should contain pattern containing %q", pattern)
+		}
+	}
 }

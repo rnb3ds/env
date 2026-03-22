@@ -1,79 +1,58 @@
+// Package env provides environment variable loading and management.
+//
+// # Component Factory
+//
+// This file implements ComponentFactory which creates and manages shared components
+// used by Loader and Parser. It provides a clean lifecycle for validator, auditor,
+// and expander instances.
+//
+// The factory uses adapters (defined in adapters.go) to bridge between public interfaces
+// and internal interfaces, allowing both built-in and custom components to work seamlessly.
 package env
 
 import (
 	"io"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/cybergodev/env/internal"
 )
-
-// auditorAdapter wraps internal.Auditor to implement AuditLogger interface.
-type auditorAdapter struct {
-	auditor *internal.Auditor
-}
-
-// newAuditorAdapter creates a new AuditLogger from an internal.Auditor.
-func newAuditorAdapter(a *internal.Auditor) AuditLogger {
-	if a == nil {
-		return nil
-	}
-	return &auditorAdapter{auditor: a}
-}
-
-// Log implements AuditLogger.
-func (a *auditorAdapter) Log(action AuditAction, key, reason string, success bool) error {
-	return a.auditor.Log(internal.Action(action), key, reason, success)
-}
-
-// LogError implements AuditLogger.
-func (a *auditorAdapter) LogError(action AuditAction, key, errMsg string) error {
-	return a.auditor.LogError(internal.Action(action), key, errMsg)
-}
-
-// LogWithFile implements AuditLogger.
-func (a *auditorAdapter) LogWithFile(action AuditAction, key, file, reason string, success bool) error {
-	return a.auditor.LogWithFile(internal.Action(action), key, file, reason, success)
-}
-
-// LogWithDuration implements AuditLogger.
-func (a *auditorAdapter) LogWithDuration(action AuditAction, key, reason string, success bool, duration time.Duration) error {
-	return a.auditor.LogWithDuration(internal.Action(action), key, reason, success, duration)
-}
-
-// Close implements AuditLogger.
-func (a *auditorAdapter) Close() error {
-	// Check both a and a.auditor for nil safety
-	// newAuditorAdapter guarantees non-nil auditor, but be defensive
-	if a == nil || a.auditor == nil {
-		return nil
-	}
-	return a.auditor.Close()
-}
 
 // ComponentFactory creates and manages shared components used by Loader and Parser.
 // It provides a clean lifecycle for validator, auditor, and expander instances.
 // ComponentFactory is safe for concurrent use.
 type ComponentFactory struct {
-	validator *internal.Validator
-	auditor   *internal.Auditor
-	expander  *internal.Expander
+	// Store interfaces; concrete type detection via type assertion when needed
+	validator internal.LineKeyValidator
+	auditor   internal.LineAuditLogger
+	expander  internal.LineExpander
 	closed    atomic.Bool
-	mu        sync.Mutex // Protects auditor.Close()
+	mu        sync.Mutex // Protects Close()
 }
 
 // Compile-time check that ComponentFactory implements io.Closer.
 var _ io.Closer = (*ComponentFactory)(nil)
 
-// Validator returns the validator component.
+// Validator returns the validator component as a Validator interface.
 func (f *ComponentFactory) Validator() Validator {
-	return f.validator
+	switch v := f.validator.(type) {
+	case Validator:
+		return v
+	default:
+		return &validatorInterfaceWrapper{v}
+	}
 }
 
-// Auditor returns the audit logger component.
-func (f *ComponentFactory) Auditor() AuditLogger {
-	return newAuditorAdapter(f.auditor)
+// Auditor returns the audit logger component as FullAuditLogger.
+func (f *ComponentFactory) Auditor() FullAuditLogger {
+	switch a := f.auditor.(type) {
+	case *internal.Auditor:
+		return newAuditorAdapter(a)
+	case FullAuditLogger:
+		return a
+	default:
+		return &auditorInterfaceWrapper{a}
+	}
 }
 
 // Close releases resources held by the factory.
@@ -82,7 +61,6 @@ func (f *ComponentFactory) Auditor() AuditLogger {
 // This method is safe for concurrent use.
 func (f *ComponentFactory) Close() error {
 	// Use CompareAndSwap for atomic transition from open to closed state.
-	// This eliminates the need for double-check locking pattern.
 	if !f.closed.CompareAndSwap(false, true) {
 		return nil // Already closed
 	}
@@ -90,8 +68,9 @@ func (f *ComponentFactory) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if f.auditor != nil {
-		return f.auditor.Close()
+	// Try to close if it implements io.Closer
+	if c, ok := f.auditor.(io.Closer); ok {
+		return c.Close()
 	}
 	return nil
 }
@@ -102,21 +81,25 @@ func (f *ComponentFactory) IsClosed() bool {
 	return f.closed.Load()
 }
 
-// internalValidator returns the concrete validator for internal use.
-// This method is used internally by parsers that need access to the concrete type.
-func (f *ComponentFactory) internalValidator() *internal.Validator {
+// LineParserValidator returns the validator as internal.LineKeyValidator interface.
+func (f *ComponentFactory) LineParserValidator() internal.LineKeyValidator {
 	return f.validator
 }
 
-// internalAuditor returns the concrete auditor for internal use.
-// This method is used internally by parsers that need access to the concrete type.
-func (f *ComponentFactory) internalAuditor() *internal.Auditor {
+// LineParserAuditor returns the auditor as internal.LineAuditLogger interface.
+func (f *ComponentFactory) LineParserAuditor() internal.LineAuditLogger {
 	return f.auditor
 }
 
-// internalExpander returns the concrete expander for internal use.
-// This method is used internally by parsers that need access to the concrete type.
-func (f *ComponentFactory) internalExpander() *internal.Expander {
+// LineParserExpander returns the expander as internal.LineExpander interface.
+func (f *ComponentFactory) LineParserExpander() internal.LineExpander {
+	return f.expander
+}
+
+// Expander returns the expander as VariableExpander interface.
+func (f *ComponentFactory) Expander() VariableExpander {
+	// VariableExpander and internal.LineExpander are now the same type
+	// via type aliases, so direct return works
 	return f.expander
 }
 
@@ -129,6 +112,7 @@ func (c *Config) buildComponentFactory() *ComponentFactory {
 // buildComponentFactoryWithFS creates a new ComponentFactory from the configuration
 // using the provided FileSystem for environment variable lookup.
 // If fs is nil, DefaultFileSystem is used.
+// If custom components are provided in Config, they will be used instead of built-in ones.
 func (c *Config) buildComponentFactoryWithFS(fs FileSystem) *ComponentFactory {
 	// Use default file system if not provided
 	if fs == nil {
@@ -144,32 +128,56 @@ func (c *Config) buildComponentFactoryWithFS(fs FileSystem) *ComponentFactory {
 		return fs.LookupEnv(key)
 	}
 
-	// Start with default forbidden keys
-	forbiddenKeys := make([]string, 0, len(DefaultForbiddenKeys))
-	for k := range DefaultForbiddenKeys {
-		forbiddenKeys = append(forbiddenKeys, k)
-	}
+	// Start with pre-computed default forbidden keys
+	forbiddenKeys := make([]string, 0, len(defaultForbiddenKeysSlice)+len(c.ForbiddenKeys))
+	forbiddenKeys = append(forbiddenKeys, defaultForbiddenKeysSlice...)
 	// Add custom forbidden keys
 	forbiddenKeys = append(forbiddenKeys, c.ForbiddenKeys...)
 
-	return &ComponentFactory{
-		validator: internal.NewValidator(internal.ValidatorConfig{
+	factory := &ComponentFactory{}
+
+	// Use custom validator if provided, otherwise create default
+	if c.CustomValidator != nil {
+		// Since KeyValidator = types.KeyValidator = internal.LineKeyValidator,
+		// we can directly use the custom validator
+		factory.validator = c.CustomValidator
+	} else {
+		factory.validator = internal.NewValidator(internal.ValidatorConfig{
 			KeyPattern:     c.KeyPattern,
 			AllowedKeys:    c.AllowedKeys,
 			ForbiddenKeys:  forbiddenKeys,
 			RequiredKeys:   c.RequiredKeys,
 			MaxKeyLength:   c.MaxKeyLength,
 			MaxValueLength: c.MaxValueLength,
+			ValidateUTF8:   c.ValidateUTF8,
 			IsSensitive:    IsSensitiveKey,
 			MaskKey:        MaskKey,
 			MaskSensitive:  MaskSensitiveInString,
-		}),
-		auditor: internal.NewAuditor(handler, IsSensitiveKey, MaskValue, c.AuditEnabled),
-		expander: internal.NewExpander(internal.ExpanderConfig{
+		})
+	}
+
+	// Use custom auditor if provided, otherwise create default
+	if c.CustomAuditor != nil {
+		// Since AuditLogger = types.AuditLogger = internal.LineAuditLogger,
+		// we can directly use the custom auditor
+		factory.auditor = c.CustomAuditor
+	} else {
+		factory.auditor = internal.NewAuditor(handler, IsSensitiveKey, MaskValue, c.AuditEnabled)
+	}
+
+	// Use custom expander if provided, otherwise create default
+	if c.CustomExpander != nil {
+		// Since VariableExpander = types.VariableExpander = internal.LineExpander,
+		// we can directly use the custom expander
+		factory.expander = c.CustomExpander
+	} else {
+		factory.expander = internal.NewExpander(internal.ExpanderConfig{
 			MaxDepth:   c.MaxExpansionDepth,
 			Lookup:     lookup,
 			Mode:       internal.ModeAll,
 			KeyPattern: c.KeyPattern,
-		}),
+		})
 	}
+
+	return factory
 }

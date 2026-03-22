@@ -135,6 +135,13 @@ func (sv *SecureValue) reset(value string) {
 	// This reduces allocations for frequently reused SecureValue objects
 	// The 2x limit prevents unbounded memory growth while allowing efficient reuse
 	if sv.data != nil && cap(sv.data) >= valueLen && cap(sv.data) <= valueLen*2 {
+		// SECURITY: Clear the entire capacity before reusing to prevent
+		// residual data from remaining in unused capacity.
+		// This is important because sv.data may have been cleared above
+		// with only the current length, not the full capacity.
+		oldCap := cap(sv.data)
+		fullSlice := sv.data[:oldCap]
+		clear(fullSlice)
 		sv.data = sv.data[:valueLen]
 		copy(sv.data, value)
 		// Attempt to lock memory if enabled
@@ -174,12 +181,13 @@ func (sv *SecureValue) tryLockMemory() {
 // - This method is called by GC when the SecureValue becomes unreachable
 // - At that point, no goroutine should have access to the object
 // - We use atomic.Bool for the closed flag to ensure safe reads
-// - The lock-free clearData() is safe because GC only runs when object is unreachable
+// - SECURITY: We acquire the mutex to prevent race with concurrent Release()
 //
 // Race Prevention:
 // - Release() clears the finalizer BEFORE putting the object back in the pool
 // - NewSecureValue() sets a fresh finalizer when taking from the pool
 // - This ensures no finalizer runs on pooled objects being reused
+// - Additional mutex protection provides defense-in-depth
 //
 // SECURITY REQUIREMENT:
 // Callers that return SecureValue to the pool MUST follow this sequence:
@@ -189,13 +197,25 @@ func (sv *SecureValue) tryLockMemory() {
 // Failure to clear the finalizer before Put() may cause the GC to run
 // finalize() while the object is being reused, leading to data corruption.
 func (sv *SecureValue) finalize() {
-	// Fast path: if already closed or no data, nothing to do
+	// Fast path: if already closed, nothing to do
+	if sv.closed.Load() {
+		return
+	}
+
+	// SECURITY: Acquire mutex to prevent race with Release()
+	// This is defense-in-depth - the finalizer should already be cleared
+	// before the object is returned to the pool, but we protect against
+	// any edge cases where this might not happen.
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+
+	// Double-check after acquiring lock (standard pattern)
 	if sv.closed.Load() || sv.data == nil {
 		return
 	}
-	// Use lock-free clear since GC finalizer runs when object is unreachable
-	// No other goroutine should be accessing this object at this point
-	sv.clearData()
+
+	sv.clearDataLocked()
+	sv.closed.Store(true)
 }
 
 // clearData securely zeros the data slice.
@@ -227,6 +247,30 @@ func (sv *SecureValue) clearData() {
 		*(*byte)(unsafe.Pointer(uintptr(dataPtr) + uintptr(i))) = 0
 	}
 	// Use runtime.KeepAlive to ensure the pointer is considered live until here
+	runtime.KeepAlive(sv.data)
+	sv.data = nil
+	sv.lockErr = nil
+}
+
+// clearDataLocked securely zeros the data slice.
+// Must be called with sv.mu held.
+// This is the locked version used by finalize() for thread-safety.
+func (sv *SecureValue) clearDataLocked() {
+	if len(sv.data) == 0 {
+		return
+	}
+
+	// Unlock memory before clearing (if it was locked)
+	if sv.locked {
+		internal.UnlockMemory(sv.data)
+		sv.locked = false
+	}
+
+	// Use volatile-style clearing to prevent compiler optimization
+	dataPtr := unsafe.Pointer(&sv.data[0])
+	for i := range sv.data {
+		*(*byte)(unsafe.Pointer(uintptr(dataPtr) + uintptr(i))) = 0
+	}
 	runtime.KeepAlive(sv.data)
 	sv.data = nil
 	sv.lockErr = nil
@@ -556,17 +600,16 @@ func (sm *secureMap) Get(key string) (string, bool) {
 		shard.mu.RUnlock()
 		return "", false
 	}
-	// Acquire SecureValue's read lock while holding shard lock to prevent
-	// data race with concurrent Release() or Close() operations.
-	// This ensures the data is not cleared while we're reading it.
-	sv.mu.RLock()
+	// Check closed state atomically (no SecureValue lock needed)
+	// Holding shard lock prevents concurrent Delete/Release which could acquire sv lock
+	// before checking closed state, ensuring consistent view
 	if sv.closed.Load() || sv.data == nil {
-		sv.mu.RUnlock()
 		shard.mu.RUnlock()
 		return "", false
 	}
+	// Copy data while holding shard lock
+	// The shard lock prevents Delete/Release from modifying this entry
 	result := string(sv.data)
-	sv.mu.RUnlock()
 	shard.mu.RUnlock()
 	return result, true
 }

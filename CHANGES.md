@@ -4,6 +4,45 @@ All notable changes to the cybergodev/env library will be documented in this fil
 
 ---
 
+## v1.1.0 — Performance & Architecture Refactoring (2026-03-22)
+
+### Breaking Changes
+- Removed deprecated grouped accessors: use direct `Config` field access instead of `GetFileConfig()`/`SetFileConfig()`, `GetValidationConfig()`/`SetValidationConfig()`, etc.
+
+### Added
+- `ForceRegisterParser()` — allows overriding built-in parsers for advanced use cases
+- `ToUpperASCIISafe()` / `IsASCII()` — fast ASCII validation with zero overhead
+- `ErrNonASCII` / `ErrValidateRequiredUnsupported` — explicit sentinel errors
+- `ValidateUTF8` config option — optional UTF-8 value validation
+- `CloseableChannelHandler` — audit handler with owned channel lifecycle
+- Config sub-structs for grouped access documentation
+
+### Changed
+- `New()` accepts optional `Config` parameter; zero-value defaults to `DefaultConfig()`
+- Singleton error cache expires after 30s for transient failure recovery
+- Extracted adapter types to `adapters.go` for better organization
+- `finalize()` now mutex-protected for thread-safety
+
+### Fixed
+- `ValidateRequired()` returns explicit error instead of silent `nil` for minimal validators
+- `containsIgnoreCase()` now handles non-ASCII input correctly
+- Resource leak in `parseString()` with double `Close()` call
+- Inaccurate pre-allocation in `buildChain()` error messages
+
+### Security
+- `InternKey()` cache consistency improved with FIFO eviction correctness
+- `validateValueChars()` unsafe pointer usage documented with safety invariants
+- Added security invariant documentation for fast path operations
+
+### Performance
+- Parser: ~9% faster, ~9% less memory for large files
+- YAML parser: ~9% faster, ~25% less memory for medium files
+- JSON parser: ~6% faster
+- Key validation: ~5-10% improvement
+- `SanitizeForLog()`: O(n*m) → single-pass scanning
+
+---
+
 ## v1.0.1 — Security Hardening & Performance (2026-03-19)
 
 ### Added

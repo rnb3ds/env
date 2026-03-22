@@ -327,9 +327,10 @@ func TestExpander_UnclosedBrace(t *testing.T) {
 	if err != nil {
 		t.Errorf("Expand() error = %v", err)
 	}
-	// Unclosed brace should return masked version
-	if result != "${...}" {
-		t.Errorf("Expand(\"${VAR\") = %q, want \"${...}\"", result)
+	// SECURITY: Unclosed brace should return the original string unchanged
+	// This makes it clear that expansion failed rather than returning a confusing placeholder
+	if result != "${VAR" {
+		t.Errorf("Expand(\"${VAR\") = %q, want \"${VAR\"", result)
 	}
 }
 

@@ -37,21 +37,21 @@ func NewScalarValue(s string, line, col int) *Value {
 	}
 }
 
-// NewMapValue creates a new map value.
+// NewMapValue creates a new map value with pre-allocated capacity.
 func NewMapValue(line, col int) *Value {
 	return &Value{
 		Type:   ValueTypeMap,
-		Map:    make(map[string]*Value),
+		Map:    make(map[string]*Value, 8), // Pre-allocate with reasonable capacity
 		Line:   line,
 		Column: col,
 	}
 }
 
-// NewArrayValue creates a new array value.
+// NewArrayValue creates a new array value with pre-allocated capacity.
 func NewArrayValue(line, col int) *Value {
 	return &Value{
 		Type:   ValueTypeArray,
-		Array:  []*Value{},
+		Array:  make([]*Value, 0, 4), // Pre-allocate with reasonable capacity
 		Line:   line,
 		Column: col,
 	}

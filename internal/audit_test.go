@@ -21,7 +21,7 @@ func TestNewAuditor(t *testing.T) {
 
 	// Test with enabled
 	a = NewAuditor(nil, nil, nil, true)
-	if !a.enabled {
+	if !a.enabled.Load() {
 		t.Error("auditor should be enabled")
 	}
 }

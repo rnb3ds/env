@@ -286,7 +286,7 @@ wg.Wait()
 
 ```go
 // ✅ Use defer for cleanup
-loader, _ := env.NewIsolated(cfg)
+loader, _ := env.New(cfg)
 defer loader.Close()
 
 // Or explicit close with error handling

@@ -11,6 +11,17 @@ import (
 )
 
 // ============================================================================
+// Type Constraints
+// ============================================================================
+
+// sliceElement is a type constraint for supported slice element types.
+// This constraint is used by GetSlice and GetSliceFrom functions to ensure
+// type-safe parsing of slice values from environment variables.
+type sliceElement interface {
+	string | int | int64 | uint | uint64 | bool | float64 | time.Duration
+}
+
+// ============================================================================
 // Generic Helpers
 // ============================================================================
 
