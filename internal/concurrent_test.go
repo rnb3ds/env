@@ -7,10 +7,10 @@ import (
 )
 
 // ============================================================================
-// Concurrent Access Tests for InternKey
+// Concurrent Access Tests for InternKeyBytes
 // ============================================================================
 
-func TestInternKey_ConcurrentAccess(t *testing.T) {
+func TestInternKeyBytes_ConcurrentAccess(t *testing.T) {
 	var wg sync.WaitGroup
 	iterations := 1000
 	concurrency := 10
@@ -21,9 +21,9 @@ func TestInternKey_ConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
 				key := "TEST_KEY_" + string(rune('A'+j%26))
-				result := InternKey(key)
+				result := InternKeyBytes([]byte(key))
 				if result != key {
-					t.Errorf("InternKey(%q) = %q, want %q", key, result, key)
+					t.Errorf("InternKeyBytes(%q) = %q, want %q", key, result, key)
 				}
 			}
 		}(i)
@@ -32,7 +32,7 @@ func TestInternKey_ConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
-func TestInternKey_ConcurrentWithClear(t *testing.T) {
+func TestInternKeyBytes_ConcurrentWithClear(t *testing.T) {
 	for run := 0; run < 10; run++ {
 		ClearInternCache()
 
@@ -46,7 +46,7 @@ func TestInternKey_ConcurrentWithClear(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for j := 0; j < iterations; j++ {
-					InternKey("TEST_KEY")
+					InternKeyBytes([]byte("TEST_KEY"))
 				}
 			}()
 		}
@@ -156,8 +156,8 @@ func TestAuditor_ConcurrentAccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
-				auditor.Log(ActionSet, "KEY", "test", true)
-				auditor.LogError(ActionGet, "KEY", "error")
+				_ = auditor.Log(ActionSet, "KEY", "test", true) // error irrelevant under concurrent stress
+				_ = auditor.LogError(ActionGet, "KEY", "error") // error irrelevant under concurrent stress
 				_ = auditor.IsEnabled()
 			}
 		}()
@@ -184,7 +184,7 @@ func TestAuditor_ConcurrentWithEnable(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for j := 0; j < iterations; j++ {
-					auditor.Log(ActionSet, "KEY", "test", true)
+					_ = auditor.Log(ActionSet, "KEY", "test", true) // error irrelevant under concurrent stress
 					_ = auditor.IsEnabled()
 				}
 			}()
@@ -300,7 +300,6 @@ func TestLineParser_ConcurrentAccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
-				_, _, _ = parser.ParseLine("KEY=value")
 				_, _, _ = parser.ParseLineBytes([]byte("KEY=value"))
 			}
 		}()
@@ -313,7 +312,7 @@ func TestLineParser_ConcurrentAccess(t *testing.T) {
 // Stress Tests
 // ============================================================================
 
-func TestStress_InternKey(t *testing.T) {
+func TestStress_InternKeyBytes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in short mode")
 	}
@@ -328,7 +327,7 @@ func TestStress_InternKey(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
 				key := "STRESS_KEY_" + string(rune('A'+j%26))
-				InternKey(key)
+				InternKeyBytes([]byte(key))
 			}
 		}(i)
 	}

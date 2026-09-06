@@ -1,4 +1,10 @@
-//go:build unix || linux || darwin || freebsd || netbsd || openbsd
+//go:build linux || darwin
+
+// mlock/munlock via the syscall package. The tag list is exactly the
+// platforms where stdlib syscall.Mlock/Munlock exist: the previous
+// "unix || ..." form also pulled in the BSDs, Solaris and Illumos, where
+// syscall.Mlock is undefined and the package failed to compile. Platforms
+// without mlock take the no-op fallback in mlock_other.go.
 
 package internal
 

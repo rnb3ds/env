@@ -20,10 +20,12 @@ var (
 	ErrLineTooLong = ierrors.ErrLineTooLong
 
 	// ErrInvalidKey indicates the key does not match the required pattern.
-	ErrInvalidKey = errors.New("invalid key format")
+	// Matches key-rule ValidationErrors returned by Set and the parsers via errors.Is.
+	ErrInvalidKey = ierrors.ErrInvalidKey
 
 	// ErrForbiddenKey indicates the key is not allowed for security reasons.
-	ErrForbiddenKey = errors.New("key is forbidden for security reasons")
+	// Matches SecurityErrors from the forbidden-keys / allowed-keys policy via errors.Is.
+	ErrForbiddenKey = ierrors.ErrForbiddenKey
 
 	// ErrSecurityViolation indicates a general security policy violation.
 	// Re-exported from internal/errors for backward compatibility.
@@ -34,16 +36,20 @@ var (
 	ErrExpansionDepth = ierrors.ErrExpansionDepth
 
 	// ErrMaxVariables indicates the maximum number of variables has been reached.
-	ErrMaxVariables = errors.New("maximum number of variables exceeded")
+	// Matches the max-variables ValidationError via errors.Is.
+	ErrMaxVariables = ierrors.ErrMaxVariables
 
 	// ErrInvalidValue indicates the value contains invalid content.
 	// Re-exported from internal/errors for backward compatibility.
 	ErrInvalidValue = ierrors.ErrInvalidValue
 
 	// ErrMissingRequired indicates a required key is missing.
-	ErrMissingRequired = errors.New("required key is missing")
+	// Matches the required-keys ValidationError via errors.Is.
+	ErrMissingRequired = ierrors.ErrMissingRequired
 
 	// ErrDuplicateKey indicates a duplicate key was encountered.
+	// Reserved: duplicate keys are currently skipped (not an error) when
+	// OverwriteExisting is false; no code path returns this sentinel yet.
 	ErrDuplicateKey = errors.New("duplicate key encountered")
 
 	// ErrClosed indicates the loader has been closed.

@@ -399,6 +399,14 @@ func TestValidationError_Is(t *testing.T) {
 		{"empty rule does not match ErrInvalidValue", &ValidationError{Rule: ""}, ErrInvalidValue, false},
 		{"config rule does not match ErrInvalidValue", &ValidationError{Rule: "config"}, ErrInvalidValue, false},
 		{"does not match wrong target", &ValidationError{Rule: "value"}, ErrFileTooLarge, false},
+		{"key pattern rule matches ErrInvalidKey", &ValidationError{Field: "key", Rule: "pattern"}, ErrInvalidKey, true},
+		{"key non_empty rule matches ErrInvalidKey", &ValidationError{Field: "key", Rule: "non_empty"}, ErrInvalidKey, true},
+		{"key max_length rule matches ErrInvalidKey", &ValidationError{Field: "key", Rule: "max_length"}, ErrInvalidKey, true},
+		{"key ascii_only rule matches ErrInvalidKey", &ValidationError{Field: "key", Rule: "ascii_only"}, ErrInvalidKey, true},
+		{"pattern rule on non-key field does not match ErrInvalidKey", &ValidationError{Field: "value", Rule: "pattern"}, ErrInvalidKey, false},
+		{"required rule matches ErrMissingRequired", &ValidationError{Rule: "required"}, ErrMissingRequired, true},
+		{"max_variables rule matches ErrMaxVariables", &ValidationError{Rule: "max_variables"}, ErrMaxVariables, true},
+		{"value rule does not match ErrInvalidKey", &ValidationError{Rule: "value"}, ErrInvalidKey, false},
 	}
 
 	for _, tt := range tests {
@@ -419,6 +427,21 @@ func TestSecurityError_Is(t *testing.T) {
 
 	if errors.Is(err, ErrFileTooLarge) {
 		t.Error("errors.Is(SecurityError, ErrFileTooLarge) = true, want false")
+	}
+
+	// key_access rejections match ErrForbiddenKey in addition to ErrSecurityViolation.
+	forbidden := &SecurityError{Action: "key_access", Reason: "key is forbidden"}
+	if !errors.Is(forbidden, ErrForbiddenKey) {
+		t.Error("errors.Is(key_access SecurityError, ErrForbiddenKey) = false, want true")
+	}
+	if !errors.Is(forbidden, ErrSecurityViolation) {
+		t.Error("errors.Is(key_access SecurityError, ErrSecurityViolation) = false, want true")
+	}
+
+	// Non-key_access security errors do not match ErrForbiddenKey.
+	pathErr := &SecurityError{Action: "file_access", Reason: "path traversal detected"}
+	if errors.Is(pathErr, ErrForbiddenKey) {
+		t.Error("errors.Is(file_access SecurityError, ErrForbiddenKey) = true, want false")
 	}
 }
 

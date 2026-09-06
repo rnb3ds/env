@@ -11,9 +11,9 @@ import (
 
 func TestYAMLLexer_SimpleKey(t *testing.T) {
 	input := "key: value"
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
-	tokens, err := lexer.Tokenize()
+	tokens, err := lexer.tokenizeInto(nil)
 	if err != nil {
 		t.Fatalf("Tokenize() error = %v", err)
 	}
@@ -42,9 +42,9 @@ func TestYAMLLexer_NestedKeys(t *testing.T) {
 	input := `database:
   host: localhost
   port: 5432`
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
-	tokens, err := lexer.Tokenize()
+	tokens, err := lexer.tokenizeInto(nil)
 	if err != nil {
 		t.Fatalf("Tokenize() error = %v", err)
 	}
@@ -74,9 +74,9 @@ func TestYAMLLexer_Array(t *testing.T) {
   - one
   - two
   - three`
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
-	tokens, err := lexer.Tokenize()
+	tokens, err := lexer.tokenizeInto(nil)
 	if err != nil {
 		t.Fatalf("Tokenize() error = %v", err)
 	}
@@ -97,9 +97,9 @@ func TestYAMLLexer_Array(t *testing.T) {
 func TestYAMLLexer_DocumentStart(t *testing.T) {
 	input := `---
 key: value`
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
-	tokens, err := lexer.Tokenize()
+	tokens, err := lexer.tokenizeInto(nil)
 	if err != nil {
 		t.Fatalf("Tokenize() error = %v", err)
 	}
@@ -116,9 +116,9 @@ key: value`
 func TestYAMLLexer_Comments(t *testing.T) {
 	input := `# This is a comment
 key: value # inline comment`
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
-	tokens, err := lexer.Tokenize()
+	tokens, err := lexer.tokenizeInto(nil)
 	if err != nil {
 		t.Fatalf("Tokenize() error = %v", err)
 	}
@@ -165,8 +165,8 @@ func TestYAMLLexer_QuotedStrings(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			lexer := NewYAMLLexer(tt.input)
-			tokens, err := lexer.Tokenize()
+			lexer := newYAMLLexer([]byte(tt.input))
+			tokens, err := lexer.tokenizeInto(nil)
 			if err != nil {
 				t.Fatalf("Tokenize() error = %v", err)
 			}
@@ -203,8 +203,8 @@ func TestYAMLLexer_EscapeSequences(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			input := "key: " + tt.input
-			lexer := NewYAMLLexer(input)
-			tokens, err := lexer.Tokenize()
+			lexer := newYAMLLexer([]byte(input))
+			tokens, err := lexer.tokenizeInto(nil)
 			if err != nil {
 				t.Fatalf("Tokenize() error = %v", err)
 			}
@@ -225,18 +225,18 @@ func TestYAMLLexer_EscapeSequences(t *testing.T) {
 
 func TestYAMLLexer_UnterminatedString(t *testing.T) {
 	input := `key: "unterminated`
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
-	_, err := lexer.Tokenize()
+	_, err := lexer.tokenizeInto(nil)
 	if err == nil {
 		t.Error("expected error for unterminated string")
 	}
 }
 
 func TestYAMLLexer_Empty(t *testing.T) {
-	lexer := NewYAMLLexer("")
+	lexer := newYAMLLexer([]byte(""))
 
-	tokens, err := lexer.Tokenize()
+	tokens, err := lexer.tokenizeInto(nil)
 	if err != nil {
 		t.Fatalf("Tokenize() error = %v", err)
 	}
@@ -251,9 +251,9 @@ func TestYAMLLexer_IndentDedent(t *testing.T) {
   nested:
     deep: value
   back: here`
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
-	tokens, err := lexer.Tokenize()
+	tokens, err := lexer.tokenizeInto(nil)
 	if err != nil {
 		t.Fatalf("Tokenize() error = %v", err)
 	}
@@ -282,9 +282,9 @@ func TestYAMLLexer_MultipleDocuments(t *testing.T) {
 doc1: value
 ---
 doc2: value2`
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
-	tokens, err := lexer.Tokenize()
+	tokens, err := lexer.tokenizeInto(nil)
 	if err != nil {
 		t.Fatalf("Tokenize() error = %v", err)
 	}
@@ -303,9 +303,9 @@ doc2: value2`
 
 func TestYAMLLexer_CRLF(t *testing.T) {
 	input := "key1: value1\r\nkey2: value2"
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
-	tokens, err := lexer.Tokenize()
+	tokens, err := lexer.tokenizeInto(nil)
 	if err != nil {
 		t.Fatalf("Tokenize() error = %v", err)
 	}
@@ -325,9 +325,9 @@ func TestYAMLLexer_CRLF(t *testing.T) {
 
 func TestYAMLLexer_Tabs(t *testing.T) {
 	input := "root:\n\t\tnested: value"
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
-	tokens, err := lexer.Tokenize()
+	tokens, err := lexer.tokenizeInto(nil)
 	if err != nil {
 		t.Fatalf("Tokenize() error = %v", err)
 	}
@@ -350,9 +350,9 @@ func TestYAMLLexer_Tabs(t *testing.T) {
 
 func TestYAMLLexer_ColonInValue(t *testing.T) {
 	input := `url: "https://example.com:8080"`
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
-	tokens, err := lexer.Tokenize()
+	tokens, err := lexer.tokenizeInto(nil)
 	if err != nil {
 		t.Fatalf("Tokenize() error = %v", err)
 	}
@@ -368,9 +368,9 @@ func TestYAMLLexer_ColonInValue(t *testing.T) {
 
 func TestYAMLLexer_DashInKey(t *testing.T) {
 	input := `api-key: value`
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
-	tokens, err := lexer.Tokenize()
+	tokens, err := lexer.tokenizeInto(nil)
 	if err != nil {
 		t.Fatalf("Tokenize() error = %v", err)
 	}
@@ -390,9 +390,9 @@ func TestYAMLLexer_DashInKey(t *testing.T) {
 func TestYAMLLexer_LineColumn(t *testing.T) {
 	input := `key1: value1
 key2: value2`
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
-	tokens, err := lexer.Tokenize()
+	tokens, err := lexer.tokenizeInto(nil)
 	if err != nil {
 		t.Fatalf("Tokenize() error = %v", err)
 	}
@@ -416,7 +416,7 @@ key2: value2`
 
 func TestYAMLLexer_NextToken(t *testing.T) {
 	input := "key: value"
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
 	// Test NextToken one at a time
 	tok, err := lexer.NextToken()
@@ -446,9 +446,9 @@ func TestYAMLLexer_NextToken(t *testing.T) {
 
 func TestYAMLLexer_EscapeAtEndOfString(t *testing.T) {
 	input := `key: "value\"`
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
-	_, err := lexer.Tokenize()
+	_, err := lexer.tokenizeInto(nil)
 	if err == nil {
 		t.Error("expected error for escape at end of string")
 	}
@@ -456,14 +456,14 @@ func TestYAMLLexer_EscapeAtEndOfString(t *testing.T) {
 
 func TestYAMLLexer_NullByte(t *testing.T) {
 	input := `key: "value\0null"`
-	lexer := NewYAMLLexer(input)
+	lexer := newYAMLLexer([]byte(input))
 
 	// SECURITY FIX: \0 escape should now return an error at lexer level
 	// for defense in depth. Null bytes can cause:
 	// - Log injection (log entries truncated at null byte)
 	// - String truncation vulnerabilities in C interop
 	// - Bypass of security controls that don't expect nulls
-	_, err := lexer.Tokenize()
+	_, err := lexer.tokenizeInto(nil)
 	if err == nil {
 		t.Error("SECURITY: expected error for \\0 escape - null bytes are not allowed")
 		return

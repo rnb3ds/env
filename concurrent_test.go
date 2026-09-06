@@ -65,7 +65,7 @@ func TestLoader_Concurrent(t *testing.T) {
 
 			// Pre-populate so readers have data
 			for i := 0; i < 26; i++ {
-				loader.Set("KEY_"+string(rune('A'+i)), "initial")
+				_ = loader.Set("KEY_"+string(rune('A'+i)), "initial") // fixture; read assertions live below
 			}
 
 			var wg sync.WaitGroup
@@ -101,7 +101,7 @@ func TestLoader_ConcurrentWithClose(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for j := 0; j < iterations; j++ {
-					loader.Set("KEY", "value")
+					_ = loader.Set("KEY", "value") // stress loop; valid key cannot fail
 					_ = loader.GetString("KEY")
 					_ = loader.Keys()
 				}
@@ -120,6 +120,76 @@ func TestLoader_ConcurrentWithClose(t *testing.T) {
 		}()
 
 		wg.Wait()
+	}
+}
+
+// TestLoader_ConcurrentFastPaths stresses the lock-free single-key read path
+// (Lookup/GetSecure via the atomic closed flag) and the read-lock Set fast
+// path (OverwriteExisting + no AutoApply) together with concurrent Close.
+// Invariants: no data race, no panic, and every observed value is one of the
+// written ones (graceful degradation — reads that lose the race with Close
+// see the cleared state).
+func TestLoader_ConcurrentFastPaths(t *testing.T) {
+	for run := 0; run < 20; run++ {
+		cfg := DefaultConfig()
+		cfg.OverwriteExisting = true // activates the Set read-lock fast path
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		stop := make(chan struct{})
+
+		// Writers using the Set fast path
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 500; j++ {
+					if err := loader.Set("KEY", "value"); err != nil && !errors.Is(err, ErrClosed) {
+						t.Errorf("Set: unexpected error: %v", err)
+						return
+					}
+				}
+			}()
+		}
+
+		// Lock-free single-key readers
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 500; j++ {
+					if v, ok := loader.Lookup("KEY"); ok && v != "value" {
+						t.Errorf("Lookup: got %q, want %q", v, "value")
+						return
+					}
+					if sv := loader.GetSecure("KEY"); sv != nil {
+						sv.Release()
+					}
+				}
+			}()
+		}
+
+		// Closer racing with the paths above
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-stop
+			_ = loader.Close()
+		}()
+
+		close(stop)
+		wg.Wait()
+
+		// After Close completes, all single-key reads must report absence.
+		if _, ok := loader.Lookup("KEY"); ok {
+			t.Error("Lookup after Close should miss")
+		}
+		if loader.GetSecure("KEY") != nil {
+			t.Error("GetSecure after Close should return nil")
+		}
 	}
 }
 
@@ -297,6 +367,58 @@ func TestParserRegistry_ConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
+// TestCreateParsers_FactoryRegistersParser verifies that a parser factory may
+// call RegisterParser from inside its callback without deadlocking.
+// createParsers previously invoked factory callbacks while holding
+// globalParserRegistry.mu.RLock; RegisterParser needs the write lock, and
+// RWMutex is not reentrant, so this self-deadlocked.
+func TestCreateParsers_FactoryRegistersParser(t *testing.T) {
+	outerFormat := nextTestFormat()
+	innerFormat := nextTestFormat()
+
+	// Insert via the internal map (like registerBuiltin) so the test can
+	// remove its entries afterwards — RegisterParser is permanent.
+	globalParserRegistry.mu.Lock()
+	globalParserRegistry.factories[outerFormat] = func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
+		// Must not deadlock: the write lock requires the read lock held by
+		// the caller to be released first.
+		if err := RegisterParser(innerFormat, func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
+			return nil, nil
+		}); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	globalParserRegistry.mu.Unlock()
+
+	defer func() {
+		globalParserRegistry.mu.Lock()
+		delete(globalParserRegistry.factories, outerFormat)
+		delete(globalParserRegistry.factories, innerFormat)
+		globalParserRegistry.mu.Unlock()
+	}()
+
+	// Guard against a regression re-introducing the deadlock: fail the test
+	// instead of hanging the whole suite.
+	done := make(chan error, 1)
+	go func() {
+		cfg := DefaultConfig()
+		factory := cfg.buildComponentFactory()
+		defer factory.Close()
+		_, err := createParsers(cfg, factory)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("createParsers() error = %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("createParsers deadlocked: factory callback blocked on registry write lock")
+	}
+}
+
 // ============================================================================
 // Concurrent Access Tests for ComponentFactory
 // ============================================================================
@@ -382,9 +504,13 @@ func TestStress_HighConcurrency(t *testing.T) {
 	}
 	defer loader.Close()
 
-	// Pre-populate with many variables
+	// Pre-populate with many variables. Keys must be pattern-valid: the
+	// previous rune-suffix construction silently failed validation for ~75%
+	// of iterations (control/punct chars), populating ~246 of 1000 keys.
 	for i := 0; i < 1000; i++ {
-		loader.Set("STRESS_KEY_"+string(rune(i%256)), "value")
+		if err := loader.Set(fmt.Sprintf("STRESS_KEY_%d", i), "value"); err != nil {
+			t.Fatalf("setup Set() error = %v", err)
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -399,7 +525,7 @@ func TestStress_HighConcurrency(t *testing.T) {
 			for j := 0; j < iterations; j++ {
 				switch j % 5 {
 				case 0:
-					loader.Set("STRESS_KEY_"+string(rune(j%256)), "new_value")
+					_ = loader.Set("STRESS_KEY_"+string(rune(j%256)), "new_value") // stress loop
 				case 1:
 					_ = loader.GetString("STRESS_KEY_" + string(rune(j%256)))
 				case 2:
@@ -438,7 +564,7 @@ func TestLoader_ConcurrentApplyValidate(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
-				loader.Set("KEY1", "value")
+				_ = loader.Set("KEY1", "value") // stress loop; valid key cannot fail
 				_ = loader.Apply()
 			}
 		}(i)
@@ -553,8 +679,8 @@ func TestSecureValue_ConcurrentWithMemoryLock(t *testing.T) {
 // ============================================================================
 
 func TestGetDefaultLoader(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	// Without Load(), should return ErrNotInitialized
 	_, err := getDefaultLoader()
@@ -581,8 +707,8 @@ func TestGetDefaultLoader(t *testing.T) {
 }
 
 func TestResetDefaultLoader(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	// Set a loader first
 	loader, err := New(DefaultConfig())
@@ -595,7 +721,7 @@ func TestResetDefaultLoader(t *testing.T) {
 
 	// Create and reset multiple times
 	for i := 0; i < 3; i++ {
-		ResetDefaultLoader()
+		resetDefaultLoader()
 	}
 
 	// After reset, should return ErrNotInitialized
@@ -605,23 +731,9 @@ func TestResetDefaultLoader(t *testing.T) {
 	}
 }
 
-func TestSetDefaultLoader(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	loader, err := New(DefaultConfig())
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-}
-
 func TestSetDefaultLoader_AlreadyInitialized(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	// First initialization should succeed
 	loader, err := New(DefaultConfig())
@@ -652,8 +764,8 @@ func TestSetDefaultLoader_AlreadyInitialized(t *testing.T) {
 
 // TestSingleton_ConcurrentAccess tests concurrent access to the default loader.
 func TestSingleton_ConcurrentAccess(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	// Set up loader before concurrent access
 	loader, err := New(DefaultConfig())
@@ -693,7 +805,7 @@ func TestSingleton_ConcurrentAccess(t *testing.T) {
 // TestSingleton_ConcurrentReset tests concurrent access with reset.
 func TestSingleton_ConcurrentReset(t *testing.T) {
 	for run := 0; run < 10; run++ {
-		ResetDefaultLoader()
+		resetDefaultLoader()
 
 		// Set up initial loader
 		initLoader, err := New(DefaultConfig())
@@ -727,112 +839,23 @@ func TestSingleton_ConcurrentReset(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for j := 0; j < iterations/10; j++ {
-					ResetDefaultLoader()
+					resetDefaultLoader()
 					l, lerr := New(DefaultConfig())
 					if lerr == nil {
-						setDefaultLoader(l)
+						_ = setDefaultLoader(l) // ErrAlreadyInitialized expected when racing other resets
 					}
 				}
 			}()
 		}
 
 		wg.Wait()
-		ResetDefaultLoader()
+		resetDefaultLoader()
 	}
 }
 
 // ============================================================================
 // Resource Leak Tests
 // ============================================================================
-
-// TestBufferedHandler_NoGoroutineLeak verifies that BufferedHandler's background
-// goroutine is properly stopped when Close() is called.
-func TestBufferedHandler_NoGoroutineLeak(t *testing.T) {
-	// Get initial goroutine count
-	initialGoroutines := runtime.NumGoroutine()
-
-	// Create multiple buffered handlers with flush intervals
-	// Each starts a background goroutine
-	handlers := make([]*internal.BufferedHandler, 10)
-	for i := 0; i < 10; i++ {
-		handlers[i] = internal.NewBufferedHandler(internal.BufferedHandlerConfig{
-			Handler:       internal.NewNopHandler(),
-			BufferSize:    10,
-			FlushInterval: 100 * time.Millisecond,
-		})
-	}
-
-	// Give goroutines time to start
-	time.Sleep(50 * time.Millisecond)
-
-	// Verify goroutines were created
-	afterCreate := runtime.NumGoroutine()
-	if afterCreate <= initialGoroutines {
-		t.Logf("Warning: expected goroutine increase, initial=%d, after=%d",
-			initialGoroutines, afterCreate)
-	}
-
-	// Close all handlers
-	for _, h := range handlers {
-		if err := h.Close(); err != nil {
-			t.Errorf("Close() error = %v", err)
-		}
-	}
-
-	// Give goroutines time to stop
-	time.Sleep(100 * time.Millisecond)
-
-	// Force garbage collection to clean up any pending finalizers
-	runtime.GC()
-	time.Sleep(50 * time.Millisecond)
-
-	// Verify goroutines were cleaned up
-	finalGoroutines := runtime.NumGoroutine()
-
-	// Allow for some variance due to test framework goroutines
-	// but there should be significant reduction
-	leakedGoroutines := finalGoroutines - initialGoroutines
-
-	t.Logf("Goroutine count: initial=%d, after_create=%d, final=%d, leaked=%d",
-		initialGoroutines, afterCreate, finalGoroutines, leakedGoroutines)
-
-	// We expect at most 2 extra goroutines from test infrastructure
-	if leakedGoroutines > 2 {
-		t.Errorf("Potential goroutine leak: %d goroutines not cleaned up", leakedGoroutines)
-	}
-}
-
-// TestCloseableChannelHandler_ReceiverUnblocked verifies that receivers
-// are properly unblocked when the handler is closed.
-func TestCloseableChannelHandler_ReceiverUnblocked(t *testing.T) {
-	handler := internal.NewCloseableChannelHandler(0) // Unbuffered
-
-	receiverDone := make(chan struct{})
-	go func() {
-		defer close(receiverDone)
-		ch := handler.Channel()
-		// This will block until handler is closed
-		for range ch {
-			// Consume events
-		}
-	}()
-
-	// Give receiver time to start blocking
-	time.Sleep(50 * time.Millisecond)
-
-	// Close the handler - this should unblock the receiver
-	if err := handler.Close(); err != nil {
-		t.Errorf("Close() error = %v", err)
-	}
-
-	// Wait for receiver to finish
-	select {
-	case <-receiverDone:
-		// Success - receiver was unblocked
-	case <-time.After(time.Second):
-		t.Error("receiver should have been unblocked by Close()")
-	}
-}
 
 // TestLoader_ResourceCleanup verifies that Loader properly cleans up resources
 // when Close() is called.
@@ -919,63 +942,11 @@ func TestSecureValue_DoubleReleaseSafe(t *testing.T) {
 	sv.Release()
 }
 
-// TestComponentFactory_CloseIdempotent verifies that ComponentFactory.Close()
-// can be called multiple times safely.
-func TestComponentFactory_CloseIdempotent(t *testing.T) {
-	cfg := DefaultConfig()
-	factory := cfg.buildComponentFactory()
-
-	// Close multiple times
-	for i := 0; i < 5; i++ {
-		if err := factory.Close(); err != nil {
-			t.Errorf("Close() #%d error = %v", i+1, err)
-		}
-	}
-
-	if !factory.IsClosed() {
-		t.Error("IsClosed() should return true")
-	}
-}
+// TestComponentFactory_CloseIdempotent is covered by TestComponentFactory's
+// "Close" + "IsClosed" subtests in loader_test.go.
 
 // TestBufferedHandler_FlushOnClose verifies that BufferedHandler flushes
 // remaining events when closed.
-func TestBufferedHandler_FlushOnClose(t *testing.T) {
-	ch := make(chan internal.Event, 100)
-	underlying := internal.NewChannelHandler(ch)
-
-	handler := internal.NewBufferedHandler(internal.BufferedHandlerConfig{
-		Handler:       underlying,
-		BufferSize:    10,
-		FlushInterval: 0, // Disable auto-flush
-	})
-
-	// Log events without flushing
-	for i := 0; i < 5; i++ {
-		_ = handler.Log(internal.Event{Action: internal.ActionSet})
-	}
-
-	// Close should flush remaining events
-	if err := handler.Close(); err != nil {
-		t.Errorf("Close() error = %v", err)
-	}
-
-	// Count received events
-	count := 0
-	for {
-		select {
-		case <-ch:
-			count++
-		default:
-			goto done
-		}
-	}
-done:
-
-	if count != 5 {
-		t.Errorf("expected 5 events flushed on close, got %d", count)
-	}
-}
-
 // TestMultipleLoader_NoResourceLeak verifies that creating and closing
 // multiple Loaders doesn't accumulate resources.
 func TestMultipleLoader_NoResourceLeak(t *testing.T) {
@@ -1057,33 +1028,6 @@ func TestSecureMap_ClearReleasesMemory(t *testing.T) {
 // Additional Resource Leak Tests
 // ============================================================================
 
-// TestBufferedHandler_ConcurrentClose verifies that BufferedHandler.Close()
-// can be called concurrently without causing race conditions or deadlocks.
-func TestBufferedHandler_ConcurrentClose(t *testing.T) {
-	for i := 0; i < 10; i++ {
-		handler := internal.NewBufferedHandler(internal.BufferedHandlerConfig{
-			Handler:       internal.NewNopHandler(),
-			BufferSize:    10,
-			FlushInterval: 10 * time.Millisecond,
-		})
-
-		var wg sync.WaitGroup
-		for j := 0; j < 5; j++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				_ = handler.Close()
-			}()
-		}
-		wg.Wait()
-
-		// Verify handler is closed
-		if !handler.IsFull() && handler.BufferLen() != 0 {
-			// After close, buffer should be empty
-		}
-	}
-}
-
 // TestSecureValue_FinalizerCleanup verifies that SecureValue's finalizer
 // properly cleans up memory when the value is garbage collected.
 func TestSecureValue_FinalizerCleanup(t *testing.T) {
@@ -1158,16 +1102,16 @@ func TestKeyInternCache_BoundedGrowth(t *testing.T) {
 	for i := 0; i < 2000; i++ {
 		// Create keys that are within the length limit
 		key := fmt.Sprintf("KEY_%04d", i)
-		_ = internal.InternKey(key)
+		_ = internal.InternKeyBytes([]byte(key))
 	}
 
 	// Clear and verify it doesn't panic
 	internal.ClearInternCache()
 
 	// Verify we can still intern after clear
-	interned := internal.InternKey("TEST_KEY")
+	interned := internal.InternKeyBytes([]byte("TEST_KEY"))
 	if interned != "TEST_KEY" {
-		t.Error("InternKey should return the key after clear")
+		t.Error("InternKeyBytes should return the key after clear")
 	}
 
 	internal.ClearInternCache()
@@ -1175,54 +1119,21 @@ func TestKeyInternCache_BoundedGrowth(t *testing.T) {
 
 // TestLoader_MultipleCloseSafe verifies that calling Close() on a Loader
 // multiple times is safe.
-func TestLoader_MultipleCloseSafe(t *testing.T) {
-	mockFS := newTestFileSystem()
-	mockFS.files[".env"] = "KEY=value"
-
-	cfg := DefaultConfig()
-	cfg.Filenames = []string{".env"}
-	cfg.FileSystem = mockFS
-
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	// Close multiple times
-	for i := 0; i < 5; i++ {
-		if err := loader.Close(); err != nil {
-			t.Errorf("Close() #%d error = %v", i+1, err)
-		}
-	}
-
-	if !loader.IsClosed() {
-		t.Error("IsClosed() should return true")
-	}
-}
+// TestLoader_MultipleCloseSafe is covered by TestLoader_CloseAndIsClosed in
+// loader_test.go (second-close idempotency).
 
 // TestAuditEventPool_NoLeak verifies that the audit event pool properly
 // recycles events without leaking memory.
 func TestAuditEventPool_NoLeak(t *testing.T) {
-	handler := internal.NewBufferedHandler(internal.BufferedHandlerConfig{
-		Handler:       internal.NewNopHandler(),
-		BufferSize:    100,
-		FlushInterval: 0,
-	})
+	auditor := internal.NewAuditor(internal.NewNopHandler(), nil, nil, true)
 
-	// Log many events
+	// Log many events; each cycle takes an Event from the pool in Log and
+	// returns it in logEvent after the handler consumes it.
 	for i := 0; i < 1000; i++ {
-		_ = handler.Log(internal.Event{
-			Action:    internal.ActionSet,
-			Key:       "TEST_KEY",
-			Reason:    "test",
-			Success:   true,
-			Timestamp: time.Now(),
-		})
+		_ = auditor.Log(internal.ActionSet, "TEST_KEY", "test", true)
 	}
 
-	// Flush and close
-	_ = handler.Flush()
-	_ = handler.Close()
+	_ = auditor.Close()
 
 	// If we get here without memory issues, the test passes
 }

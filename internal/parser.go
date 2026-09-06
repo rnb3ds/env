@@ -50,53 +50,6 @@ func (p *LineParser) SetValueValidator(v LineValueValidator) {
 	p.valueValidator = v
 }
 
-// ParseLine parses a single line and returns the key and value.
-func (p *LineParser) ParseLine(line string) (string, string, error) {
-	// Handle export prefix - use direct slice comparison for speed
-	if p.config.AllowExportPrefix && len(line) > 7 && line[:7] == "export " {
-		line = line[7:]
-	}
-
-	// Find the separator
-	sepIdx := strings.IndexAny(line, "=:")
-	if sepIdx == -1 {
-		return "", "", nil // No assignment on this line
-	}
-
-	// Trim key using byte-level operations (faster than strings.TrimSpace)
-	keyStart := 0
-	keyEnd := sepIdx
-	for keyStart < keyEnd && (line[keyStart] == ' ' || line[keyStart] == '\t') {
-		keyStart++
-	}
-	for keyEnd > keyStart && (line[keyEnd-1] == ' ' || line[keyEnd-1] == '\t') {
-		keyEnd--
-	}
-	key := line[keyStart:keyEnd]
-
-	// Validate key
-	if err := p.keyValidator.ValidateKey(key); err != nil {
-		return "", "", err
-	}
-
-	value := line[sepIdx+1:]
-
-	// Parse the value
-	parsedValue, err := p.ParseValue(value)
-	if err != nil {
-		return "", "", err
-	}
-
-	// Validate value
-	if p.valueValidator != nil {
-		if err := p.valueValidator.ValidateValue(parsedValue); err != nil {
-			return "", "", err
-		}
-	}
-
-	return key, parsedValue, nil
-}
-
 // ParseLineBytes parses a single line from a byte slice and returns the key and value.
 // This version avoids string allocation by working directly with bytes.
 func (p *LineParser) ParseLineBytes(line []byte) (string, string, error) {
@@ -143,8 +96,9 @@ func (p *LineParser) ParseLineBytes(line []byte) (string, string, error) {
 	// overwritten on the next Scan() call. Using bytesToString here would cause
 	// the interned key to point to invalid memory after the buffer is reused.
 	// InternKeyBytes returns a stable heap copy (independent of the buffer) on
-	// a cache miss, while avoiding the temporary string allocation that
-	// InternKey(string(...)) would incur on every call — including cache hits.
+	// a cache miss, while avoiding the temporary string allocation that an
+	// InternKeyBytes(string(...))-style call would incur on every call —
+	// including cache hits.
 	key := InternKeyBytes(line[keyStart:keyEnd])
 
 	// Validate key
@@ -167,52 +121,6 @@ func (p *LineParser) ParseLineBytes(line []byte) (string, string, error) {
 	}
 
 	return key, parsedValue, nil
-}
-
-// ParseValue parses a value handling quotes and escapes.
-func (p *LineParser) ParseValue(value string) (string, error) {
-	// Fast byte-level trim for leading/trailing whitespace
-	start := 0
-	end := len(value)
-	for start < end && (value[start] == ' ' || value[start] == '\t') {
-		start++
-	}
-	for end > start && (value[end-1] == ' ' || value[end-1] == '\t') {
-		end--
-	}
-	value = value[start:end]
-
-	if len(value) == 0 {
-		return "", nil
-	}
-
-	// Handle quoted values
-	switch value[0] {
-	case '"':
-		return ParseDoubleQuoted(value)
-	case '\'':
-		return ParseSingleQuoted(value)
-	}
-
-	// Handle YAML-style values if enabled
-	if p.config.AllowYamlSyntax {
-		if unquoted, ok := TryParseYamlValue(value); ok {
-			return unquoted, nil
-		}
-	}
-
-	// Unquoted value - remove inline comments
-	if idx := strings.Index(value, " #"); idx != -1 {
-		value = value[:idx]
-		// Trim trailing whitespace after comment removal
-		end = len(value)
-		for end > 0 && (value[end-1] == ' ' || value[end-1] == '\t') {
-			end--
-		}
-		value = value[:end]
-	}
-
-	return value, nil
 }
 
 // ParseValueBytes parses a value from a byte slice handling quotes and escapes.
@@ -280,56 +188,6 @@ func (p *LineParser) ParseValueBytes(value []byte) (string, error) {
 	// string would become corrupted when the buffer is reused.
 	// The allocation cost is necessary for memory safety.
 	return string(value), nil
-}
-
-// ParseDoubleQuoted handles double-quoted values with escape sequences.
-func ParseDoubleQuoted(value string) (string, error) {
-	if len(value) < 2 || value[len(value)-1] != '"' {
-		return "", ErrInvalidValue
-	}
-
-	// Extract content between quotes
-	content := value[1 : len(value)-1]
-
-	// Fast path: no escape sequences
-	if strings.IndexByte(content, '\\') == -1 {
-		return content, nil
-	}
-
-	// Use pooled builder for escaped content
-	result := GetBuilder()
-	defer PutBuilder(result)
-	result.Grow(len(content))
-
-	// Optimized escape processing with lookup table
-	for i := 0; i < len(content); {
-		c := content[i]
-		if c == '\\' && i+1 < len(content) {
-			escaped := content[i+1]
-			// Use lookup table for O(1) escape translation
-			if translated := escapeTable[escaped]; translated != 0 {
-				result.WriteByte(translated)
-			} else {
-				result.WriteByte(escaped)
-			}
-			i += 2
-		} else {
-			result.WriteByte(c)
-			i++
-		}
-	}
-
-	return result.String(), nil
-}
-
-// ParseSingleQuoted handles single-quoted values (no escape processing).
-func ParseSingleQuoted(value string) (string, error) {
-	if len(value) < 2 || value[len(value)-1] != '\'' {
-		return "", ErrInvalidValue
-	}
-
-	// Single quotes don't process escapes
-	return value[1 : len(value)-1], nil
 }
 
 // escapeTable provides O(1) lookup for escape sequence translation.
@@ -461,42 +319,6 @@ func IsYamlNumberBytes(s []byte) bool {
 	return hasDigit
 }
 
-// TryParseYamlValue attempts to parse YAML-style values.
-func TryParseYamlValue(value string) (string, bool) {
-	// Check for YAML boolean/null values
-	switch strings.ToLower(value) {
-	case "true", "false":
-		return value, true
-	case "null", "~":
-		return "", true
-	}
-
-	// Check for YAML numbers
-	if IsYamlNumber(value) {
-		return value, true
-	}
-
-	return "", false
-}
-
-// IsYamlNumber checks if a string is a valid YAML number.
-func IsYamlNumber(s string) bool {
-	if s == "" {
-		return false
-	}
-
-	// Simple check for integer/float patterns
-	hasDigit := false
-	for _, c := range s {
-		if c >= '0' && c <= '9' {
-			hasDigit = true
-		} else if c != '-' && c != '+' && c != '.' && c != 'e' && c != 'E' {
-			return false
-		}
-	}
-	return hasDigit
-}
-
 // ExpandAll expands all variables in the map.
 // Returns the original map if no expansion is needed, avoiding unnecessary allocations.
 // This method delegates to Expander.ExpandAllInMap for the actual expansion logic.
@@ -508,7 +330,7 @@ func (p *LineParser) ExpandAll(vars map[string]string) (map[string]string, error
 		if err != nil {
 			// Log cycle detection errors
 			if expErr, ok := err.(*ExpansionError); ok && expErr.Key != "" {
-				p.auditor.LogError(ActionExpand, expErr.Key, "cycle detected")
+				_ = p.auditor.LogError(ActionExpand, expErr.Key, "cycle detected")
 			}
 			return nil, err
 		}
@@ -541,7 +363,7 @@ func (p *LineParser) expandAllUsingInterface(vars map[string]string) (map[string
 	for key, value := range vars {
 		expanded, err := p.expander.Expand(value)
 		if err != nil {
-			p.auditor.LogError(ActionExpand, key, err.Error())
+			_ = p.auditor.LogError(ActionExpand, key, err.Error())
 			return nil, err
 		}
 		result[key] = expanded
@@ -559,15 +381,6 @@ func keysToUpperImpl(m map[string]string, result map[string]bool) {
 		}
 		result[ToUpperASCII(k)] = true
 	}
-}
-
-// KeysToUpper converts map keys to uppercase for comparison.
-// This function is optimized to minimize allocations.
-// The caller owns the returned map and does not need to return it to a pool.
-func KeysToUpper(m map[string]string) map[string]bool {
-	result := make(map[string]bool, len(m))
-	keysToUpperImpl(m, result)
-	return result
 }
 
 // KeysToUpperPooled converts map keys to uppercase using a pooled map.

@@ -129,18 +129,29 @@ func (v *PathValidator) Validate(filename string) error {
 	return v.validateSymlinks(cleanPath)
 }
 
+// reservedDeviceNames and reservedPseudoDevices are the Windows reserved
+// device names checked on every file access. Package-level so the check is
+// allocation-free — per-call slice literals would rebuild their headers each
+// time, and the previous strings.ToUpper copied the whole filename.
+var (
+	reservedDeviceNames   = []string{"CON", "PRN", "AUX", "NUL"}
+	reservedPseudoDevices = []string{"CONIN$", "CONOUT$", "CLOCK$"}
+)
+
 // checkReservedDeviceNames checks for Windows reserved device names.
+// Comparisons are ASCII case-insensitive and allocation-free (EqualFoldASCII
+// on filename slices). This is equivalent to the previous strings.ToUpper
+// approach for these all-ASCII names: ToUpper never maps a non-ASCII byte to
+// one of these letters, so a fold mismatch here implies a mismatch there too.
 func (v *PathValidator) checkReservedDeviceNames(filename string) error {
 	if len(filename) < 3 {
 		return nil
 	}
 
-	upper := strings.ToUpper(filename)
-
 	// Check for CON, PRN, AUX, NUL
-	reserved := []string{"CON", "PRN", "AUX", "NUL"}
-	for _, r := range reserved {
-		if upper == r || (len(upper) > 3 && upper[:3] == r && (upper[3] == '.' || upper[3] == ':')) {
+	for _, r := range reservedDeviceNames {
+		if EqualFoldASCII(filename[:3], r) &&
+			(len(filename) == 3 || filename[3] == '.' || filename[3] == ':') {
 			return &SecurityError{
 				Action: "file_access",
 				Reason: "reserved device name",
@@ -150,11 +161,13 @@ func (v *PathValidator) checkReservedDeviceNames(filename string) error {
 
 	// Check COM and LPT ports (COM1-COM9, LPT1-LPT9)
 	// These are 4-character names like "COM1", "LPT9", etc.
-	if len(upper) >= 4 {
-		prefix := upper[:3]
-		if (prefix == "COM" || prefix == "LPT") && upper[3] >= '1' && upper[3] <= '9' {
+	// Digits are case-invariant, so filename[3] compares directly.
+	if len(filename) >= 4 &&
+		(EqualFoldASCII(filename[:3], "COM") || EqualFoldASCII(filename[:3], "LPT")) {
+		if c := filename[3]; c >= '1' && c <= '9' {
 			// Match: exactly 4 chars (e.g., "COM1") or followed by separator
-			if len(upper) == 4 || (len(upper) > 4 && (upper[4] == '.' || upper[4] == ':')) {
+			rest := filename[4:]
+			if len(rest) == 0 || rest[0] == '.' || rest[0] == ':' {
 				return &SecurityError{
 					Action: "file_access",
 					Reason: "reserved device name",
@@ -164,12 +177,20 @@ func (v *PathValidator) checkReservedDeviceNames(filename string) error {
 	}
 
 	// Check for pseudo-device names: CONIN$, CONOUT$, CLOCK$
-	pseudoDevices := []string{"CONIN$", "CONOUT$", "CLOCK$"}
-	for _, pd := range pseudoDevices {
-		if upper == pd || strings.HasPrefix(upper, pd+".") || strings.HasPrefix(upper, pd+":") {
+	for _, pd := range reservedPseudoDevices {
+		if EqualFoldASCII(filename, pd) {
 			return &SecurityError{
 				Action: "file_access",
 				Reason: "reserved pseudo-device name",
+			}
+		}
+		if len(filename) > len(pd) {
+			withSep := filename[:len(pd)+1]
+			if EqualFoldASCII(withSep, pd+".") || EqualFoldASCII(withSep, pd+":") {
+				return &SecurityError{
+					Action: "file_access",
+					Reason: "reserved pseudo-device name",
+				}
 			}
 		}
 	}

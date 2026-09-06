@@ -11,8 +11,10 @@ import (
 // JSON Flatten Tests
 // ============================================================================
 
-func TestFlattenJSON_Empty(t *testing.T) {
-	cfg := JSONFlattenConfig{
+// defaultJSONCfg returns the standard flatten configuration used by most
+// cases; individual cases override fields as needed.
+func defaultJSONCfg() JSONFlattenConfig {
+	return JSONFlattenConfig{
 		KeyDelimiter:     "_",
 		ArrayIndexFormat: "underscore",
 		NullAsEmpty:      true,
@@ -20,455 +22,331 @@ func TestFlattenJSON_Empty(t *testing.T) {
 		BoolAsString:     true,
 		MaxDepth:         10,
 	}
-
-	result, err := FlattenJSON([]byte{}, cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	if len(result) != 0 {
-		t.Errorf("expected empty map for empty input, got %d items", len(result))
-	}
 }
 
-func TestFlattenJSON_SimpleObject(t *testing.T) {
-	data := []byte(`{"key1": "value1", "key2": "value2"}`)
+func TestFlattenJSON(t *testing.T) {
+	longKey := strings.Repeat("K", 70)
 
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	result, err := FlattenJSON(data, cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	if len(result) != 2 {
-		t.Errorf("expected 2 items, got %d", len(result))
-	}
-
-	if result["KEY1"] != "value1" {
-		t.Errorf("result[\"KEY1\"] = %q, want %q", result["KEY1"], "value1")
-	}
-
-	if result["KEY2"] != "value2" {
-		t.Errorf("result[\"KEY2\"] = %q, want %q", result["KEY2"], "value2")
-	}
-}
-
-func TestFlattenJSON_NestedObject(t *testing.T) {
-	data := []byte(`{
-		"database": {
-			"host": "localhost",
-			"port": 5432
-		}
-	}`)
-
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	result, err := FlattenJSON(data, cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	if result["DATABASE_HOST"] != "localhost" {
-		t.Errorf("result[\"DATABASE_HOST\"] = %q, want %q", result["DATABASE_HOST"], "localhost")
-	}
-
-	if result["DATABASE_PORT"] != "5432" {
-		t.Errorf("result[\"DATABASE_PORT\"] = %q, want %q", result["DATABASE_PORT"], "5432")
-	}
-}
-
-func TestFlattenJSON_Array(t *testing.T) {
-	data := []byte(`{"items": ["one", "two", "three"]}`)
-
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	result, err := FlattenJSON(data, cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	if result["ITEMS_0"] != "one" {
-		t.Errorf("result[\"ITEMS_0\"] = %q, want %q", result["ITEMS_0"], "one")
-	}
-
-	if result["ITEMS_1"] != "two" {
-		t.Errorf("result[\"ITEMS_1\"] = %q, want %q", result["ITEMS_1"], "two")
-	}
-
-	if result["ITEMS_2"] != "three" {
-		t.Errorf("result[\"ITEMS_2\"] = %q, want %q", result["ITEMS_2"], "three")
-	}
-}
-
-func TestFlattenJSON_ArrayBracketFormat(t *testing.T) {
-	data := []byte(`{"items": ["one", "two"]}`)
-
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "bracket",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	result, err := FlattenJSON(data, cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	if result["ITEMS[0]"] != "one" {
-		t.Errorf("result[\"ITEMS[0]\"] = %q, want %q", result["ITEMS[0]"], "one")
-	}
-
-	if result["ITEMS[1]"] != "two" {
-		t.Errorf("result[\"ITEMS[1]\"] = %q, want %q", result["ITEMS[1]"], "two")
-	}
-}
-
-func TestFlattenJSON_NullValue(t *testing.T) {
 	tests := []struct {
-		name     string
-		cfg      JSONFlattenConfig
-		expected string
+		name        string
+		input       string
+		cfg         JSONFlattenConfig
+		want        map[string]string // keys asserted when non-nil
+		wantLen     int               // expected len(result); -1 skips the check
+		wantErr     bool
+		wantJSONErr bool // error must unwrap to *JSONError
+		check       func(t *testing.T, result map[string]string)
 	}{
 		{
-			name:     "null as empty",
-			cfg:      JSONFlattenConfig{NullAsEmpty: true},
-			expected: "",
+			name:    "empty input yields empty map",
+			input:   "",
+			cfg:     defaultJSONCfg(),
+			wantLen: 0,
 		},
 		{
-			name:     "null preserved",
-			cfg:      JSONFlattenConfig{NullAsEmpty: false},
-			expected: "null",
+			name:    "root null yields empty map",
+			input:   `null`,
+			cfg:     defaultJSONCfg(),
+			wantLen: 0,
+		},
+		{
+			name:    "root scalar yields empty map",
+			input:   `"hello"`,
+			cfg:     defaultJSONCfg(),
+			wantLen: 0,
+		},
+		{
+			name:    "root array yields indexed items",
+			input:   `["a", "b", "c"]`,
+			cfg:     defaultJSONCfg(),
+			wantLen: 3,
+			check: func(t *testing.T, result map[string]string) {
+				values := make(map[string]bool, len(result))
+				for _, v := range result {
+					values[v] = true
+				}
+				for _, want := range []string{"a", "b", "c"} {
+					if !values[want] {
+						t.Errorf("root array missing value %q (got %v)", want, result)
+					}
+				}
+			},
+		},
+		{
+			name:    "simple object",
+			input:   `{"key1": "value1", "key2": "value2"}`,
+			cfg:     defaultJSONCfg(),
+			want:    map[string]string{"KEY1": "value1", "KEY2": "value2"},
+			wantLen: 2,
+		},
+		{
+			name:  "nested object",
+			input: `{"database": {"host": "localhost", "port": 5432}}`,
+			cfg:   defaultJSONCfg(),
+			want:  map[string]string{"DATABASE_HOST": "localhost", "DATABASE_PORT": "5432"},
+		},
+		{
+			name:  "array with underscore format",
+			input: `{"items": ["one", "two", "three"]}`,
+			cfg:   defaultJSONCfg(),
+			want:  map[string]string{"ITEMS_0": "one", "ITEMS_1": "two", "ITEMS_2": "three"},
+		},
+		{
+			name:  "array with bracket format",
+			input: `{"items": ["a", "b", "c"]}`,
+			cfg: func() JSONFlattenConfig {
+				cfg := defaultJSONCfg()
+				cfg.ArrayIndexFormat = "bracket"
+				return cfg
+			}(),
+			want: map[string]string{"ITEMS[0]": "a", "ITEMS[1]": "b", "ITEMS[2]": "c"},
+		},
+		{
+			name: "array of objects",
+			input: `{"servers": [
+				{"host": "server1", "port": 8080},
+				{"host": "server2", "port": 9090}
+			]}`,
+			cfg: defaultJSONCfg(),
+			want: map[string]string{
+				"SERVERS_0_HOST": "server1",
+				"SERVERS_0_PORT": "8080",
+				"SERVERS_1_HOST": "server2",
+				"SERVERS_1_PORT": "9090",
+			},
+			wantLen: 4,
+		},
+		{
+			name: "nested array",
+			input: `{"matrix": [
+				["a", "b"],
+				["c", "d"]
+			]}`,
+			cfg:     defaultJSONCfg(),
+			want:    map[string]string{"MATRIX_0_0": "a", "MATRIX_0_1": "b", "MATRIX_1_0": "c", "MATRIX_1_1": "d"},
+			wantLen: 4,
+		},
+		{
+			name:  "null as empty",
+			input: `{"key": null}`,
+			cfg: func() JSONFlattenConfig {
+				cfg := defaultJSONCfg()
+				cfg.NullAsEmpty = true
+				return cfg
+			}(),
+			want: map[string]string{"KEY": ""},
+		},
+		{
+			name:  "null preserved",
+			input: `{"key": null}`,
+			cfg: func() JSONFlattenConfig {
+				cfg := defaultJSONCfg()
+				cfg.NullAsEmpty = false
+				return cfg
+			}(),
+			want: map[string]string{"KEY": "null"},
+		},
+		{
+			name:  "true as string",
+			input: `{"enabled": true}`,
+			cfg:   defaultJSONCfg(),
+			want:  map[string]string{"ENABLED": "true"},
+		},
+		{
+			name:  "false as string",
+			input: `{"enabled": false}`,
+			cfg:   defaultJSONCfg(),
+			want:  map[string]string{"ENABLED": "false"},
+		},
+		{
+			name:  "bool rendered when BoolAsString is off",
+			input: `{"flag": true}`,
+			cfg: func() JSONFlattenConfig {
+				cfg := defaultJSONCfg()
+				cfg.BoolAsString = false
+				return cfg
+			}(),
+			want: map[string]string{"FLAG": "true"},
+		},
+		{
+			name:  "integer",
+			input: `{"count": 42}`,
+			cfg:   defaultJSONCfg(),
+			want:  map[string]string{"COUNT": "42"},
+		},
+		{
+			name:  "float",
+			input: `{"rate": 3.14}`,
+			cfg:   defaultJSONCfg(),
+			want:  map[string]string{"RATE": "3.14"},
+		},
+		{
+			name:  "float as integer",
+			input: `{"count": 42.0}`,
+			cfg:   defaultJSONCfg(),
+			want:  map[string]string{"COUNT": "42"},
+		},
+		{
+			name:  "negative number",
+			input: `{"temp": -10}`,
+			cfg:   defaultJSONCfg(),
+			want:  map[string]string{"TEMP": "-10"},
+		},
+		{
+			name:  "number rendered when NumberAsString is off",
+			input: `{"count": 42}`,
+			cfg: func() JSONFlattenConfig {
+				cfg := defaultJSONCfg()
+				cfg.NumberAsString = false
+				return cfg
+			}(),
+			want: map[string]string{"COUNT": "42"},
+		},
+		{
+			name:    "empty object produces no entries",
+			input:   `{"empty": {}}`,
+			cfg:     defaultJSONCfg(),
+			wantLen: 0,
+		},
+		{
+			name:    "empty array produces no entries",
+			input:   `{"empty": []}`,
+			cfg:     defaultJSONCfg(),
+			wantLen: 0,
+		},
+		{
+			name:        "invalid JSON returns JSONError",
+			input:       `{invalid json}`,
+			cfg:         defaultJSONCfg(),
+			wantErr:     true,
+			wantJSONErr: true,
+		},
+		{
+			name: "max depth exceeded returns error",
+			input: `{
+				"a": {
+					"b": {
+						"c": {
+							"d": "deep"
+						}
+					}
+				}
+			}`,
+			cfg: func() JSONFlattenConfig {
+				cfg := defaultJSONCfg()
+				cfg.MaxDepth = 2
+				return cfg
+			}(),
+			wantErr: true,
+		},
+		{
+			name: "complex structure",
+			input: `{
+				"app": {
+					"name": "myapp",
+					"version": "1.0.0",
+					"features": ["auth", "logging"]
+				},
+				"database": {
+					"host": "localhost",
+					"port": 5432
+				}
+			}`,
+			cfg: defaultJSONCfg(),
+			want: map[string]string{
+				"APP_NAME":       "myapp",
+				"APP_VERSION":    "1.0.0",
+				"APP_FEATURES_0": "auth",
+				"APP_FEATURES_1": "logging",
+				"DATABASE_HOST":  "localhost",
+				"DATABASE_PORT":  "5432",
+			},
+			wantLen: 6,
+		},
+		{
+			// Boundary: combined key length crosses the builder fast-path
+			// threshold for nested keys.
+			name:    "long nested key",
+			input:   fmt.Sprintf(`{"%s": {"nested": "value"}}`, longKey),
+			cfg:     defaultJSONCfg(),
+			wantLen: 1,
+			check: func(t *testing.T, result map[string]string) {
+				for k := range result {
+					if len(k) < 70 {
+						t.Errorf("expected key length >= 70, got %d: %q", len(k), k)
+					}
+				}
+			},
+		},
+		{
+			name:    "long key with bracket format uses builder path",
+			input:   fmt.Sprintf(`{"%s": ["a", "b"]}`, longKey),
+			cfg:     func() JSONFlattenConfig { cfg := defaultJSONCfg(); cfg.ArrayIndexFormat = "bracket"; return cfg }(),
+			wantLen: 2,
+			check: func(t *testing.T, result map[string]string) {
+				values := make(map[string]bool, len(result))
+				for k, v := range result {
+					if !strings.Contains(k, "[") {
+						t.Errorf("expected bracket in key %q", k)
+					}
+					values[v] = true
+				}
+				for _, want := range []string{"a", "b"} {
+					if !values[want] {
+						t.Errorf("missing value %q (got %v)", want, result)
+					}
+				}
+			},
+		},
+		{
+			name:    "long key with underscore format uses builder path",
+			input:   fmt.Sprintf(`{"%s": ["a"]}`, longKey),
+			cfg:     defaultJSONCfg(),
+			wantLen: 1,
+			check: func(t *testing.T, result map[string]string) {
+				for k := range result {
+					if len(k) < 70 {
+						t.Errorf("expected key length >= 70, got %d: %q", len(k), k)
+					}
+				}
+			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			data := []byte(`{"key": null}`)
-			tt.cfg.KeyDelimiter = "_"
-			tt.cfg.MaxDepth = 10
-
-			result, err := FlattenJSON(data, tt.cfg)
-			if err != nil {
-				t.Fatalf("FlattenJSON() error = %v", err)
-			}
-
-			if result["KEY"] != tt.expected {
-				t.Errorf("result[\"KEY\"] = %q, want %q", result["KEY"], tt.expected)
-			}
-		})
-	}
-}
-
-func TestFlattenJSON_BoolValue(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		cfg      JSONFlattenConfig
-		expected string
-	}{
-		{
-			name:     "true as string",
-			input:    `{"enabled": true}`,
-			cfg:      JSONFlattenConfig{BoolAsString: true},
-			expected: "true",
-		},
-		{
-			name:     "false as string",
-			input:    `{"enabled": false}`,
-			cfg:      JSONFlattenConfig{BoolAsString: true},
-			expected: "false",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tt.cfg.KeyDelimiter = "_"
-			tt.cfg.MaxDepth = 10
-
 			result, err := FlattenJSON([]byte(tt.input), tt.cfg)
-			if err != nil {
-				t.Fatalf("FlattenJSON() error = %v", err)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("FlattenJSON() error = %v, wantErr %v", err, tt.wantErr)
 			}
-
-			if result["ENABLED"] != tt.expected {
-				t.Errorf("result[\"ENABLED\"] = %q, want %q", result["ENABLED"], tt.expected)
-			}
-		})
-	}
-}
-
-func TestFlattenJSON_NumberValue(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		cfg      JSONFlattenConfig
-		expected string
-	}{
-		{
-			name:     "integer",
-			input:    `{"count": 42}`,
-			cfg:      JSONFlattenConfig{NumberAsString: true},
-			expected: "42",
-		},
-		{
-			name:     "float",
-			input:    `{"rate": 3.14}`,
-			cfg:      JSONFlattenConfig{NumberAsString: true},
-			expected: "3.14",
-		},
-		{
-			name:     "float as integer",
-			input:    `{"count": 42.0}`,
-			cfg:      JSONFlattenConfig{NumberAsString: true},
-			expected: "42",
-		},
-		{
-			name:     "negative number",
-			input:    `{"temp": -10}`,
-			cfg:      JSONFlattenConfig{NumberAsString: true},
-			expected: "-10",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tt.cfg.KeyDelimiter = "_"
-			tt.cfg.MaxDepth = 10
-
-			result, err := FlattenJSON([]byte(tt.input), tt.cfg)
-			if err != nil {
-				t.Fatalf("FlattenJSON() error = %v", err)
-			}
-
-			// Get first value (key varies by test)
-			for _, v := range result {
-				if v != tt.expected {
-					t.Errorf("value = %q, want %q", v, tt.expected)
+			if tt.wantJSONErr {
+				var jsonErr *JSONError
+				if !errors.As(err, &jsonErr) {
+					t.Fatalf("error type = %T, want *JSONError", err)
 				}
 				return
 			}
-			t.Error("no values found in result")
-		})
-	}
-}
-
-func TestFlattenJSON_InvalidJSON(t *testing.T) {
-	data := []byte(`{invalid json}`)
-
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	_, err := FlattenJSON(data, cfg)
-	if err == nil {
-		t.Error("expected error for invalid JSON")
-	}
-
-	// Verify it's a JSONError
-	var jsonErr *JSONError
-	if !errors.As(err, &jsonErr) {
-		t.Errorf("error type = %T, want *JSONError", err)
-	}
-}
-
-func TestFlattenJSON_MaxDepthExceeded(t *testing.T) {
-	data := []byte(`{
-		"a": {
-			"b": {
-				"c": {
-					"d": "deep"
+			if tt.wantErr {
+				return
+			}
+			for key, exp := range tt.want {
+				if result[key] != exp {
+					t.Errorf("result[%q] = %q, want %q", key, result[key], exp)
 				}
 			}
-		}
-	}`)
-
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         2, // Low limit
-	}
-
-	_, err := FlattenJSON(data, cfg)
-	if err == nil {
-		t.Error("expected max depth exceeded error")
-	}
-}
-
-func TestFlattenJSON_ArrayOfObjects(t *testing.T) {
-	data := []byte(`{
-		"servers": [
-			{"host": "server1", "port": 8080},
-			{"host": "server2", "port": 9090}
-		]
-	}`)
-
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	result, err := FlattenJSON(data, cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	if result["SERVERS_0_HOST"] != "server1" {
-		t.Errorf("result[\"SERVERS_0_HOST\"] = %q, want %q", result["SERVERS_0_HOST"], "server1")
-	}
-
-	if result["SERVERS_0_PORT"] != "8080" {
-		t.Errorf("result[\"SERVERS_0_PORT\"] = %q, want %q", result["SERVERS_0_PORT"], "8080")
-	}
-
-	if result["SERVERS_1_HOST"] != "server2" {
-		t.Errorf("result[\"SERVERS_1_HOST\"] = %q, want %q", result["SERVERS_1_HOST"], "server2")
-	}
-}
-
-func TestFlattenJSON_NestedArray(t *testing.T) {
-	data := []byte(`{
-		"matrix": [
-			["a", "b"],
-			["c", "d"]
-		]
-	}`)
-
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	result, err := FlattenJSON(data, cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	if result["MATRIX_0_0"] != "a" {
-		t.Errorf("result[\"MATRIX_0_0\"] = %q, want %q", result["MATRIX_0_0"], "a")
-	}
-
-	if result["MATRIX_0_1"] != "b" {
-		t.Errorf("result[\"MATRIX_0_1\"] = %q, want %q", result["MATRIX_0_1"], "b")
-	}
-
-	if result["MATRIX_1_0"] != "c" {
-		t.Errorf("result[\"MATRIX_1_0\"] = %q, want %q", result["MATRIX_1_0"], "c")
-	}
-}
-
-func TestFlattenJSON_RootNull(t *testing.T) {
-	data := []byte(`null`)
-
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	result, err := FlattenJSON(data, cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	// Root null should result in empty map
-	if len(result) != 0 {
-		t.Errorf("expected empty map for root null, got %d items", len(result))
-	}
-}
-
-func TestFlattenJSON_RootArray(t *testing.T) {
-	data := []byte(`["a", "b", "c"]`)
-
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	result, err := FlattenJSON(data, cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	// Root array with no prefix still produces indexed keys
-	if len(result) != 3 {
-		t.Errorf("expected 3 items for root array, got %d", len(result))
-	}
-
-	// The keys are just the indices
-	if result["0"] != "a" && result["_0"] != "a" {
-		// Keys may vary - just check we have 3 items
-		t.Logf("root array result: %v", result)
-	}
-}
-
-func TestFlattenJSON_RootScalar(t *testing.T) {
-	data := []byte(`"hello"`)
-
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	result, err := FlattenJSON(data, cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	// Root scalar with no prefix should result in empty map
-	if len(result) != 0 {
-		t.Errorf("expected empty map for root scalar, got %d items", len(result))
+			// wantLen defaults to len(want) so a row that lists expected keys
+			// also pins the result size without repeating the count.
+			wantLen := tt.wantLen
+			if wantLen == 0 && len(tt.want) > 0 {
+				wantLen = len(tt.want)
+			}
+			if len(result) != wantLen {
+				t.Errorf("len(result) = %d, want %d (got keys: %v)", len(result), wantLen, keysOf(result))
+			}
+			if tt.check != nil {
+				tt.check(t, result)
+			}
+		})
 	}
 }
 
@@ -539,274 +417,120 @@ func TestBuildArrayIndex_JSON(t *testing.T) {
 }
 
 // ============================================================================
-// Complex Structure Tests
+// Depth Propagation, Pre-Scanner & Default-Branch Coverage
 // ============================================================================
 
-func TestFlattenJSON_ComplexStructure(t *testing.T) {
-	data := []byte(`{
-		"app": {
-			"name": "myapp",
-			"version": "1.0.0",
-			"features": ["auth", "logging"]
-		},
-		"database": {
-			"host": "localhost",
-			"port": 5432
+// TestFlattenJSON_DepthErrorPropagation pins the fail-late depth contract:
+// inputs whose bracket nesting passes the conservative pre-scan but whose
+// value depth still reaches MaxDepth must surface a *JSONError from
+// flattenValue, propagated through the container loops back to FlattenJSON.
+func TestFlattenJSON_DepthErrorPropagation(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"error propagates through map loops", `{"a":{"b":1}}`},
+		{"error propagates through array loops", `[["x"]]`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := defaultJSONCfg()
+			cfg.MaxDepth = 2
+			_, err := FlattenJSON([]byte(tt.input), cfg)
+			if err == nil {
+				t.Fatalf("FlattenJSON(%s) error = nil, want depth error", tt.input)
+			}
+			var jsonErr *JSONError
+			if !errors.As(err, &jsonErr) {
+				t.Errorf("error = %T, want *JSONError", err)
+			}
+		})
+	}
+}
+
+// TestFlattenJSON_RootBoolAndNumber pins the root-scalar contract for bool
+// and number inputs: like root strings and null, they contribute no keys
+// and no error.
+func TestFlattenJSON_RootBoolAndNumber(t *testing.T) {
+	for _, input := range []string{"true", "42"} {
+		result, err := FlattenJSON([]byte(input), defaultJSONCfg())
+		if err != nil {
+			t.Errorf("FlattenJSON(%s) error = %v, want nil", input, err)
 		}
-	}`)
-
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	result, err := FlattenJSON(data, cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	expected := map[string]string{
-		"APP_NAME":       "myapp",
-		"APP_VERSION":    "1.0.0",
-		"APP_FEATURES_0": "auth",
-		"APP_FEATURES_1": "logging",
-		"DATABASE_HOST":  "localhost",
-		"DATABASE_PORT":  "5432",
-	}
-
-	for key, exp := range expected {
-		if result[key] != exp {
-			t.Errorf("result[%q] = %q, want %q", key, result[key], exp)
-		}
-	}
-}
-
-func TestFlattenJSON_EmptyObject(t *testing.T) {
-	data := []byte(`{"empty": {}}`)
-
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	result, err := FlattenJSON(data, cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	// Empty object should result in no entries for that key
-	if len(result) != 0 {
-		t.Errorf("expected 0 items for empty object, got %d", len(result))
-	}
-}
-
-func TestFlattenJSON_EmptyArray(t *testing.T) {
-	data := []byte(`{"empty": []}`)
-
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	result, err := FlattenJSON(data, cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	// Empty array should result in no entries for that key
-	if len(result) != 0 {
-		t.Errorf("expected 0 items for empty array, got %d", len(result))
-	}
-}
-
-func TestFlattenJSON_LongKeys(t *testing.T) {
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	// Test with long key prefix that exceeds 64 chars to hit builder path
-	longKey := "A"
-	for i := 0; i < 70; i++ {
-		longKey += "B"
-	}
-
-	input := fmt.Sprintf(`{"%s": {"nested": "value"}}`, longKey)
-	result, err := FlattenJSON([]byte(input), cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	if len(result) != 1 {
-		t.Errorf("expected 1 item, got %d", len(result))
-	}
-
-	// Verify the key contains both parts
-	for k := range result {
-		if len(k) < 70 {
-			t.Errorf("expected key length >= 70, got %d: %q", len(k), k)
+		if len(result) != 0 {
+			t.Errorf("FlattenJSON(%s) = %v, want empty map", input, result)
 		}
 	}
 }
 
-func TestFlattenJSON_BracketArrayFormat(t *testing.T) {
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "bracket",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
+// TestScanJSONLimits_MalformedAndStrings covers the pre-scanner's
+// tolerance branches: negative nesting clamps to zero, and string bodies
+// (including escaped quotes) are skipped so brackets inside JSON strings
+// never count toward the depth or the node count.
+func TestScanJSONLimits_MalformedAndStrings(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{"unbalanced close clamps to zero", `{"a":1}]`, false},
+		{"bracket inside string ignored", `{"k": "a[b"}`, false},
+		{"escaped quote does not end string", `{"a\":\"b": 1}`, false},
+		{"deep real nesting detected", `[[[[[[1]]]]]]`, true},
 	}
-
-	input := `{"items": ["a", "b", "c"]}`
-	result, err := FlattenJSON([]byte(input), cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-
-	if result["ITEMS[0]"] != "a" {
-		t.Errorf("ITEMS[0] = %q, want %q", result["ITEMS[0]"], "a")
-	}
-	if result["ITEMS[1]"] != "b" {
-		t.Errorf("ITEMS[1] = %q, want %q", result["ITEMS[1]"], "b")
-	}
-	if result["ITEMS[2]"] != "c" {
-		t.Errorf("ITEMS[2] = %q, want %q", result["ITEMS[2]"], "c")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, _ := scanJSONLimits([]byte(tt.input), 0, 5, HardMaxJSONNodes); got != tt.want {
+				t.Errorf("scanJSONLimits(%s) depth = %v, want %v", tt.input, got, tt.want)
+			}
+		})
 	}
 }
 
-func TestFlattenJSON_LongKeyWithBracketFormat(t *testing.T) {
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "bracket",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
+// TestScanJSONLimits_NodeCount verifies the node cap path independently of
+// the global HardMaxJSONNodes constant.
+func TestScanJSONLimits_NodeCount(t *testing.T) {
+	// `[1,2,3]` = 1 opening bracket + 2 commas = 3 nodes.
+	if _, nodes := scanJSONLimits([]byte(`[1,2,3]`), 0, 10, 2); !nodes {
+		t.Error("nodes=true want exceeded for 3 nodes against cap 2")
 	}
-
-	longKey := strings.Repeat("K", 70)
-	input := fmt.Sprintf(`{"%s": ["a", "b"]}`, longKey)
-	result, err := FlattenJSON([]byte(input), cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
+	if _, nodes := scanJSONLimits([]byte(`[1,2,3]`), 0, 10, 3); nodes {
+		t.Error("nodes=false want ok for 3 nodes against cap 3")
 	}
-
-	count := 0
-	for k, v := range result {
-		if !strings.Contains(k, "[") {
-			t.Errorf("expected bracket in key %q", k)
-		}
-		if v != "a" && v != "b" {
-			t.Errorf("unexpected value %q for key %q", v, k)
-		}
-		count++
-	}
-	if count != 2 {
-		t.Errorf("expected 2 items, got %d", count)
+	// Brackets and commas inside strings do not count.
+	if _, nodes := scanJSONLimits([]byte(`"[,,"`), 0, 10, 2); nodes {
+		t.Error("string contents must not count toward the node cap")
 	}
 }
 
-func TestFlattenJSON_LongKeyWithUnderscoreFormat(t *testing.T) {
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
+// TestFlattenJSON_NodeCap (SEC-02): documents whose structural node count
+// exceeds HardMaxJSONNodes are rejected by the pre-scan before
+// json.Unmarshal materializes a parse tree disproportionate to the input.
+func TestFlattenJSON_NodeCap(t *testing.T) {
+	// Each "[]," contributes 2 nodes (open bracket + comma).
+	input := "[" + strings.Repeat("[],", HardMaxJSONNodes/2+1) + "]"
+	_, err := FlattenJSON([]byte(input), defaultJSONCfg())
+	if err == nil {
+		t.Fatal("expected node cap error")
 	}
-
-	longKey := strings.Repeat("K", 70)
-	input := fmt.Sprintf(`{"%s": ["a"]}`, longKey)
-	result, err := FlattenJSON([]byte(input), cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
+	var je *JSONError
+	if !errors.As(err, &je) {
+		t.Fatalf("want *JSONError, got %T: %v", err, err)
 	}
-
-	if len(result) != 1 {
-		t.Errorf("expected 1 item, got %d", len(result))
-	}
-	for k := range result {
-		if len(k) < 70 {
-			t.Errorf("expected key length >= 70, got %d: %q", len(k), k)
-		}
+	if !strings.Contains(err.Error(), "node count") {
+		t.Errorf("error should mention node count: %v", err)
 	}
 }
 
-func TestFlattenJSON_NullNotAsEmpty(t *testing.T) {
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      false,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         10,
+// TestFlattenValue_UnsupportedType pins flattenValue's terminal default
+// branch with a type json.Unmarshal never produces.
+func TestFlattenValue_UnsupportedType(t *testing.T) {
+	err := flattenValue(complex128(1+2i), "K", defaultJSONCfg(), map[string]string{}, 0)
+	if err == nil {
+		t.Fatal("flattenValue(complex128) error = nil, want error")
 	}
-
-	input := `{"key": null}`
-	result, err := FlattenJSON([]byte(input), cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-	if result["KEY"] != "null" {
-		t.Errorf("KEY = %q, want %q", result["KEY"], "null")
-	}
-}
-
-func TestFlattenJSON_BoolNotAsString(t *testing.T) {
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     false,
-		MaxDepth:         10,
-	}
-
-	input := `{"flag": true}`
-	result, err := FlattenJSON([]byte(input), cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-	if result["FLAG"] != "true" {
-		t.Errorf("FLAG = %q, want %q", result["FLAG"], "true")
-	}
-}
-
-func TestFlattenJSON_NumberNotAsString(t *testing.T) {
-	cfg := JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   false,
-		BoolAsString:     true,
-		MaxDepth:         10,
-	}
-
-	input := `{"count": 42}`
-	result, err := FlattenJSON([]byte(input), cfg)
-	if err != nil {
-		t.Fatalf("FlattenJSON() error = %v", err)
-	}
-	if result["COUNT"] != "42" {
-		t.Errorf("COUNT = %q, want %q", result["COUNT"], "42")
+	var jsonErr *JSONError
+	if !errors.As(err, &jsonErr) {
+		t.Errorf("error = %T, want *JSONError", err)
 	}
 }

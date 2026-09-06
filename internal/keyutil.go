@@ -2,7 +2,6 @@
 package internal
 
 import (
-	"errors"
 	"sync"
 )
 
@@ -43,13 +42,13 @@ func init() {
 // For short keys (<=8 chars) it uses a multiplicative hash that combines the
 // key bytes without a per-character loop; for longer keys it uses FNV-1a over
 // the first and last 8 bytes (sampling).
-// The numShards parameter determines the range of the returned hash (0 to numShards-1).
+// The shards parameter determines the range of the returned hash (0 to shards-1).
 //
 // Performance notes:
 //   - For keys 1-4 chars (the common case) the bytes are combined with fixed
 //     indexing rather than a loop.
-//   - numShards==8 (the only value used in this package) maps to a single AND.
-func HashKey(key string, numShards int) uint32 {
+//   - shards==8 (the only value used in this package) maps to a single AND.
+func HashKey(key string, shards int) uint32 {
 	keyLen := len(key)
 	if keyLen == 0 {
 		return 0
@@ -107,11 +106,11 @@ func HashKey(key string, numShards int) uint32 {
 		}
 	}
 
-	// Single optimization point for numShards==8
-	if numShards == 8 {
+	// Single optimization point for shards==8
+	if shards == 8 {
 		return hash & 7
 	}
-	return hash % uint32(numShards)
+	return hash % uint32(shards)
 }
 
 // getShard returns the shard for a given key using HashKey.
@@ -119,54 +118,26 @@ func getShard(key string) *internShard {
 	return &internShards[HashKey(key, numShards)]
 }
 
-// InternKey returns an interned copy of the key string if available,
-// or stores and returns the input key. This reduces allocations when
-// the same keys are parsed repeatedly.
-// This implementation uses sharded caches with thread-safe access for better
-// concurrency performance.
-//
-// Optimization: Uses sync.Mutex instead of sync.RWMutex because:
-// 1. The cache is small (128 entries per shard), making lookup very fast
-// 2. RWMutex has higher overhead for the common case of cache hit + small cache
-// 3. Simpler lock management improves cache locality
-//
-// Callers that hold the key as a []byte (e.g. parsing from a reusable buffer)
-// should prefer InternKeyBytes, which avoids the temporary string allocation
-// on cache hits.
-func InternKey(key string) string {
-	if len(key) == 0 || len(key) > maxInternKeyLen {
-		return key // Don't intern empty or very long keys
-	}
-
-	shard := getShard(key)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	if interned, ok := shard.cache[key]; ok {
-		return interned
-	}
-
-	return storeInterned(shard, key)
-}
-
 // InternKeyBytes interns a key supplied as a byte slice, returning a stable
-// interned string. It is the allocation-free equivalent of InternKey(string(b))
-// for the common cache-hit case, which matters on hot parse paths where keys
-// arrive as []byte slices into a reusable buffer.
+// interned string. This reduces allocations when the same keys are parsed
+// repeatedly, which matters on hot parse paths where keys arrive as []byte
+// slices into a reusable buffer.
 //
-// Why this avoids an allocation on a cache hit: the call site
-// InternKey(string(b)) allocates a temporary string on every call because that
-// string escapes into InternKey. Here the compiler optimizes both string(b)
-// conversions away:
+// Why this avoids an allocation on a cache hit: the compiler optimizes both
+// string(b) conversions away:
 //   - getShard(string(b)): escape analysis proves the converted string does not
 //     escape (getShard -> HashKey only read its bytes), so no allocation occurs.
 //   - shard.cache[string(b)]: the documented compiler elision for
 //     map[string]V[string([]byte)] index expressions allocates nothing.
 //
 // On a cache miss the key is allocated exactly once (inside storeInterned,
-// which stores it in the map), identical to InternKey. The returned string is a
-// stable heap copy independent of b, so it stays valid after b is reused — this
-// preserves the scanner-buffer-safety invariant required by ParseLineBytes.
+// which stores it in the map). The returned string is a stable heap copy
+// independent of b, so it stays valid after b is reused — this preserves the
+// scanner-buffer-safety invariant required by ParseLineBytes.
+//
+// The intern cache uses sharded sync.Mutex storage (not RWMutex): the cache is
+// small (128 entries per shard), so lookup is fast enough that RWMutex overhead
+// outweighs its benefit, and simpler lock management improves cache locality.
 func InternKeyBytes(b []byte) string {
 	if len(b) == 0 || len(b) > maxInternKeyLen {
 		return string(b) // Don't intern empty or very long keys; must copy
@@ -218,23 +189,39 @@ func storeInterned(shard *internShard, key string) string {
 // Do not duplicate this logic elsewhere; all components should call this function
 // when using the default pattern.
 func isValidDefaultKey(key string) bool {
+	valid, _ := validateDefaultKeyScan(key)
+	return valid
+}
+
+// validateDefaultKeyScan validates ^[A-Za-z][A-Za-z0-9_]*$ in a single pass and
+// also reports whether the key contains any non-ASCII byte. Both signals come
+// from the same scan because every byte >= 0x80 already fails the pattern's
+// character classes — the separate ASCII homograph scan in ValidateKey visited
+// the exact same bytes. Callers use the non-ASCII flag to pick the more precise
+// error rule (ascii_only takes precedence over pattern, matching the previous
+// scan-order behavior).
+func validateDefaultKeyScan(key string) (valid, hasNonASCII bool) {
 	if len(key) == 0 {
-		return false
+		return false, false
 	}
 	// First character must be a letter
 	c := key[0]
-	if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
-		return false
+	if c >= 0x80 {
+		return false, true
 	}
+	valid = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 	// Remaining characters must be alphanumeric or underscore
 	for i := 1; i < len(key); i++ {
 		c := key[i]
+		if c >= 0x80 {
+			return false, true
+		}
 		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
 			(c >= '0' && c <= '9') || c == '_') {
-			return false
+			valid = false
 		}
 	}
-	return true
+	return valid, false
 }
 
 // isVarChar returns true if c is a valid variable name character.
@@ -371,21 +358,6 @@ func TrimSpace(s string) string {
 	return s[start:end]
 }
 
-// TrimSpaceBytes trims leading and trailing whitespace from a byte slice,
-// converting to string. Avoids the intermediate string(buf.String()) that
-// strings.TrimSpace would require.
-func TrimSpaceBytes(b []byte) string {
-	start := 0
-	end := len(b)
-	for start < end && (b[start] == ' ' || b[start] == '\t' || b[start] == '\n' || b[start] == '\r') {
-		start++
-	}
-	for end > start && (b[end-1] == ' ' || b[end-1] == '\t' || b[end-1] == '\n' || b[end-1] == '\r') {
-		end--
-	}
-	return string(b[start:end])
-}
-
 // ToUpperASCII converts an ASCII string to uppercase.
 // This is faster than strings.ToUpper for ASCII-only strings.
 // Uses single-pass algorithm: convert while detecting lowercase.
@@ -398,8 +370,6 @@ func TrimSpaceBytes(b []byte) string {
 // 1. Environment variable names are conventionally ASCII
 // 2. Key validation elsewhere rejects non-ASCII keys
 // 3. Visual spoofing attacks with Unicode are mitigated by key pattern validation
-//
-// For use cases requiring strict ASCII validation, use ToUpperASCIISafe instead.
 func ToUpperASCII(s string) string {
 	// Single-pass: convert to uppercase while detecting if conversion is needed
 	// This avoids the double-pass of check-then-convert
@@ -428,60 +398,6 @@ func ToUpperASCII(s string) string {
 	}
 	// No lowercase characters found, return original
 	return s
-}
-
-// ErrNonASCII is returned when a string contains non-ASCII characters
-// in functions that require ASCII-only input.
-var ErrNonASCII = errors.New("string contains non-ASCII characters")
-
-// ToUpperASCIISafe converts an ASCII string to uppercase with strict ASCII validation.
-// Returns ErrNonASCII if the input contains any bytes >= 0x80.
-// This is the safe version of ToUpperASCII for use when input validation is required.
-//
-// Performance: This function has minimal overhead compared to ToUpperASCII
-// (single additional bounds check per character that was already being performed).
-func ToUpperASCIISafe(s string) (string, error) {
-	// Single-pass: validate ASCII and convert to uppercase
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		// SECURITY: Check for non-ASCII bytes first
-		if c >= 0x80 {
-			return "", ErrNonASCII
-		}
-		if c >= 'a' && c <= 'z' {
-			// Found a lowercase character, need to convert
-			b := make([]byte, len(s))
-			for j := 0; j < i; j++ {
-				b[j] = s[j]
-			}
-			b[i] = c - 32
-			for j := i + 1; j < len(s); j++ {
-				c2 := s[j]
-				// SECURITY: Validate remaining characters too
-				if c2 >= 0x80 {
-					return "", ErrNonASCII
-				}
-				if c2 >= 'a' && c2 <= 'z' {
-					b[j] = c2 - 32
-				} else {
-					b[j] = c2
-				}
-			}
-			return string(b), nil
-		}
-	}
-	return s, nil
-}
-
-// IsASCII checks if a string contains only ASCII characters (bytes < 0x80).
-// This is a fast path function used for input validation.
-func IsASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] >= 0x80 {
-			return false
-		}
-	}
-	return true
 }
 
 // DefaultMaskKey masks a key name for safe logging and error reporting.

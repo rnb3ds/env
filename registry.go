@@ -99,13 +99,24 @@ func (r *parserRegistry) registerBuiltin(format FileFormat, factory ParserFactor
 
 // createParsers creates all registered parsers for the given configuration.
 // Returns a map of parsers keyed by file format.
+//
+// The registry is snapshotted under the read lock, but the factory callbacks
+// are invoked only AFTER releasing it. ParserFactory is user-supplied code:
+// calling it while holding globalParserRegistry.mu.RLock would deadlock if a
+// factory (transitively) calls RegisterParser/ForceRegisterParser — RWMutex is
+// not reentrant, so the write-lock acquisition inside would block on the read
+// lock held by this same goroutine. It would also serialize unrelated Loader
+// constructions behind potentially slow factory code.
 func createParsers(cfg Config, factory *ComponentFactory) (map[FileFormat]EnvParser, error) {
 	globalParserRegistry.mu.RLock()
-	defer globalParserRegistry.mu.RUnlock()
-
-	parsers := make(map[FileFormat]EnvParser, len(globalParserRegistry.factories))
-
+	snapshot := make(map[FileFormat]ParserFactory, len(globalParserRegistry.factories))
 	for format, parserFactory := range globalParserRegistry.factories {
+		snapshot[format] = parserFactory
+	}
+	globalParserRegistry.mu.RUnlock()
+
+	parsers := make(map[FileFormat]EnvParser, len(snapshot))
+	for format, parserFactory := range snapshot {
 		parser, err := parserFactory(cfg, factory)
 		if err != nil {
 			// Clean up already created parsers to prevent resource leak

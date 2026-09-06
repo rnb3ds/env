@@ -19,7 +19,7 @@ var _ EnvParser = (*yamlParser)(nil)
 func newYAMLParserWithFactory(cfg Config, factory *ComponentFactory) (*yamlParser, error) {
 	maxDepth := cfg.YAMLMaxDepth
 	if maxDepth <= 0 {
-		maxDepth = 10
+		maxDepth = defaultStructuredMaxDepth
 	}
 
 	flattenCfg := internal.YAMLFlattenConfig{

@@ -26,6 +26,10 @@ type Value struct {
 	Array  []*Value
 	Line   int
 	Column int
+	// Quoted reports that a ValueTypeScalar came from a quoted token.
+	// YAML semantics: quoted scalars are always strings — no null/bool/number
+	// coercion, and interior whitespace (including trailing) is significant.
+	Quoted bool
 }
 
 // valuePool pools *Value nodes to reduce allocation pressure during YAML parsing.
@@ -47,10 +51,17 @@ func NewScalarValue(s string, line, col int) *Value {
 
 // NewMapValue creates a new map value with pre-allocated capacity (from pool).
 func NewMapValue(line, col int) *Value {
+	return newMapValueCap(line, col, 8)
+}
+
+// newMapValueCap creates a pooled map value whose backing map is sized to
+// hold at least size entries, avoiding incremental growth. Used for the
+// document root where the entry count is estimable from the token count.
+func newMapValueCap(line, col, size int) *Value {
 	v := valuePool.Get().(*Value)
 	v.Type = ValueTypeMap
 	if v.Map == nil {
-		v.Map = make(map[string]*Value, 8)
+		v.Map = make(map[string]*Value, size)
 	} else {
 		// Reuse existing map after clearing
 		clear(v.Map)
@@ -121,7 +132,16 @@ func (p *Parser) parseDocument(depth int) (*Value, error) {
 
 // parseMap parses a YAML map.
 func (p *Parser) parseMap(depth, expectedIndent int) (*Value, error) {
-	root := NewMapValue(p.currentLine(), p.currentColumn())
+	var root *Value
+	if depth == 0 {
+		// Root document map: pre-size from the token count (~3 tokens per
+		// entry: newline, key, value) so large flat documents don't pay for
+		// repeated map growth. Nested maps keep the small default — depth 0
+		// is reachable only from parseDocument.
+		root = newMapValueCap(p.currentLine(), p.currentColumn(), len(p.tokens)/3)
+	} else {
+		root = NewMapValue(p.currentLine(), p.currentColumn())
+	}
 
 	for !p.isEOF() {
 		// Skip newlines
@@ -173,45 +193,14 @@ func (p *Parser) parseMap(depth, expectedIndent int) (*Value, error) {
 				p.advance()
 				value, err = p.parseNestedValue(depth+1, currentIndent+1)
 			} else if p.current().Type == TokenValue {
-				value = NewScalarValue(p.current().Value, p.currentLine(), p.currentColumn())
-				p.advance()
+				value = p.scalarFromToken()
 			} else if p.current().Type == TokenComment {
-				// Skip comments and check for nested structure on next line
-				for p.current().Type == TokenComment {
-					p.advance()
-				}
-				// Now expect newline followed by possible nested content
-				if p.current().Type == TokenNewline {
-					p.skipNewlines()
-					for p.current().Type == TokenComment {
-						p.advance()
-						p.skipNewlines()
-					}
-					if p.current().Type == TokenIndent {
-						p.advance()
-						value, err = p.parseNestedValue(depth+1, currentIndent+1)
-					} else {
-						value = NewScalarValue("", p.currentLine(), p.currentColumn())
-					}
-				} else {
-					value = NewScalarValue("", p.currentLine(), p.currentColumn())
-				}
-			} else if p.current().Type == TokenNewline {
-				// Skip newlines and check for nested structure on next line
-				p.skipNewlines()
-
-				// Skip any comments between newlines and nested content
-				for p.current().Type == TokenComment {
-					p.advance()
-					p.skipNewlines()
-				}
-
-				if p.current().Type == TokenIndent {
-					// Nested structure after newline(s) and comment(s)
-					p.advance()
+				// Comment line(s) directly after the colon. A nested block
+				// may still follow after the newline and any further comment
+				// lines (see consumeCommentsAfterKey).
+				if p.consumeCommentsAfterKey() {
 					value, err = p.parseNestedValue(depth+1, currentIndent+1)
 				} else {
-					// Empty value
 					value = NewScalarValue("", p.currentLine(), p.currentColumn())
 				}
 			} else if p.current().Type == TokenDash {
@@ -241,6 +230,35 @@ func (p *Parser) parseMap(depth, expectedIndent int) (*Value, error) {
 	}
 
 	return root, nil
+}
+
+// consumeCommentsAfterKey advances past the comment lines that may follow a
+// key's colon (e.g. "key: # comment"). It reports whether a nested block was
+// found after the comments, in which case the block's opening Indent token
+// has been consumed and the caller should parse the nested value.
+//
+// This is the single implementation of the comment/newline/nested sequencing
+// rules for values after a key. parseMap's early skipNewlines (run right
+// after the key) already consumes a bare "key:\n  nested" sequence, so this
+// helper only fires for comments — the former TokenNewline branch in the
+// value chain was unreachable after that skip and has been removed.
+func (p *Parser) consumeCommentsAfterKey() bool {
+	for p.current().Type == TokenComment {
+		p.advance()
+	}
+	if p.current().Type != TokenNewline {
+		return false
+	}
+	p.skipNewlines()
+	for p.current().Type == TokenComment {
+		p.advance()
+		p.skipNewlines()
+	}
+	if p.current().Type == TokenIndent {
+		p.advance()
+		return true
+	}
+	return false
 }
 
 // parseNestedValue parses a nested value (could be map, array, or scalar).
@@ -280,10 +298,14 @@ func (p *Parser) parseNestedValue(depth, expectedIndent int) (*Value, error) {
 	} else if p.current().Type == TokenDash {
 		return p.parseArray(depth, expectedIndent)
 	} else if p.current().Type == TokenValue {
-		value := NewScalarValue(p.current().Value, p.currentLine(), p.currentColumn())
-		p.advance()
-		return value, nil
+		return p.scalarFromToken(), nil
 	} else if p.current().Type == TokenDedent {
+		// The nested block turned out to be empty (e.g. it held only
+		// comments) and this Dedent closes it. Consume it here so the
+		// caller resumes at the dedented level — leaving it unconsumed
+		// made the next map up treat its own scope as ended and silently
+		// dropped sibling keys after the comment block.
+		p.advance()
 		return NewScalarValue("", p.currentLine(), p.currentColumn()), nil
 	}
 
@@ -353,14 +375,18 @@ func (p *Parser) parseArray(depth, expectedIndent int) (*Value, error) {
 				p.advance()
 				value, err = p.parseNestedValue(depth+1, currentIndent+1)
 			} else if p.current().Type == TokenValue {
-				value = NewScalarValue(p.current().Value, p.currentLine(), p.currentColumn())
-				p.advance()
+				value = p.scalarFromToken()
 			} else if p.current().Type == TokenKey {
 				// Map as array item (KEY at same indent level as DASH)
 				value, err = p.parseMap(depth+1, currentIndent)
 			} else if p.current().Type == TokenDash {
-				// Nested array
-				value, err = p.parseArray(depth+1, currentIndent+1)
+				// Nested array. In "- - a" the second dash sits at the SAME
+				// indent level as the first (no Indent token separates them),
+				// so the nested array starts at currentIndent — the previous
+				// currentIndent+1 made the nested array's own first dash fail
+				// its indent guard, yielding an empty item and letting the
+				// scalars spill into the outer array.
+				value, err = p.parseArray(depth+1, currentIndent)
 			} else {
 				value = NewScalarValue("", p.currentLine(), p.currentColumn())
 			}
@@ -381,12 +407,31 @@ func (p *Parser) parseArray(depth, expectedIndent int) (*Value, error) {
 	return root, nil
 }
 
-// current returns the current token.
-func (p *Parser) current() Token {
+// eofToken is the shared end-of-input sentinel returned by current().
+// It is read-only: parsers never mutate tokens.
+var eofToken = Token{Type: TokenEOF}
+
+// scalarFromToken creates a scalar Value from the current TokenValue token,
+// preserving the token's quoting flag (a quoted scalar must never be
+// type-coerced downstream — see Value.Quoted), and advances past it.
+func (p *Parser) scalarFromToken() *Value {
+	tok := p.current()
+	v := NewScalarValue(tok.Value, tok.Line, tok.Column)
+	v.Quoted = tok.IsQuoted
+	p.advance()
+	return v
+}
+
+// current returns a pointer to the current token.
+// The tokens slice is never mutated during parsing, so the pointer stays
+// valid until the next advance(). Returning a pointer avoids copying the
+// 56-byte Token struct on every check — current() is called several times
+// per token in the parse loops, making those copies a measured hotspot.
+func (p *Parser) current() *Token {
 	if p.pos >= len(p.tokens) {
-		return Token{Type: TokenEOF}
+		return &eofToken
 	}
-	return p.tokens[p.pos]
+	return &p.tokens[p.pos]
 }
 
 // advance moves to the next token.
@@ -451,6 +496,7 @@ func ReleaseValue(v *Value) {
 		v.Array = nil
 	}
 	v.Scalar = ""
+	v.Quoted = false
 	v.Type = ValueTypeScalar
 	valuePool.Put(v)
 }
@@ -459,13 +505,27 @@ func ReleaseValue(v *Value) {
 // The caller MUST call ReleaseValue on the returned tree when done
 // to return nodes to the pool and prevent memory growth.
 func ParseYAML(data []byte, maxDepth int) (*Value, error) {
-	lexer := NewYAMLLexer(string(data))
-	tokens, err := lexer.Tokenize()
+	// Lex directly over the caller's buffer (no full-file copy): every token
+	// value is copied out as an independent string during tokenization, and
+	// the Value tree holds only those copies, so aliasing data is safe for
+	// the duration of this call.
+	lexer := newYAMLLexer(data)
+	// Seed tokenization with a pooled token slice — the largest per-parse
+	// allocation (see tokenSlicePool).
+	tokensPtr := getTokenSlice()
+	tokens, err := lexer.tokenizeInto(*tokensPtr)
+	*tokensPtr = tokens // tokenizeInto may reallocate; pool the final slice
 	lexer.release()
 	if err != nil {
+		putTokenSlice(tokensPtr)
 		return nil, err
 	}
 
 	parser := NewYAMLParser(tokens, maxDepth)
-	return parser.Parse()
+	value, perr := parser.Parse()
+	putTokenSlice(tokensPtr)
+	if perr != nil {
+		return nil, perr
+	}
+	return value, nil
 }

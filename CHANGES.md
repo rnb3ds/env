@@ -4,6 +4,37 @@ All notable changes to the cybergodev/env library will be documented in this fil
 
 ---
 
+## v1.2.3 - Security Hardening, Correctness & Performance (2026-09-07)
+
+### Breaking
+- Conversion errors from `ParseInto`/`UnmarshalInto`/`UnmarshalStruct` changed type: raw `*strconv.NumError`/time errors → `*env.MarshalError`; match via `errors.As` or `IsMarshalError()` (offending values are no longer embedded in error messages)
+- Custom `KeyPattern`s that accept injection-enabling syntax (`=`, `:`, newline, NUL) now fail `Config` validation instead of enabling key injection on re-parse
+- Pathological structured documents (>200K YAML tokens / JSON nodes) now fail fast with `YAMLError`/`JSONError` instead of unbounded allocation (a 2MB file previously amplified to ~644MB)
+- `MaskSensitiveInString` output changes for pattern-bearing strings (embedded secrets are now masked); YAML `Marshal` now quotes coercible scalars (`PORT: "8080"`) so values survive round-trips unchanged
+
+### Fixed
+- Single-variable expansion no longer drops literal suffixes — `"$FOO bar"` with `FOO` unset yields `" bar"`, not `""`
+- Struct decoding no longer silently truncates out-of-range integers (300 in an `int8` field became 44); overflow now returns an error, on all field widths and 32-bit platforms alike
+- `StructInto` now resolves prefixed keys for untagged and multi-level tagged nested structs (previously dropped values that `MarshalStruct` emits)
+- `Delete()` no longer unsets process env vars the loader never set (previously clobbered `HOME`, `TERM`, …) and now correctly unsets variables applied via `Set()` with `AutoApply`
+- Registering a parser from inside a factory callback no longer self-deadlocks the parser registry (RWMutex reentrancy)
+
+### Changed
+- Single-key reads (`Lookup`, `GetSecure`) are lock-free; `Set` uses a read-lock fast path when `OverwriteExisting` is set and `AutoApply` is off
+- Sentinel errors now match via `errors.Is`: `ErrInvalidKey`, `ErrForbiddenKey`, `ErrMaxVariables`, `ErrMissingRequired` (and `New()` wraps `ErrInvalidConfig`)
+- `Auditor.Close()` disables logging before closing the handler, so post-`Close` `Log*` calls are no-ops
+- BSDs/Solaris/Illumos and other non-mlock platforms now cross-compile correctly (build tags narrowed to linux/darwin with a no-op fallback elsewhere)
+- Doc accuracy: `Lookup` returns stored values untrimmed (trimming is `.env` parse-time only); file loading is first-file-wins unless `OverwriteExisting=true`
+- Test suite deduplicated and consolidated (table-driven merges); overall coverage 94.5% → 95.9%
+
+### Performance
+- Lock-free single-key reads and the `Set` fast path: `Loader_ConcurrentGet` -53%, `Loader_ConcurrentSet` -36%
+- YAML lexer pass (exact-size token copies + token-slice pooling): `YAMLParser_Medium` -16.6% time / -57% bytes; `YAMLParser_Small` -15.4% / -57%
+- `SecureValue` finalizer set once per object (`SecureValue_New` -53.1%); `SetAll` buckets into one flat allocation (`SecureMap_SetAll` -37.3%)
+- pprof-guided pass (geomean -8.1% time / -3.7% allocs): pooled 64KB reader buffers, single-pass key homograph scan, lazy shard maps, allocation-free reserved-device-name checks
+
+---
+
 ## v1.2.2 - Performance, Concurrency Hardening & Security (2026-08-12)
 
 ### Added

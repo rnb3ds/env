@@ -2,10 +2,12 @@ package env
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cybergodev/env/internal"
@@ -684,9 +686,14 @@ func TestMaskSensitiveInString(t *testing.T) {
 		expected string
 	}{
 		{
-			name:     "short string unchanged",
+			name:     "short non-sensitive string unchanged",
+			input:    "plain value",
+			expected: "plain value",
+		},
+		{
+			name:     "sensitive pattern masked",
 			input:    "password=secret123",
-			expected: "password=secret123",
+			expected: "password=[MASKED]",
 		},
 		{
 			name:     "long string truncated",
@@ -1115,4 +1122,158 @@ func TestSecureMap_EmptyStringValue(t *testing.T) {
 	}
 
 	sm.Clear()
+}
+
+// ============================================================================
+// Marshaling Redaction Tests
+// ============================================================================
+
+// TestSecureValue_MarshalRedaction verifies that reflection-based serializers
+// never see the plaintext: MarshalJSON and MarshalText must both emit the
+// masked form, including for nil and closed values.
+func TestSecureValue_MarshalRedaction(t *testing.T) {
+	const secret = "super-secret-value"
+
+	t.Run("MarshalJSON emits masked form", func(t *testing.T) {
+		sv := NewSecureValue(secret)
+		defer sv.Release()
+
+		b, err := json.Marshal(sv)
+		if err != nil {
+			t.Fatalf("json.Marshal() error = %v", err)
+		}
+		out := string(b)
+		if strings.Contains(out, secret) {
+			t.Errorf("MarshalJSON() leaked plaintext: %s", out)
+		}
+		if !strings.Contains(out, sv.Masked()) {
+			t.Errorf("MarshalJSON() = %s, want masked form %q", out, sv.Masked())
+		}
+	})
+
+	t.Run("MarshalJSON on nil receiver returns null", func(t *testing.T) {
+		var sv *SecureValue
+		// Call the method directly: json.Marshal short-circuits nil pointers
+		// and would never invoke MarshalJSON.
+		b, err := sv.MarshalJSON()
+		if err != nil {
+			t.Fatalf("MarshalJSON() error = %v", err)
+		}
+		if string(b) != "null" {
+			t.Errorf("MarshalJSON() = %s, want null", b)
+		}
+	})
+
+	t.Run("MarshalJSON on closed value stays masked", func(t *testing.T) {
+		sv := NewSecureValue(secret)
+		sv.Close()
+
+		b, err := json.Marshal(sv)
+		if err != nil {
+			t.Fatalf("json.Marshal() error = %v", err)
+		}
+		if strings.Contains(string(b), secret) {
+			t.Errorf("MarshalJSON() leaked plaintext after Close: %s", b)
+		}
+	})
+
+	t.Run("MarshalJSON inside nested struct stays masked", func(t *testing.T) {
+		type credentials struct {
+			Token *SecureValue `json:"token"`
+		}
+
+		sv := NewSecureValue(secret)
+		defer sv.Release()
+
+		b, err := json.Marshal(credentials{Token: sv})
+		if err != nil {
+			t.Fatalf("json.Marshal(struct) error = %v", err)
+		}
+		if strings.Contains(string(b), secret) {
+			t.Errorf("nested json.Marshal() leaked plaintext: %s", b)
+		}
+	})
+
+	t.Run("MarshalText emits masked form", func(t *testing.T) {
+		sv := NewSecureValue(secret)
+		defer sv.Release()
+
+		b, err := sv.MarshalText()
+		if err != nil {
+			t.Fatalf("MarshalText() error = %v", err)
+		}
+		if strings.Contains(string(b), secret) {
+			t.Errorf("MarshalText() leaked plaintext: %s", b)
+		}
+		if string(b) != sv.Masked() {
+			t.Errorf("MarshalText() = %s, want %q", b, sv.Masked())
+		}
+	})
+
+	t.Run("MarshalText on nil receiver returns NIL marker", func(t *testing.T) {
+		var sv *SecureValue
+		b, err := sv.MarshalText()
+		if err != nil {
+			t.Fatalf("MarshalText() error = %v", err)
+		}
+		if string(b) != "[NIL]" {
+			t.Errorf("MarshalText() = %s, want [NIL]", b)
+		}
+	})
+}
+
+// ============================================================================
+// Memory Lock Failure Path Tests
+// ============================================================================
+
+// TestSecureValue_MemoryLockFailureContract pins the strict-mode failure
+// contract: when locking fails, MemoryLockError must be set, the value must
+// not report as locked, and the strict-mode handler must have been invoked;
+// when locking succeeds the value reports locked with no error. Exactly one
+// of the two outcomes holds regardless of OS privileges.
+func TestSecureValue_MemoryLockFailureContract(t *testing.T) {
+	originalEnabled := IsMemoryLockEnabled()
+	originalStrict := IsMemoryLockStrict()
+	originalHandler := onStrictLockFailure.Load()
+	defer func() {
+		SetMemoryLockEnabled(originalEnabled)
+		SetMemoryLockStrict(originalStrict)
+		onStrictLockFailure.Store(originalHandler)
+	}()
+
+	SetMemoryLockEnabled(true)
+	SetMemoryLockStrict(true)
+
+	var handlerCalled atomic.Bool
+	var handler strictLockFailureHandler = func(err error) {
+		if err == nil {
+			t.Error("strict lock failure handler invoked with nil error")
+		}
+		handlerCalled.Store(true)
+	}
+	onStrictLockFailure.Store(&handler)
+
+	// A large buffer is used to make VirtualLock/mlock failure (and thus the
+	// strict handler path) likely on systems without SE_LOCK_MEMORY/raised
+	// RLIMIT_MEMLOCK; on privileged systems the success path is pinned.
+	sv := NewSecureValue(strings.Repeat("x", 64<<20))
+	defer sv.Release()
+
+	lockErr := sv.MemoryLockError()
+	locked := sv.IsMemoryLocked()
+
+	if lockErr != nil && locked {
+		t.Error("IsMemoryLocked() = true despite MemoryLockError() being set")
+	}
+	if lockErr != nil && !handlerCalled.Load() {
+		t.Error("strict mode enabled but lock failure handler was not invoked")
+	}
+	if lockErr == nil && !locked {
+		t.Errorf("lock reported neither failed (err=%v) nor succeeded (locked=%v)", lockErr, locked)
+	}
+
+	// The value stays usable either way — the data is just not swap-protected.
+	if sv.Reveal() != strings.Repeat("x", 64<<20) {
+		t.Error("Reveal() changed after memory lock failure")
+	}
 }

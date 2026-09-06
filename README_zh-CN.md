@@ -6,7 +6,7 @@
 [![Security Policy](https://img.shields.io/badge/security-policy-blue.svg)](docs/SECURITY.md)
 [![Thread Safe](https://img.shields.io/badge/thread%20safe-%E2%9C%93-brightgreen.svg)](docs/CONCURRENCY_SAFETY.md)
 
-**[English Documentation](README.md)** | **[www.cybergo.dev/env](https://www.cybergo.dev/env)**
+**[English Documentation](README.md)** | **[www.cybergo.dev/env](https://www.cybergo.dev/env/)**
 
 ---
 
@@ -95,8 +95,11 @@ func main() {
 ### 基础操作
 
 ```go
-// 多文件初始化（后加载的覆盖先加载的）
-env.Load(".env", "config.json", ".env.local")
+// 多文件初始化（默认配置下先加载的值生效；
+// 设置 cfg.OverwriteExisting = true 后，后加载的文件才会覆盖）
+if err := env.Load(".env", "config.json", ".env.local"); err != nil {
+    log.Fatal(err)
+}
 
 // 检查存在性
 value, exists := env.Lookup("KEY")
@@ -111,6 +114,12 @@ keys := env.Keys()                // 获取所有键
 all := env.All()                  // 获取所有变量为 map
 count := env.Len()                // 变量数量
 ```
+
+> **注意：** 包级函数（`GetString`、`Set`、`Lookup` 等）必须先调用 `Load()` 或
+> `LoadWithConfig()` 才能使用。未初始化时，`Get*`/`Lookup`/`Keys`/`All`/`Len`/`GetSecure`
+> 会静默返回默认值/零值，而 `Set`、`Delete`、`Validate`、`ParseInto` 会返回 `ErrNotInitialized`。
+> `Load()` 只能初始化默认加载器一次，重复调用返回 `ErrAlreadyInitialized`；
+> 如需重新初始化（例如测试之间），请先调用 `ResetDefaultLoader()`。
 
 ### 类型访问
 
@@ -160,6 +169,11 @@ env.GetString("test_app.key")   // 解析为 TEST_APP_KEY
 // 适用于所有 Get* 方法
 env.GetInt("app.port")          // 解析为 APP_PORT
 env.GetBool("debug.mode")       // 解析为 DEBUG_MODE
+
+// 逗号分隔值的索引访问（虚拟查找）
+// 已知 .env: LIST=a,b,c
+env.GetString("LIST.0")         // "a" — 第一个元素
+env.GetString("list.2")         // "c" — 第三个元素（基键不区分大小写）
 ```
 
 **解析策略：**
@@ -168,6 +182,7 @@ env.GetBool("debug.mode")       // 解析为 DEBUG_MODE
 |:-----|:----------------|:-----------|
 | 1 | 精确匹配 | 点号转下划线，转大写 → 查找 |
 | 2 | 大写回退 | （已在步骤 1 完成） |
+| 3 | — | 键以数字索引结尾时：解析基键，按索引切分逗号分隔的值 |
 
 **最佳实践：** 在 `.env` 文件中使用 `UPPER_SNAKE_CASE`（大写下划线格式），确保所有查找方式均可正确工作。
 
@@ -175,8 +190,8 @@ env.GetBool("debug.mode")       // 解析为 DEBUG_MODE
 
 ```go
 type Config struct {
-    Port    int           `env:"PORT,envDefault:8080"`
-    Debug   bool          `env:"DEBUG,envDefault:false"`
+    Port    int           `env:"PORT,envDefault:8080"` // 内联默认值
+    Debug   bool          `env:"DEBUG" envDefault:"false"` // 独立标签 — 两种写法均支持
     Timeout time.Duration `env:"TIMEOUT"`
     Origins []string      `env:"CORS_ORIGINS"`
 }
@@ -194,7 +209,7 @@ if err := env.ParseInto(&cfg); err != nil {
 
 ```go
 cfg := env.ProductionConfig()
-cfg.Filenames = []string{"/etc/app/.env"}
+cfg.Filenames = []string{"app.env"} // 仅允许相对路径；绝对路径会被拒绝
 
 loader, err := env.New(cfg)
 if err != nil {
@@ -374,12 +389,30 @@ defer secret.Release()
 ## 📝 审计日志
 
 ```go
+auditFile, err := os.Create("audit.log")
+if err != nil {
+    log.Fatal(err)
+}
+defer auditFile.Close()
+
 cfg := env.ProductionConfig()
 cfg.AuditEnabled = true
-cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
+// 请使用文件而非 os.Stdout：loader.Close() 会关闭处理器，进而关闭底层 writer
+cfg.AuditHandler = env.NewJSONAuditHandler(auditFile)
 
-loader, _ := env.New(cfg)
-// 输出: {"action":"set","key":"API_KEY","success":true,"timestamp":"..."}
+loader, err := env.New(cfg)
+if err != nil {
+    log.Fatal(err)
+}
+defer loader.Close()
+
+if err := loader.LoadFiles("app.env"); err != nil {
+    log.Fatal(err)
+}
+// 输出: {"timestamp":"...","action":"parse","reason":"parsed: app.env","success":true,"duration_ns":150000}
+//       {"timestamp":"...","action":"set","key":"[MASKED:7 chars]","reason":"loaded","success":true,"masked":true}
+//
+// 敏感键（如 API_KEY）在审计输出中会被掩码为 [MASKED:<len> chars]。
 ```
 
 **内置处理器：**
@@ -412,9 +445,11 @@ func TestConfig(t *testing.T) {
     // 测试你的代码...
 }
 
-// 测试之间重置默认加载器
+// 测试之间重置默认加载器（若已调用过 Load() 则必须先重置）
 func TestMain(m *testing.M) {
-    env.ResetDefaultLoader()
+    if err := env.ResetDefaultLoader(); err != nil {
+        log.Printf("重置默认加载器: %v", err)
+    }
     os.Exit(m.Run())
 }
 ```
@@ -428,11 +463,12 @@ func TestMain(m *testing.M) {
 env.IsSensitiveKey("API_SECRET")  // true
 env.IsSensitiveKey("HOST")        // false
 
-// 值掩码
-env.MaskValue("API_KEY", "secret123")  // "***"
+// 值掩码 — 敏感键返回 "[MASKED:n chars]"；
+// 非敏感值 ≤ 20 字符原样返回，超长则截断并追加 "..."
+env.MaskValue("API_KEY", "secret123")  // "[MASKED:9 chars]"
 
-// 键掩码用于日志
-env.MaskKey("DB_PASSWORD")  // "DB_***"
+// 键掩码用于日志 — 保留前 2 个字符 + "***"（≤3 字符时返回 "***"）
+env.MaskKey("DB_PASSWORD")  // "DB***"
 
 // 日志安全处理
 safe := env.SanitizeForLog(userInput)
@@ -441,7 +477,7 @@ safe := env.SanitizeForLog(userInput)
 masked := env.MaskSensitiveInString(logMessage)
 
 // 格式检测
-env.DetectFormat("config.yaml")  // FormatYAML
+env.DetectFormat("config.yaml")  // FormatYAML（String() → "yaml"）
 ```
 
 ### 敏感键模式
@@ -533,7 +569,7 @@ cfg.FileSystem = nil         // nil = 操作系统文件系统
 
 // === 审计日志（ComponentConfig）===
 cfg.AuditEnabled = true
-cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
+cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout) // 仅演示；生产环境请用文件 — Close() 会关闭底层 writer
 ```
 
 > **注意：** Config 使用嵌套结构体（`FileConfig`、`ValidationConfig`、`LimitsConfig`、
@@ -553,14 +589,49 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 
 ---
 
+## ⚠️ 错误处理
+
+库提供哨兵错误（配合 `errors.Is`）和结构化错误类型（配合 `errors.As`）：
+
+```go
+if err := env.Load(".env"); err != nil {
+    switch {
+    case errors.Is(err, env.ErrFileNotFound):
+        // 文件缺失 — 提供回退或快速失败
+    case errors.Is(err, env.ErrFileTooLarge):
+        // 超过 cfg.MaxFileSize
+    case errors.Is(err, env.ErrSecurityViolation):
+        // 禁止键或安全策略违规
+    }
+}
+
+var parseErr *env.ParseError
+if errors.As(err, &parseErr) {
+    fmt.Printf("%s:%d: %v\n", parseErr.File, parseErr.Line, parseErr.Err)
+}
+```
+
+**哨兵错误：** `ErrFileNotFound`、`ErrFileTooLarge`、`ErrLineTooLong`、`ErrInvalidKey`、
+`ErrForbiddenKey`、`ErrSecurityViolation`、`ErrInvalidValue`、`ErrMissingRequired`、
+`ErrMaxVariables`、`ErrExpansionDepth`、`ErrClosed`、`ErrInvalidConfig`、
+`ErrNotInitialized`、`ErrAlreadyInitialized`、`ErrDuplicateKey`
+
+**结构化错误类型：** `ParseError`（文件/行号）、`ValidationError`、`SecurityError`、
+`FileError`、`ExpansionError`、`JSONError`、`YAMLError`、`MarshalError` —
+可用 `env.IsMarshalError(err)` 判断。
+
+可运行示例见 [examples/09_error_handling](examples/09_error_handling/)。
+
+---
+
 ## 📖 API 参考
 
 ### 包函数
 
 | 函数 | 说明 |
 |:-----|:-----|
-| `Load(files...)` | 加载文件并应用到 `os.Environ` |
-| `LoadWithConfig(cfg)` | 使用自定义配置加载 |
+| `Load(files...)` | 加载文件并应用到 `os.Environ`（仅可调用一次，见上文说明） |
+| `LoadWithConfig(cfg)` | 使用自定义配置加载（强制 `AutoApply = true`） |
 | `GetString(key, def...)` | 获取字符串值 |
 | `GetInt(key, def...)` | 获取 `int64` 值 |
 | `GetBool(key, def...)` | 获取布尔值 |
@@ -584,7 +655,11 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `UnmarshalInto(map, &struct)` | 从 map 填充结构体 |
 | `MarshalStruct(struct)` | 将结构体转换为 map |
 | `IsMarshalError(err)` | 检查是否为序列化错误 |
-| `New(cfg)` | 使用配置创建新加载器 |
+| `DefaultConfig()` | 安全默认配置 |
+| `DevelopmentConfig()` | 宽松限制 + 允许覆盖 |
+| `TestingConfig()` | 紧凑限制，隔离测试 |
+| `ProductionConfig()` | 严格安全 + 启用审计 |
+| `New(cfg...)` | 创建新加载器（cfg 可选；零值 → 默认配置） |
 | `NewSecureValue(string)` | 从字符串创建 SecureValue |
 | `NewSecureValueStrict(string)` | 创建 SecureValue，锁定失败时返回错误 |
 | `ResetDefaultLoader()` | 重置单例（测试用，返回 error） |

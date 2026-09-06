@@ -1,6 +1,8 @@
 package internal
 
 import (
+	"errors"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -129,71 +131,120 @@ func TestValidator_ValidateKey(t *testing.T) {
 	}
 }
 
-func TestValidator_ValidateKey_AllowedKeys(t *testing.T) {
-	v := NewValidator(ValidatorConfig{
-		AllowedKeys:  []string{"ALLOWED_KEY"},
-		MaxKeyLength: 64,
-	})
+// TestValidator_ValidateKey_Policy covers the allowed-keys / forbidden-keys
+// policy and the max-key-length rule in one table.
+func TestValidator_ValidateKey_Policy(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     ValidatorConfig
+		key     string
+		wantErr bool
+	}{
+		{
+			name:    "allowed key accepted",
+			cfg:     ValidatorConfig{AllowedKeys: []string{"ALLOWED_KEY"}, MaxKeyLength: 64},
+			key:     "ALLOWED_KEY",
+			wantErr: false,
+		},
+		{
+			name:    "non-allowed key rejected",
+			cfg:     ValidatorConfig{AllowedKeys: []string{"ALLOWED_KEY"}, MaxKeyLength: 64},
+			key:     "NOT_ALLOWED",
+			wantErr: true,
+		},
+		{
+			name:    "forbidden key rejected",
+			cfg:     ValidatorConfig{ForbiddenKeys: []string{"PATH"}, MaxKeyLength: 64},
+			key:     "PATH",
+			wantErr: true,
+		},
+		{
+			name:    "normal key unaffected by forbidden list",
+			cfg:     ValidatorConfig{ForbiddenKeys: []string{"PATH"}, MaxKeyLength: 64},
+			key:     "MY_KEY",
+			wantErr: false,
+		},
+		{
+			name:    "within length limit",
+			cfg:     ValidatorConfig{MaxKeyLength: 10},
+			key:     "SHORT",
+			wantErr: false,
+		},
+		{
+			// Boundary: exactly at the limit is still valid.
+			name:    "exactly at length limit",
+			cfg:     ValidatorConfig{MaxKeyLength: 10},
+			key:     "ABCDEFGHIJ",
+			wantErr: false,
+		},
+		{
+			// Boundary: one over the limit fails.
+			name:    "one over length limit",
+			cfg:     ValidatorConfig{MaxKeyLength: 10},
+			key:     "ABCDEFGHIJK",
+			wantErr: true,
+		},
+	}
 
-	t.Run("allowed key", func(t *testing.T) {
-		if err := v.ValidateKey("ALLOWED_KEY"); err != nil {
-			t.Errorf("ValidateKey(allowed) error = %v", err)
-		}
-	})
-
-	t.Run("non-allowed key", func(t *testing.T) {
-		err := v.ValidateKey("NOT_ALLOWED")
-		if err == nil {
-			t.Error("ValidateKey(non-allowed) should fail")
-		}
-		var secErr *SecurityError
-		if !AsError(err, &secErr) {
-			t.Errorf("error type = %T, want SecurityError", err)
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := NewValidator(tt.cfg)
+			err := v.ValidateKey(tt.key)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateKey(%q) error = %v, wantErr %v", tt.key, err, tt.wantErr)
+			}
+		})
+	}
 }
 
-func TestValidator_ValidateKey_ForbiddenKeys(t *testing.T) {
-	v := NewValidator(ValidatorConfig{
-		ForbiddenKeys: []string{"PATH"},
-		MaxKeyLength:  64,
-	})
+// TestValidator_ValidateKey_NonASCIIRule verifies the Unicode homograph
+// defense: keys containing non-ASCII bytes are rejected under both the
+// default scan and a custom pattern (SECURITY: prevents ℌOST-style spoofs of
+// restricted keys).
+func TestValidator_ValidateKey_NonASCIIRule(t *testing.T) {
+	const homograph = "ℌOST" // U+210C SCRIPT CAPITAL H, looks like HOST
+	permissivePattern := regexp.MustCompile(`.*`)
+	strictPattern := regexp.MustCompile(`^[A-Z_]+$`)
 
-	t.Run("normal key", func(t *testing.T) {
-		if err := v.ValidateKey("MY_KEY"); err != nil {
-			t.Errorf("ValidateKey(normal) error = %v", err)
-		}
-	})
+	tests := []struct {
+		name    string
+		cfg     ValidatorConfig
+		key     string
+		wantErr bool
+	}{
+		{name: "default check rejects homograph", cfg: ValidatorConfig{MaxKeyLength: 64}, key: homograph, wantErr: true},
+		{name: "default check accepts ASCII key", cfg: ValidatorConfig{MaxKeyLength: 64}, key: "HOST", wantErr: false},
+		{
+			// Custom patterns keep the dedicated ASCII scan because a
+			// user-supplied pattern may permit non-ASCII characters.
+			name:    "custom pattern rejects homograph",
+			cfg:     ValidatorConfig{KeyPattern: permissivePattern, MaxKeyLength: 64},
+			key:     homograph,
+			wantErr: true,
+		},
+		{
+			name:    "custom pattern rejects non-matching key",
+			cfg:     ValidatorConfig{KeyPattern: strictPattern, MaxKeyLength: 64},
+			key:     "INVALID-KEY",
+			wantErr: true,
+		},
+		{
+			name:    "custom pattern accepts matching key",
+			cfg:     ValidatorConfig{KeyPattern: strictPattern, MaxKeyLength: 64},
+			key:     "GOOD_KEY",
+			wantErr: false,
+		},
+	}
 
-	t.Run("forbidden key", func(t *testing.T) {
-		err := v.ValidateKey("PATH")
-		if err == nil {
-			t.Error("ValidateKey(forbidden) should fail")
-		}
-		var secErr *SecurityError
-		if !AsError(err, &secErr) {
-			t.Errorf("error type = %T, want SecurityError", err)
-		}
-	})
-}
-
-func TestValidator_ValidateKey_MaxLength(t *testing.T) {
-	v := NewValidator(ValidatorConfig{
-		MaxKeyLength: 10,
-	})
-
-	t.Run("within limit", func(t *testing.T) {
-		if err := v.ValidateKey("SHORT"); err != nil {
-			t.Errorf("ValidateKey(short) error = %v", err)
-		}
-	})
-
-	t.Run("exceeds limit", func(t *testing.T) {
-		err := v.ValidateKey("THIS_KEY_IS_TOO_LONG")
-		if err == nil {
-			t.Error("ValidateKey(too long) should fail")
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := NewValidator(tt.cfg)
+			err := v.ValidateKey(tt.key)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateKey(%q) error = %v, wantErr %v", tt.key, err, tt.wantErr)
+			}
+		})
+	}
 }
 
 // ============================================================================
@@ -507,4 +558,46 @@ func AsError(err error, target interface{}) bool {
 		}
 	}
 	return false
+}
+
+// TestValidator_ValidateKeyPolicy verifies the policy-only check used by the
+// structured (JSON/YAML) parsers: it enforces the allowed/forbidden key lists
+// without applying the .env key pattern, so format-specific keys (dots,
+// hyphens) pass while dangerous keys are still rejected.
+func TestValidator_ValidateKeyPolicy(t *testing.T) {
+	v := NewValidator(ValidatorConfig{
+		ForbiddenKeys:  []string{"PATH", "LD_PRELOAD"},
+		MaxKeyLength:   DefaultMaxKeyLength,
+		MaxValueLength: DefaultMaxValueLength,
+	})
+
+	if err := v.ValidateKeyPolicy("PATH"); err == nil {
+		t.Error("ValidateKeyPolicy(PATH) should be rejected by forbidden list")
+	} else if !errors.Is(err, ErrForbiddenKey) {
+		t.Errorf("ValidateKeyPolicy(PATH) should match ErrForbiddenKey, got %v", err)
+	}
+	if err := v.ValidateKeyPolicy("ld_preload"); err == nil {
+		t.Error("ValidateKeyPolicy should be case-insensitive")
+	}
+	if err := v.ValidateKeyPolicy("service.host-name"); err != nil {
+		t.Errorf("ValidateKeyPolicy(format-specific key) should pass, got %v", err)
+	}
+
+	// AllowedKeys policy: anything outside the list is rejected.
+	allowed := NewValidator(ValidatorConfig{
+		AllowedKeys:    []string{"HOST", "PORT"},
+		MaxKeyLength:   DefaultMaxKeyLength,
+		MaxValueLength: DefaultMaxValueLength,
+	})
+	if err := allowed.ValidateKeyPolicy("HOST"); err != nil {
+		t.Errorf("ValidateKeyPolicy(HOST) should pass allowed list, got %v", err)
+	}
+	if err := allowed.ValidateKeyPolicy("OTHER"); err == nil {
+		t.Error("ValidateKeyPolicy(OTHER) should be rejected by allowed list")
+	}
+
+	// Full ValidateKey still applies pattern + policy.
+	if err := v.ValidateKey("PATH"); err == nil {
+		t.Error("ValidateKey(PATH) should be rejected")
+	}
 }

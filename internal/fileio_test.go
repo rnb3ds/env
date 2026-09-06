@@ -1,66 +1,38 @@
 package internal
 
 import (
-	"bytes"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestEscapeValue(t *testing.T) {
+// TestMarshalEnv_ValueEscaping pins escapeValueToBuilder's quoting rules via
+// the public MarshalEnv path (single-key map; each output line is "K=<escaped>\n").
+func TestMarshalEnv_ValueEscaping(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    string
 		expected string
 	}{
-		{
-			name:     "simple value",
-			input:    "simple",
-			expected: "simple",
-		},
-		{
-			name:     "value with space",
-			input:    "value with space",
-			expected: `"value with space"`,
-		},
-		{
-			name:     "value with newline",
-			input:    "line1\nline2",
-			expected: `"line1\nline2"`,
-		},
-		{
-			name:     "value with tab",
-			input:    "col1\tcol2",
-			expected: `"col1\tcol2"`,
-		},
-		{
-			name:     "value with quote",
-			input:    `say "hello"`,
-			expected: `"say \"hello\""`,
-		},
-		{
-			name:     "value with hash",
-			input:    "value#comment",
-			expected: `"value#comment"`,
-		},
-		{
-			name:     "value with backslash only",
-			input:    "path\\to\\file",
-			expected: "path\\to\\file", // no quoting needed, returned as-is
-		},
-		{
-			name:     "empty value",
-			input:    "",
-			expected: `""`,
-		},
+		{"simple value", "simple", "simple"},
+		{"value with space", "value with space", `"value with space"`},
+		{"value with newline", "line1\nline2", `"line1\nline2"`},
+		{"value with tab", "col1\tcol2", `"col1\tcol2"`},
+		{"value with quote", `say "hello"`, `"say \"hello\""`},
+		{"value with hash", "value#comment", `"value#comment"`},
+		// A lone backslash neither triggers quoting nor is escaped.
+		{"value with backslash only", `path\to\file`, `path\to\file`},
+		{"empty value", "", `""`},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := EscapeValue(tt.input)
-			if result != tt.expected {
-				t.Errorf("EscapeValue() = %q, want %q", result, tt.expected)
+			result, err := MarshalEnv(map[string]string{"K": tt.input}, false)
+			if err != nil {
+				t.Errorf("MarshalEnv() error = %v", err)
+				return
+			}
+			if want := "K=" + tt.expected + "\n"; result != want {
+				t.Errorf("MarshalEnv() = %q, want %q", result, want)
 			}
 		})
 	}
@@ -135,71 +107,6 @@ func TestMarshalEnvSorted(t *testing.T) {
 
 	if !(aIdx < mIdx && mIdx < zIdx) {
 		t.Errorf("keys not in sorted order: A=%d, M=%d, Z=%d", aIdx, mIdx, zIdx)
-	}
-}
-
-func TestWriteFile(t *testing.T) {
-	// Create temp directory
-	tmpDir, err := os.MkdirTemp("", "env-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	filename := filepath.Join(tmpDir, "test.env")
-	content := "KEY=value\n"
-
-	var buf bytes.Buffer
-	buf.WriteString(content)
-
-	err = WriteFile(filename, &buf)
-	if err != nil {
-		t.Errorf("WriteFile() error = %v", err)
-		return
-	}
-
-	// Verify file exists
-	if _, err := os.Stat(filename); os.IsNotExist(err) {
-		t.Error("file was not created")
-		return
-	}
-
-	// Verify content
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		t.Errorf("failed to read file: %v", err)
-		return
-	}
-
-	if string(data) != content {
-		t.Errorf("file content = %q, want %q", string(data), content)
-	}
-}
-
-func TestWriteFileCreatesDirectory(t *testing.T) {
-	// Create temp directory
-	tmpDir, err := os.MkdirTemp("", "env-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// Target file in non-existent subdirectory
-	filename := filepath.Join(tmpDir, "subdir", "nested", "test.env")
-	content := "KEY=value\n"
-
-	var buf bytes.Buffer
-	buf.WriteString(content)
-
-	err = WriteFile(filename, &buf)
-	if err != nil {
-		t.Errorf("WriteFile() error = %v", err)
-		return
-	}
-
-	// Verify file exists
-	if _, err := os.Stat(filename); os.IsNotExist(err) {
-		t.Error("file was not created in nested directory")
 	}
 }
 
@@ -374,8 +281,11 @@ func TestMarshalToYAML(t *testing.T) {
 				"NAME": "test",
 				"PORT": "8080",
 			},
-			sorted:   false,
-			contains: []string{"NAME: test", "PORT: 8080"},
+			sorted: false,
+			// Numeric strings are quoted so the value round-trips as a string
+			// (an unquoted 8080 would still parse back to "8080", but bool/null
+			// scalars would be coerced — the quoting rule is uniform).
+			contains: []string{"NAME: test", `PORT: "8080"`},
 		},
 		{
 			name: "sorted output",
@@ -424,6 +334,15 @@ func TestEscapeYAMLValue(t *testing.T) {
 		{"has\n newline", `"has\n newline"`},
 		{"has \"quote\"", `"has \"quote\""`},
 		{"- starts with dash", `"- starts with dash"`},
+		// Scalars the YAML reader would type-coerce on reparse are quoted so
+		// the string value survives a Marshal→Unmarshal round trip.
+		{"true", `"true"`},
+		{"null", `"null"`},
+		{"~", `"~"`},
+		{"42", `"42"`},
+		{"3.14", `"3.14"`},
+		// Trailing whitespace is stripped from plain scalars — quote it.
+		{"trailing ", `"trailing "`},
 	}
 
 	for _, tt := range tests {
@@ -460,144 +379,92 @@ func TestMarshalToYAMLSorted(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// Resource Cleanup Tests
-// ============================================================================
-
-// TestWriteFile_TempFileCleanup verifies that temp files are cleaned up
-// when WriteFile fails at various stages.
-func TestWriteFile_TempFileCleanup(t *testing.T) {
-	// Create temp directory
-	tmpDir, err := os.MkdirTemp("", "env-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
+// TestMarshalEnv_EscapeArms pins the carriage-return and backslash arms of
+// escapeValueToBuilder: \r both triggers quoting and escapes, while a lone
+// backslash neither triggers quoting nor is escaped.
+func TestMarshalEnv_EscapeArms(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"a\rb", `"a\rb"`},
+		{`a\b`, `a\b`},
 	}
-	defer os.RemoveAll(tmpDir)
-
-	t.Run("temp file cleaned up on invalid path", func(t *testing.T) {
-		// Use an invalid path (e.g., null byte in path)
-		filename := filepath.Join(tmpDir, "test\x00file.env")
-		var buf bytes.Buffer
-		buf.WriteString("KEY=value\n")
-
-		// This should fail because path is invalid
-		err := WriteFile(filename, &buf)
-		if err == nil {
-			t.Error("expected error for invalid path")
-		}
-
-		// Temp file should not exist (it shouldn't have been created)
-		tempFile := filename + ".tmp"
-		if _, err := os.Stat(tempFile); err == nil {
-			t.Errorf("temp file should not exist for invalid path")
-		}
-	})
-
-	t.Run("temp file cleaned up on directory creation error", func(t *testing.T) {
-		// Try to create a file in a path that would require creating a directory
-		// but use a path component that is actually an existing file
-		blockingFile := filepath.Join(tmpDir, "blocker")
-		if err := os.WriteFile(blockingFile, []byte("blocking"), 0644); err != nil {
-			t.Fatalf("failed to create blocking file: %v", err)
-		}
-
-		// Try to write to a file inside what should be a directory but is a file
-		filename := filepath.Join(blockingFile, "subdir", "test.env")
-		var buf bytes.Buffer
-		buf.WriteString("KEY=value\n")
-
-		// This should fail because "blocker" is a file, not a directory
-		err := WriteFile(filename, &buf)
-		if err == nil {
-			t.Error("expected error when parent path is a file")
-		}
-
-		// Temp file should not exist
-		tempFile := filename + ".tmp"
-		if _, err := os.Stat(tempFile); err == nil {
-			t.Errorf("temp file should not exist: %s", tempFile)
-		}
-	})
-}
-
-// TestWriteFile_NoDoubleClose verifies that WriteFile doesn't
-// double-close the file handle.
-func TestWriteFile_NoDoubleClose(t *testing.T) {
-	// Create temp directory
-	tmpDir, err := os.MkdirTemp("", "env-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// Write multiple files to stress-test the file handle management
-	for i := range 10 {
-		filename := filepath.Join(tmpDir, "test"+string(rune('0'+i))+".env")
-		var buf bytes.Buffer
-		buf.WriteString("KEY=value\n")
-
-		err := WriteFile(filename, &buf)
+	for _, tt := range tests {
+		out, err := MarshalEnv(map[string]string{"K": tt.in}, false)
 		if err != nil {
-			t.Errorf("WriteFile() error = %v", err)
-			continue
+			t.Fatalf("MarshalEnv() error = %v", err)
 		}
-
-		// Verify file exists and has correct content
-		data, err := os.ReadFile(filename)
-		if err != nil {
-			t.Errorf("failed to read file: %v", err)
-			continue
-		}
-		if string(data) != "KEY=value\n" {
-			t.Errorf("file content = %q, want %q", string(data), "KEY=value\n")
+		if got := strings.TrimSuffix(out, "\n"); got != "K="+tt.want {
+			t.Errorf("MarshalEnv(%q) = %q, want %q", tt.in, got, "K="+tt.want)
 		}
 	}
 }
 
-func TestWriteFile_ErrorPaths(t *testing.T) {
-	t.Run("invalid path", func(t *testing.T) {
-		var buf bytes.Buffer
-		buf.WriteString("test")
-
-		// Use an invalid path that should fail
-		err := WriteFile(string([]byte{0}), &buf)
-		if err == nil {
-			t.Error("WriteFile() should fail for invalid path")
-		}
-	})
-}
-
-// TestWriteFile_OverwriteAtomic verifies that writing to an existing file
-// atomically replaces the old content (rename-over-existing path).
-func TestWriteFile_OverwriteAtomic(t *testing.T) {
-	tmpDir := t.TempDir()
-	filename := filepath.Join(tmpDir, "overwrite.env")
-
-	// Write initial content
-	var buf1 bytes.Buffer
-	buf1.WriteString("OLD=value\n")
-	if err := WriteFile(filename, &buf1); err != nil {
-		t.Fatalf("first WriteFile() error = %v", err)
+// TestMarshalEnv_EscapeEstimatePath drives the capacity-estimation branch:
+// values containing escapable characters take the doubled-length estimate
+// path while still marshaling correctly.
+func TestMarshalEnv_EscapeEstimatePath(t *testing.T) {
+	m := map[string]string{
+		"WITH_SPACE": "a b",
+		"PLAIN":      "plain",
 	}
-
-	// Overwrite — exercises the rename-over-existing path
-	var buf2 bytes.Buffer
-	buf2.WriteString("NEW=value\n")
-	if err := WriteFile(filename, &buf2); err != nil {
-		t.Fatalf("second WriteFile() error = %v", err)
-	}
-
-	data, err := os.ReadFile(filename)
+	out, err := MarshalEnv(m, false)
 	if err != nil {
-		t.Fatalf("ReadFile() error = %v", err)
+		t.Fatalf("MarshalEnv error = %v", err)
 	}
-	if string(data) != "NEW=value\n" {
-		t.Errorf("content = %q, want %q", string(data), "NEW=value\n")
+	if !strings.Contains(out, "WITH_SPACE=\"a b\"") {
+		t.Errorf("output missing quoted WITH_SPACE line in:\n%s", out)
 	}
+	if !strings.Contains(out, "PLAIN=plain") {
+		t.Errorf("output missing PLAIN line in:\n%s", out)
+	}
+}
 
-	// Verify no temp file left behind
-	tempFile := filename + ".tmp"
-	if _, err := os.Stat(tempFile); err == nil {
-		t.Error("temp file should not exist after successful write")
+// TestMarshalEnvAs_JSONSorted drives the sorted-keys branch of
+// marshalToJSON; the JSON encoder sorts keys itself, so the observable
+// contract is simply a well-formed document with all keys present.
+func TestMarshalEnvAs_JSONSorted(t *testing.T) {
+	m := map[string]string{"B": "2", "A": "1", "C": "3"}
+	out, err := MarshalEnvAs(m, FormatJSON, true)
+	if err != nil {
+		t.Fatalf("MarshalEnvAs error = %v", err)
+	}
+	for _, k := range []string{`"A"`, `"B"`, `"C"`} {
+		if !strings.Contains(out, k) {
+			t.Errorf("output missing key %s in:\n%s", k, out)
+		}
+	}
+}
+
+// TestSetNestedValue_ConflictBranch covers the non-map intermediate
+// conflict: once "A" holds a scalar, "A_B" cannot nest under it and is
+// stored at the root under its full key instead.
+func TestSetNestedValue_ConflictBranch(t *testing.T) {
+	m := map[string]interface{}{}
+	setNestedValue(m, "A", "1") // A becomes a scalar
+	setNestedValue(m, "A_B", "2")
+
+	if _, ok := m["A_B"]; !ok {
+		t.Fatalf("A_B missing from result %v", m)
+	}
+	if _, ok := m["A"].(map[string]interface{}); ok {
+		t.Error("A became a map, want it to stay a scalar")
+	}
+}
+
+// TestEscapeYAMLValue_ControlCharArms covers the \r, \t and backslash escape
+// arms inside escapeYAMLValue's quoted-scalar path (control chars trigger
+// quoting; the backslash is then escaped).
+func TestEscapeYAMLValue_ControlCharArms(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"a\rb", `"a\rb"`},
+		{"a\tb", `"a\tb"`},
+		{`a\b` + "\t", `"a\\b\t"`},
+	}
+	for _, tt := range tests {
+		if got := escapeYAMLValue(tt.in); got != tt.want {
+			t.Errorf("escapeYAMLValue(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }

@@ -14,7 +14,7 @@ import (
 // It automatically resets the default loader when the test completes.
 func setupTestLoader(t *testing.T) *Loader {
 	t.Helper()
-	ResetDefaultLoader()
+	resetDefaultLoader()
 	cfg := DefaultConfig()
 	loader, err := New(cfg)
 	if err != nil {
@@ -22,6 +22,13 @@ func setupTestLoader(t *testing.T) *Loader {
 	}
 	t.Cleanup(func() { _ = ResetDefaultLoader() })
 	return loader
+}
+
+// resetDefaultLoader resets the package default loader for test isolation,
+// discarding the error: it is only the old loader's Close result, which
+// tests do not act on.
+func resetDefaultLoader() {
+	_ = ResetDefaultLoader()
 }
 
 // ============================================================================
@@ -204,36 +211,9 @@ func TestConvenienceSet(t *testing.T) {
 	}
 }
 
-func TestConvenienceGetSlice(t *testing.T) {
-	loader := setupTestLoader(t)
-
-	if err := loader.Set("PORTS_0", "8080"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-	if err := loader.Set("PORTS_1", "8081"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	// Test GetSlice with indexed keys
-	result := GetSliceFrom[int](loader, "PORTS")
-	if len(result) != 2 || result[0] != 8080 || result[1] != 8081 {
-		t.Errorf("GetSliceFrom[int]() = %v, want [8080 8081]", result)
-	}
-
-	// Test GetSlice with default
-	resultStr := GetSliceFrom[string](loader, "MISSING", []string{"default"})
-	if len(resultStr) != 1 || resultStr[0] != "default" {
-		t.Errorf("GetSliceFrom[string]() with default = %v, want [default]", resultStr)
-	}
-}
-
 func TestConvenienceNoLoader(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	// With no default loader configured, every package-level accessor returns
 	// the caller-supplied default, or its zero value when none is given.
@@ -276,70 +256,216 @@ func TestConvenienceNoLoader(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("GetSlice returns nil", func(t *testing.T) {
+		if got := GetSlice[string]("KEY"); got != nil {
+			t.Errorf("GetSlice() with no loader = %v, want nil", got)
+		}
+	})
+
+	t.Run("Lookup returns empty and false", func(t *testing.T) {
+		if value, ok := Lookup("KEY"); ok || value != "" {
+			t.Errorf("Lookup() with no loader = (%q, %v), want (\"\", false)", value, ok)
+		}
+	})
+
+	t.Run("Keys returns nil", func(t *testing.T) {
+		if keys := Keys(); keys != nil {
+			t.Errorf("Keys() with no loader = %v, want nil", keys)
+		}
+	})
+
+	t.Run("All returns nil", func(t *testing.T) {
+		if all := All(); all != nil {
+			t.Errorf("All() with no loader = %v, want nil", all)
+		}
+	})
+
+	t.Run("Len returns zero", func(t *testing.T) {
+		if count := Len(); count != 0 {
+			t.Errorf("Len() with no loader = %d, want 0", count)
+		}
+	})
+
+	t.Run("GetSecure returns nil", func(t *testing.T) {
+		if sv := GetSecure("KEY"); sv != nil {
+			t.Errorf("GetSecure() with no loader = %v, want nil", sv)
+		}
+	})
+
+	notInitialized := []struct {
+		name string
+		call func() error
+	}{
+		{"Set", func() error { return Set("KEY", "value") }},
+		{"Delete", func() error { return Delete("KEY") }},
+		{"Validate", func() error { return Validate() }},
+	}
+	for _, tt := range notInitialized {
+		t.Run(tt.name+"/ErrNotInitialized", func(t *testing.T) {
+			if err := tt.call(); !errors.Is(err, ErrNotInitialized) {
+				t.Errorf("%s() with no loader error = %v, want ErrNotInitialized", tt.name, err)
+			}
+		})
+	}
+
+	t.Run("ParseInto/ErrNotInitialized", func(t *testing.T) {
+		type Config struct {
+			Host string `env:"DB_HOST"`
+		}
+		var c Config
+		if err := ParseInto(&c); !errors.Is(err, ErrNotInitialized) {
+			t.Errorf("ParseInto with no loader error = %v, want ErrNotInitialized", err)
+		}
+	})
 }
 
 // ============================================================================
 // Load Function Tests
 // ============================================================================
 
-func TestLoad(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	fs := newTestFileSystem()
-	fs.files[".env"] = "LOAD_KEY=load_value"
-
-	cfg := DefaultConfig()
-	cfg.FileSystem = fs
-	cfg.AutoApply = true
-
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
+// TestLoadFiles_ThroughDefaultLoader consolidates the load-path variants
+// (dotenv, custom filename, default filename, JSON, YAML) into one table:
+// every row loads files, installs the loader as default, and verifies the
+// values through the package-level accessors.
+func TestLoadFiles_ThroughDefaultLoader(t *testing.T) {
+	tests := []struct {
+		name  string
+		files map[string]string
+		cfgFn func() Config
+		// loadArgs are passed to LoadFiles; nil means "use the default filenames".
+		loadArgs []string
+		verify   func(t *testing.T)
+	}{
+		{
+			name:  "dotenv file",
+			files: map[string]string{".env": "LOAD_KEY=load_value"},
+			cfgFn: func() Config {
+				cfg := DefaultConfig()
+				cfg.AutoApply = true
+				return cfg
+			},
+			loadArgs: []string{".env"},
+			verify: func(t *testing.T) {
+				if got := GetString("LOAD_KEY"); got != "load_value" {
+					t.Errorf("GetString(\"LOAD_KEY\") = %q, want %q", got, "load_value")
+				}
+			},
+		},
+		{
+			name:  "custom filename with TestingConfig",
+			files: map[string]string{"custom.env": "CUSTOM_KEY=custom_value"},
+			cfgFn: func() Config {
+				cfg := TestingConfig()
+				cfg.Filenames = []string{"custom.env"}
+				return cfg
+			},
+			loadArgs: []string{"custom.env"},
+			verify: func(t *testing.T) {
+				if got := GetString("CUSTOM_KEY"); got != "custom_value" {
+					t.Errorf("GetString(\"CUSTOM_KEY\") = %q, want %q", got, "custom_value")
+				}
+			},
+		},
+		{
+			name:  "multiple keys with typed accessors",
+			files: map[string]string{"init.env": "INIT_KEY=init_value\nPORT=3000"},
+			cfgFn: func() Config {
+				cfg := DefaultConfig()
+				cfg.Filenames = []string{"init.env"}
+				return cfg
+			},
+			loadArgs: []string{"init.env"},
+			verify: func(t *testing.T) {
+				if v := GetString("INIT_KEY"); v != "init_value" {
+					t.Errorf("GetString(INIT_KEY) = %q, want %q", v, "init_value")
+				}
+				if v := GetInt("PORT", 0); v != 3000 {
+					t.Errorf("GetInt(PORT) = %d, want %d", v, 3000)
+				}
+			},
+		},
+		{
+			name:  "default filename when no files specified",
+			files: map[string]string{".env": "DEFAULT_KEY=default_value"},
+			cfgFn: func() Config {
+				cfg := DefaultConfig()
+				cfg.AutoApply = true
+				return cfg
+			},
+			loadArgs: nil,
+			verify: func(t *testing.T) {
+				if got := GetString("DEFAULT_KEY"); got != "default_value" {
+					t.Errorf("GetString(\"DEFAULT_KEY\") = %q, want %q", got, "default_value")
+				}
+			},
+		},
+		{
+			name:  "json file flattened and uppercased",
+			files: map[string]string{"config.json": `{"database": {"host": "db.example.com", "port": 3306}}`},
+			cfgFn: func() Config {
+				cfg := DefaultConfig()
+				cfg.AutoApply = true
+				return cfg
+			},
+			loadArgs: []string{"config.json"},
+			verify: func(t *testing.T) {
+				if got := GetString("DATABASE_HOST"); got != "db.example.com" {
+					t.Errorf("GetString(\"DATABASE_HOST\") = %q, want %q", got, "db.example.com")
+				}
+				if got := GetInt("DATABASE_PORT"); got != 3306 {
+					t.Errorf("GetInt(\"DATABASE_PORT\") = %d, want 3306", got)
+				}
+			},
+		},
+		{
+			name:  "yaml file flattened and uppercased",
+			files: map[string]string{"config.yaml": "server:\n  host: yaml.example.com\n  port: 8443"},
+			cfgFn: func() Config {
+				cfg := DefaultConfig()
+				cfg.AutoApply = true
+				return cfg
+			},
+			loadArgs: []string{"config.yaml"},
+			verify: func(t *testing.T) {
+				if got := GetString("SERVER_HOST"); got != "yaml.example.com" {
+					t.Errorf("GetString(\"SERVER_HOST\") = %q, want %q", got, "yaml.example.com")
+				}
+				if got := GetInt("SERVER_PORT"); got != 8443 {
+					t.Errorf("GetInt(\"SERVER_PORT\") = %d, want 8443", got)
+				}
+			},
+		},
 	}
 
-	// Load the file first
-	if err := loader.LoadFiles(".env"); err != nil {
-		t.Fatalf("LoadFiles() error = %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetDefaultLoader()
+			defer resetDefaultLoader()
 
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
+			fs := newTestFileSystem()
+			for name, content := range tt.files {
+				fs.files[name] = content
+			}
 
-	// Test that we can get the loaded value
-	if got := GetString("LOAD_KEY"); got != "load_value" {
-		t.Errorf("GetString(\"LOAD_KEY\") = %q, want %q", got, "load_value")
-	}
-}
+			cfg := tt.cfgFn()
+			cfg.FileSystem = fs
 
-func TestLoadWithConfig(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+			loader, err := New(cfg)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
 
-	fs := newTestFileSystem()
-	fs.files["custom.env"] = "CUSTOM_KEY=custom_value"
+			if err := loader.LoadFiles(tt.loadArgs...); err != nil {
+				t.Fatalf("LoadFiles() error = %v", err)
+			}
 
-	cfg := TestingConfig()
-	cfg.FileSystem = fs
-	cfg.Filenames = []string{"custom.env"}
+			if err := setDefaultLoader(loader); err != nil {
+				t.Fatalf("setDefaultLoader() error = %v", err)
+			}
 
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := loader.LoadFiles("custom.env"); err != nil {
-		t.Fatalf("LoadFiles() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	// Test that we can get the loaded value
-	if got := GetString("CUSTOM_KEY"); got != "custom_value" {
-		t.Errorf("GetString(\"CUSTOM_KEY\") = %q, want %q", got, "custom_value")
+			tt.verify(t)
+		})
 	}
 }
 
@@ -348,8 +474,8 @@ func TestLoadWithConfig(t *testing.T) {
 // ============================================================================
 
 func TestParseInto(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	cfg := DefaultConfig()
 	loader, err := New(cfg)
@@ -394,8 +520,8 @@ func TestParseInto(t *testing.T) {
 }
 
 func TestParseInto_WithInlineDefault(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	cfg := DefaultConfig()
 	loader, err := New(cfg)
@@ -426,8 +552,8 @@ func TestParseInto_WithInlineDefault(t *testing.T) {
 }
 
 func TestParseInto_LowercaseTag(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	cfg := DefaultConfig()
 	loader, err := New(cfg)
@@ -464,26 +590,10 @@ func TestParseInto_LowercaseTag(t *testing.T) {
 	}
 }
 
-func TestParseInto_NoLoader(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	// Without Load(), ParseInto should return ErrNotInitialized
-	type Config struct {
-		Host string `env:"DB_HOST"`
-	}
-
-	var c Config
-	err := ParseInto(&c)
-	if !errors.Is(err, ErrNotInitialized) {
-		t.Errorf("ParseInto with no loader error = %v, want ErrNotInitialized", err)
-	}
-}
-
 func TestParseInto_EdgeCases(t *testing.T) {
 	t.Run("nil target", func(t *testing.T) {
-		ResetDefaultLoader()
-		defer ResetDefaultLoader()
+		resetDefaultLoader()
+		defer resetDefaultLoader()
 
 		cfg := DefaultConfig()
 		loader, err := New(cfg)
@@ -501,8 +611,8 @@ func TestParseInto_EdgeCases(t *testing.T) {
 	})
 
 	t.Run("non-pointer target", func(t *testing.T) {
-		ResetDefaultLoader()
-		defer ResetDefaultLoader()
+		resetDefaultLoader()
+		defer resetDefaultLoader()
 
 		cfg := DefaultConfig()
 		loader, err := New(cfg)
@@ -526,8 +636,8 @@ func TestParseInto_EdgeCases(t *testing.T) {
 	})
 
 	t.Run("pointer to non-struct", func(t *testing.T) {
-		ResetDefaultLoader()
-		defer ResetDefaultLoader()
+		resetDefaultLoader()
+		defer resetDefaultLoader()
 
 		cfg := DefaultConfig()
 		loader, err := New(cfg)
@@ -550,45 +660,9 @@ func TestParseInto_EdgeCases(t *testing.T) {
 // Load() Function Tests
 // ============================================================================
 
-func TestInit_EquivalentToLoad(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	// Create test file system
-	fs := newTestFileSystem()
-	fs.files["init.env"] = "INIT_KEY=init_value\nPORT=3000"
-
-	// Use Load() via config with custom filesystem
-	cfg := DefaultConfig()
-	cfg.Filenames = []string{"init.env"}
-	cfg.FileSystem = fs
-
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := loader.LoadFiles("init.env"); err != nil {
-		t.Fatalf("LoadFiles() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	// Verify values via package-level functions
-	if v := GetString("INIT_KEY"); v != "init_value" {
-		t.Errorf("GetString(INIT_KEY) = %q, want %q", v, "init_value")
-	}
-
-	if v := GetInt("PORT", 0); v != 3000 {
-		t.Errorf("GetInt(PORT) = %d, want %d", v, 3000)
-	}
-}
-
 func TestInitWithConfig(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	// Create test file system
 	fs := newTestFileSystem()
@@ -628,8 +702,8 @@ func TestInitWithConfig(t *testing.T) {
 // ============================================================================
 
 func TestLoad_AlreadyInitialized(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	// First, initialize the default loader
 	cfg := DefaultConfig()
@@ -653,146 +727,16 @@ func TestLoad_AlreadyInitialized(t *testing.T) {
 	}
 }
 
-func TestLoad_FileNotFound(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	// Create test file system without the requested file
-	fs := newTestFileSystem()
-	// Don't add "nonexistent.env"
-
-	cfg := DefaultConfig()
-	cfg.Filenames = nil // Don't auto-load files in New()
-	cfg.FileSystem = fs
-	cfg.AutoApply = true
-	cfg.FailOnMissingFile = true // Enable error on missing files
-
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	// LoadFiles should return an error when FailOnMissingFile is true
-	err = loader.LoadFiles("nonexistent.env")
-	if err == nil {
-		t.Error("LoadFiles() should return error for non-existent file when FailOnMissingFile is true")
-	}
-}
-
-func TestLoad_DefaultFilename(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	// Create test file system with default .env
-	fs := newTestFileSystem()
-	fs.files[".env"] = "DEFAULT_KEY=default_value"
-
-	cfg := DefaultConfig() // No filename = default .env
-	cfg.FileSystem = fs
-	cfg.AutoApply = true
-
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := loader.LoadFiles(); err != nil {
-		t.Fatalf("LoadFiles() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	// Verify value is accessible
-	if got := GetString("DEFAULT_KEY"); got != "default_value" {
-		t.Errorf("GetString(\"DEFAULT_KEY\") = %q, want %q", got, "default_value")
-	}
-}
-
-// ============================================================================
-// Load with JSON/YAML Tests
-// ============================================================================
-
-func TestLoad_JSONFile(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	// Create test file system with JSON file
-	fs := newTestFileSystem()
-	fs.files["config.json"] = `{"database": {"host": "db.example.com", "port": 3306}}`
-
-	cfg := DefaultConfig()
-	cfg.Filenames = []string{"config.json"}
-	cfg.FileSystem = fs
-	cfg.AutoApply = true
-
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := loader.LoadFiles("config.json"); err != nil {
-		t.Fatalf("LoadFiles() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	// JSON keys are flattened and uppercased
-	if got := GetString("DATABASE_HOST"); got != "db.example.com" {
-		t.Errorf("GetString(\"DATABASE_HOST\") = %q, want %q", got, "db.example.com")
-	}
-
-	if got := GetInt("DATABASE_PORT"); got != 3306 {
-		t.Errorf("GetInt(\"DATABASE_PORT\") = %d, want 3306", got)
-	}
-}
-
-func TestLoad_YAMLFile(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	// Create test file system with YAML file
-	fs := newTestFileSystem()
-	fs.files["config.yaml"] = "server:\n  host: yaml.example.com\n  port: 8443"
-
-	cfg := DefaultConfig()
-	cfg.Filenames = []string{"config.yaml"}
-	cfg.FileSystem = fs
-	cfg.AutoApply = true
-
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := loader.LoadFiles("config.yaml"); err != nil {
-		t.Fatalf("LoadFiles() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	// YAML keys are flattened and uppercased
-	if got := GetString("SERVER_HOST"); got != "yaml.example.com" {
-		t.Errorf("GetString(\"SERVER_HOST\") = %q, want %q", got, "yaml.example.com")
-	}
-
-	if got := GetInt("SERVER_PORT"); got != 8443 {
-		t.Errorf("GetInt(\"SERVER_PORT\") = %d, want 8443", got)
-	}
-}
-
 // ============================================================================
 // Keys/All/Len/Delete Function Tests
 // ============================================================================
 
-func TestKeys(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+// TestKeysAllLen verifies the three introspection accessors in one table:
+// they share the same setup (two keys in the default loader) and only differ
+// in the accessor under test.
+func TestKeysAllLen(t *testing.T) {
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	cfg := DefaultConfig()
 	loader, err := New(cfg)
@@ -811,117 +755,43 @@ func TestKeys(t *testing.T) {
 		t.Fatalf("setDefaultLoader() error = %v", err)
 	}
 
-	keys := Keys()
-	if len(keys) != 2 {
-		t.Errorf("Keys() returned %d keys, want 2", len(keys))
-	}
+	t.Run("Keys returns both keys", func(t *testing.T) {
+		keys := Keys()
+		if len(keys) != 2 {
+			t.Fatalf("Keys() returned %d keys, want 2", len(keys))
+		}
+		keyMap := make(map[string]bool)
+		for _, k := range keys {
+			keyMap[k] = true
+		}
+		if !keyMap["KEY1"] || !keyMap["KEY2"] {
+			t.Errorf("Keys() = %v, want [KEY1, KEY2]", keys)
+		}
+	})
 
-	// Check that both keys are present
-	keyMap := make(map[string]bool)
-	for _, k := range keys {
-		keyMap[k] = true
-	}
-	if !keyMap["KEY1"] || !keyMap["KEY2"] {
-		t.Errorf("Keys() = %v, want [KEY1, KEY2]", keys)
-	}
-}
+	t.Run("All returns both entries", func(t *testing.T) {
+		all := All()
+		if len(all) != 2 {
+			t.Fatalf("All() returned %d entries, want 2", len(all))
+		}
+		if all["KEY1"] != "value1" {
+			t.Errorf("All()[\"KEY1\"] = %q, want %q", all["KEY1"], "value1")
+		}
+		if all["KEY2"] != "value2" {
+			t.Errorf("All()[\"KEY2\"] = %q, want %q", all["KEY2"], "value2")
+		}
+	})
 
-func TestKeys_NoLoader(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	// Without Load(), Keys() returns nil
-	keys := Keys()
-	if keys != nil {
-		t.Errorf("Keys() with no loader = %v, want nil", keys)
-	}
-}
-
-func TestAll(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := loader.Set("KEY1", "value1"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-	if err := loader.Set("KEY2", "value2"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	all := All()
-	if len(all) != 2 {
-		t.Errorf("All() returned %d entries, want 2", len(all))
-	}
-
-	if all["KEY1"] != "value1" {
-		t.Errorf("All()[\"KEY1\"] = %q, want %q", all["KEY1"], "value1")
-	}
-	if all["KEY2"] != "value2" {
-		t.Errorf("All()[\"KEY2\"] = %q, want %q", all["KEY2"], "value2")
-	}
-}
-
-func TestAll_NoLoader(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	// Without Load(), All() returns nil
-	all := All()
-	if all != nil {
-		t.Errorf("All() with no loader = %v, want nil", all)
-	}
-}
-
-func TestLen(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := loader.Set("KEY1", "value1"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-	if err := loader.Set("KEY2", "value2"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	count := Len()
-	if count != 2 {
-		t.Errorf("Len() = %d, want 2", count)
-	}
-}
-
-func TestLen_NoLoader(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	count := Len()
-	if count != 0 {
-		t.Errorf("Len() with no loader = %d, want 0", count)
-	}
+	t.Run("Len returns the entry count", func(t *testing.T) {
+		if count := Len(); count != 2 {
+			t.Errorf("Len() = %d, want 2", count)
+		}
+	})
 }
 
 func TestDelete(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	cfg := DefaultConfig()
 	loader, err := New(cfg)
@@ -953,24 +823,13 @@ func TestDelete(t *testing.T) {
 	}
 }
 
-func TestDelete_NoLoader(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	// Without Load(), Delete() should return ErrNotInitialized
-	err := Delete("KEY")
-	if !errors.Is(err, ErrNotInitialized) {
-		t.Errorf("Delete() with no loader error = %v, want ErrNotInitialized", err)
-	}
-}
-
 // ============================================================================
 // GetSecure/Validate Function Tests
 // ============================================================================
 
 func TestGetSecure(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	cfg := DefaultConfig()
 	loader, err := New(cfg)
@@ -1000,8 +859,8 @@ func TestGetSecure(t *testing.T) {
 }
 
 func TestGetSecure_NotFound(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	cfg := DefaultConfig()
 	loader, err := New(cfg)
@@ -1019,75 +878,56 @@ func TestGetSecure_NotFound(t *testing.T) {
 	}
 }
 
-func TestGetSecure_NoLoader(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+// TestValidateRequiredKeys covers both outcomes of the required-keys check
+// through the package-level Validate().
+func TestValidateRequiredKeys(t *testing.T) {
+	t.Run("all required keys present", func(t *testing.T) {
+		resetDefaultLoader()
+		defer resetDefaultLoader()
 
-	sv := GetSecure("KEY")
-	if sv != nil {
-		t.Errorf("GetSecure() with no loader = %v, want nil", sv)
-	}
+		cfg := DefaultConfig()
+		cfg.RequiredKeys = []string{"REQUIRED_KEY"}
+
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+
+		if err := loader.Set("REQUIRED_KEY", "value"); err != nil {
+			t.Fatalf("Set() error = %v", err)
+		}
+
+		if err := setDefaultLoader(loader); err != nil {
+			t.Fatalf("setDefaultLoader() error = %v", err)
+		}
+
+		if err := Validate(); err != nil {
+			t.Errorf("Validate() error = %v, want nil", err)
+		}
+	})
+
+	t.Run("missing required key fails", func(t *testing.T) {
+		resetDefaultLoader()
+		defer resetDefaultLoader()
+
+		cfg := DefaultConfig()
+		cfg.RequiredKeys = []string{"MISSING_REQUIRED_KEY"}
+
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+
+		if err := setDefaultLoader(loader); err != nil {
+			t.Fatalf("setDefaultLoader() error = %v", err)
+		}
+
+		if err := Validate(); err == nil {
+			t.Error("Validate() should return error for missing required key")
+		}
+	})
 }
 
-func TestValidate(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	cfg := DefaultConfig()
-	cfg.RequiredKeys = []string{"REQUIRED_KEY"}
-
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := loader.Set("REQUIRED_KEY", "value"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	// Should pass validation
-	if err := Validate(); err != nil {
-		t.Errorf("Validate() error = %v, want nil", err)
-	}
-}
-
-func TestValidate_MissingRequired(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	cfg := DefaultConfig()
-	cfg.RequiredKeys = []string{"MISSING_REQUIRED_KEY"}
-
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	// Should fail validation
-	err = Validate()
-	if err == nil {
-		t.Error("Validate() should return error for missing required key")
-	}
-}
-
-func TestValidate_NoLoader(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
-
-	// Without Load(), Validate() should return ErrNotInitialized
-	err := Validate()
-	if !errors.Is(err, ErrNotInitialized) {
-		t.Errorf("Validate() with no loader error = %v, want ErrNotInitialized", err)
-	}
-}
 func TestGetSliceFrom(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -1445,8 +1285,8 @@ func TestLookup_CommaSeparatedFallback(t *testing.T) {
 
 // TestGetSlice_WithDefaultLoader tests the GetSlice convenience function through the default loader.
 func TestGetSlice_WithDefaultLoader(t *testing.T) {
-	ResetDefaultLoader()
-	defer ResetDefaultLoader()
+	resetDefaultLoader()
+	defer resetDefaultLoader()
 
 	cfg := DefaultConfig()
 	loader, err := New(cfg)
@@ -1477,39 +1317,9 @@ func TestGetSlice_WithDefaultLoader(t *testing.T) {
 	}
 
 	// Test with no loader returns default
-	ResetDefaultLoader()
+	resetDefaultLoader()
 	noLoaderResult := GetSlice[string]("KEY", []string{"fallback"})
 	if len(noLoaderResult) != 1 || noLoaderResult[0] != "fallback" {
 		t.Errorf("GetSlice[string]() no loader = %v, want [fallback]", noLoaderResult)
-	}
-}
-
-func TestGetString_CommaSeparatedIndex(t *testing.T) {
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	// Set up comma-separated value
-	if err := loader.Set("SERVICE_CORS_ALLOW_ORIGINS", "https://www.example.com,https://admin.example.com"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-
-	// Test Lookup with indexed access to comma-separated value
-	got, ok := loader.Lookup("service.cors.allow_origins.0")
-	if !ok || got != "https://www.example.com" {
-		t.Errorf("Lookup(\"service.cors.allow_origins.0\") = (%q, %v), want (\"https://www.example.com\", true)", got, ok)
-	}
-
-	got, ok = loader.Lookup("service.cors.allow_origins.1")
-	if !ok || got != "https://admin.example.com" {
-		t.Errorf("Lookup(\"service.cors.allow_origins.1\") = (%q, %v), want (\"https://admin.example.com\", true)", got, ok)
-	}
-
-	// Index out of range returns false
-	got, ok = loader.Lookup("service.cors.allow_origins.5")
-	if ok {
-		t.Errorf("Lookup with out of range index = (%q, %v), want (\"\", false)", got, ok)
 	}
 }

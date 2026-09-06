@@ -7,11 +7,10 @@ program in its own directory.
 
 ```powershell
 # Run from the project root so relative data paths resolve correctly.
-go run -tags examples ./examples/01_quickstart/
+go run ./examples/01_quickstart/
 ```
 
-All examples use the `//go:build examples` tag so they are excluded from
-normal builds (`go build ./...`).
+All examples are included in normal builds (`go build ./...`).
 
 ## Example Index
 

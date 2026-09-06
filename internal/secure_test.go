@@ -37,15 +37,53 @@ func TestSecureReaderSizeLimit(t *testing.T) {
 }
 
 func TestSecureReaderLineLengthLimit(t *testing.T) {
-	// Line with more than 10 characters
-	content := "this_line_is_too_long_for_limit\n"
-	reader := NewSecureReader(strings.NewReader(content), 1024, 10)
+	t.Run("line with trailing newline", func(t *testing.T) {
+		// Line with more than 10 characters
+		content := "this_line_is_too_long_for_limit\n"
+		reader := NewSecureReader(strings.NewReader(content), 1024, 10)
 
-	buf := make([]byte, len(content))
-	_, err := reader.Read(buf)
+		buf := make([]byte, len(content))
+		_, err := reader.Read(buf)
 
-	if err != ErrLineTooLong {
-		t.Errorf("expected ErrLineTooLong, got %v", err)
+		if err != ErrLineTooLong {
+			t.Errorf("expected ErrLineTooLong, got %v", err)
+		}
+	})
+
+	t.Run("final segment without trailing newline", func(t *testing.T) {
+		// Boundary: the over-long segment is the last chunk and carries no
+		// newline, so the tail-segment check must fire.
+		content := "this_line_is_too_long"
+		reader := NewSecureReader(strings.NewReader(content), 1024, 10)
+
+		buf := make([]byte, len(content))
+		_, err := reader.Read(buf)
+
+		if err != ErrLineTooLong {
+			t.Errorf("expected ErrLineTooLong, got %v", err)
+		}
+	})
+}
+
+// TestSecureReaderExactSizeEOF verifies that a stream ending exactly at the
+// size limit is accepted (EOF, not ErrFileTooLarge) and that the terminal
+// EOF state persists across subsequent reads.
+func TestSecureReaderExactSizeEOF(t *testing.T) {
+	content := strings.Repeat("a", 100)
+	reader := NewSecureReader(strings.NewReader(content), 100, 1024)
+
+	buf := make([]byte, 100)
+	n, err := reader.Read(buf)
+	if n != 100 {
+		t.Errorf("read %d bytes, want 100", n)
+	}
+	if err != io.EOF {
+		t.Errorf("exact-size read error = %v, want io.EOF", err)
+	}
+
+	// Subsequent reads must keep reporting EOF, not ErrFileTooLarge.
+	if _, err := reader.Read(buf); err != io.EOF {
+		t.Errorf("subsequent read error = %v, want io.EOF", err)
 	}
 }
 
@@ -114,7 +152,7 @@ func TestSecureReaderErrorPersisted(t *testing.T) {
 
 	buf := make([]byte, 100)
 	// First read should trigger error
-	reader.Read(buf)
+	_, _ = reader.Read(buf) // state-shaping; the assertion below covers the persisted error
 
 	// Second read should return same error
 	buf2 := make([]byte, 100)
@@ -144,7 +182,7 @@ func TestReleaseSecureReader(t *testing.T) {
 	t.Run("reader reused from pool after release", func(t *testing.T) {
 		// Create, release, create again — the second should reuse the pooled struct
 		first := NewSecureReader(strings.NewReader("data1"), 512, 64)
-		first.Read(make([]byte, 5)) // exercise Read to set internal state
+		_, _ = first.Read(make([]byte, 5)) // exercise Read to set internal state
 		ReleaseSecureReader(first)
 
 		second := NewSecureReader(strings.NewReader("data2"), 512, 64)

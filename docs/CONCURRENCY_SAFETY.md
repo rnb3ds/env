@@ -36,6 +36,7 @@ The core storage mechanism uses a **sharded map architecture** to minimize lock 
 
 **Implementation Details:**
 - **8 shards** for optimal distribution
+- **Lazy shard maps** — each shard's map is created on first write; reads over a nil map are no-ops, so empty loaders cost nothing
 - **Hybrid hash** for shard selection — multiplicative (Knuth) hashing for short keys (≤8 chars, the common case), full FNV-1a for medium keys (9–16 chars), and FNV-1a with first/last-8-byte sampling for longer keys (>16 chars)
 - **Per-shard RWMutex** for fine-grained locking
 - **Atomic counter** for O(1) `Len()` operations
@@ -65,18 +66,22 @@ The `Loader` type uses comprehensive synchronization:
 
 ```go
 type Loader struct {
-    mu       sync.RWMutex    // Protects all mutable state
-    vars     *secureMap      // Sharded thread-safe storage
-    applied  bool            // Atomic access via lock
-    closed   bool            // Atomic access via lock
-    loadTime time.Time       // Protected by lock
-    // ... other immutable fields
+    mu          sync.RWMutex        // Protects all mutable state
+    vars        *secureMap          // Sharded thread-safe storage (immutable pointer)
+    closedFast  atomic.Bool         // Mirrors `closed` for lock-free single-key reads
+    applied     bool                // Access via lock
+    appliedKeys map[string]struct{} // Process-env keys this loader set (via lock)
+    closed      bool                // Access via lock
+    loadTime    time.Time           // Protected by lock
+    // ... other immutable fields (config, factory, parsers, fs)
 }
 ```
 
 **Locking Strategy:**
-- **Read operations** → `RLock()` / `RUnlock()`
+- **Multi-key read operations** (`All`, `Keys`, `ParseInto`, …) → `RLock()` / `RUnlock()` for cross-shard snapshot consistency
 - **Write operations** → `Lock()` / `Unlock()`
+- **Single-key reads** (`Lookup`, `GetSecure`, `GetString`) → lock-free: an atomic `closed` check plus the per-shard locks in `secureMap`. A read racing `Close()` either observes the value or the cleared state (graceful degradation, as guaranteed below); it cannot panic or tear
+- **`Set` with `OverwriteExisting` and no `AutoApply`** → `RLock()` fast path: there is no check-then-act to serialize and no loader-level state is mutated, so only `secureMap`'s internal locks are needed
 - **Always use `defer`** for unlock to prevent deadlocks
 
 ### 3. SecureValue Thread Safety
@@ -172,16 +177,20 @@ func (f *ComponentFactory) Close() error {
 ### Concurrent Read/Write Operations
 
 ```go
-// Test: 10 goroutines × 1000 iterations (read, write, delete mixed)
+// Test: 4 scenarios, each with 10 goroutines performing a single operation
+// category: reads (500 iterations: GetString/Lookup/GetSecure),
+// Set (500, with OverwriteExisting), Keys/All/Len (200), Delete (300)
 func TestLoader_Concurrent(t *testing.T)
 ```
 
 **Operations Tested:**
-- `GetString()`, `GetInt()`, `GetBool()`, `GetDuration()`
-- `Lookup()`, `GetSecure()`
+- `GetString()`, `Lookup()`, `GetSecure()`
 - `Keys()`, `All()`, `Len()`
-- `Set()` with and without overwrite
+- `Set()` (with `OverwriteExisting: true`)
 - `Delete()`
+
+> The `Set` read-lock fast path (`OverwriteExisting` without `AutoApply`) and
+> concurrent `Close()` are additionally exercised by `TestLoader_ConcurrentFastPaths`.
 
 **Result:** ✅ No data races, consistent reads and writes
 
@@ -338,21 +347,22 @@ if !loader.IsClosed() {
 
 ## Performance Characteristics
 
-### Read Operations (Per-Shard RWMutex)
+### Read Operations (Lock-Free Single-Key / Per-Shard RWMutex)
 
 | Operation | Contention | Expected Performance |
 |-----------|------------|---------------------|
-| `GetString` | Low | O(1) with RLock |
-| `GetInt` | Low | O(1) with RLock |
-| `Lookup` | Low | O(1) with RLock |
-| `Keys` | Medium | O(n) across shards |
-| `Len` | None | O(1) atomic read |
+| `GetString` | None | O(1) lock-free (atomic closed check + shard lock) |
+| `GetInt` | None | O(1) lock-free |
+| `Lookup` | None | O(1) lock-free |
+| `Keys` | Medium | O(n) across shards (read lock) |
+| `Len` | Low | O(1) atomic count (loader read lock + atomic counter) |
 
 ### Write Operations (Per-Shard Mutex)
 
 | Operation | Contention | Expected Performance |
 |-----------|------------|---------------------|
-| `Set` | Medium | O(1) with Lock |
+| `Set` (overwrite, no auto-apply) | Low | O(1) with read lock fast path |
+| `Set` (other configs) | Medium | O(1) with Lock |
 | `Delete` | Medium | O(1) with Lock |
 | `SetAll` | Low | Batch per shard |
 
@@ -383,9 +393,9 @@ All concurrency tests are located in:
 
 | File | Coverage |
 |------|----------|
-| `concurrent_test.go` | Loader, SecureMap, SecureValue, Singleton tests |
-| `internal/concurrent_test.go` | InternKey, Expander, Auditor, Validator, Pool tests |
-| `secure_test.go` | SecureValue thread-safety tests |
+| `concurrent_test.go` | Loader, SecureMap, SecureValue, Singleton concurrency tests |
+| `internal/concurrent_test.go` | InternKeyBytes, Expander, Auditor, Validator, Pool tests |
+| `secure_test.go` | SecureValue/SecureMap, masking, and memory-lock functional tests |
 
 Run all tests with race detection:
 ```bash

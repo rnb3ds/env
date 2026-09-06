@@ -57,12 +57,22 @@ func (l *Loader) GetString(key string, defaultValue ...string) string {
 // Supports dot-notation path resolution for nested keys (e.g., "database.host" -> "DATABASE_HOST").
 // For indexed access (e.g., "service.cors.origins.0"), falls back to comma-separated values
 // if indexed key is not found.
-// Returns the value with leading and trailing whitespace trimmed.
+// Returns the stored value as-is (no trimming): .env values are trimmed at
+// parse time, while JSON/YAML values may keep surrounding whitespace.
 func (l *Loader) Lookup(key string) (string, bool) {
-	if err := l.enterRead(); err != nil {
+	// Lock-free fast path: single-key reads do not need l.mu. l.vars is
+	// assigned exactly once in New and synchronizes internally (per-shard
+	// locks), so the only loader-level state a reader needs is closedness —
+	// checked atomically. Under high concurrency the RWMutex reader count is
+	// itself the contention bottleneck.
+	//
+	// Semantics vs Close are unchanged: a read racing Close either observes
+	// the value or the cleared state — "graceful degradation", as documented
+	// in CONCURRENCY_SAFETY.md. Multi-key snapshots (All, ToMap, ParseInto)
+	// keep the read lock for cross-shard consistency.
+	if l == nil || l.closedFast.Load() {
 		return "", false
 	}
-	defer l.exitRead()
 
 	// Fast path: simple keys (no dots) — inline the lookup to avoid the
 	// function-value indirection of ResolveKey(key, l.vars.Get).
@@ -88,10 +98,10 @@ func (l *Loader) Lookup(key string) (string, bool) {
 // Uses the same key resolution strategy as Lookup (exact match, uppercase fallback,
 // dot-notation) via internal.ResolveKeyName to ensure consistency.
 func (l *Loader) GetSecure(key string) *SecureValue {
-	if err := l.enterRead(); err != nil {
+	// Lock-free single-key read — see Lookup for the rationale.
+	if l == nil || l.closedFast.Load() {
 		return nil
 	}
-	defer l.exitRead()
 
 	// Single-pass resolution: find key and allocate SecureValue atomically
 	// to avoid TOCTOU race between exists() and GetSecure().
@@ -291,6 +301,11 @@ func buildIndexedKey(baseKey string, index int) string {
 // Indexed keys are searched in format: KEY_0, KEY_1, KEY_2, etc.
 // Also supports comma-separated values as fallback for .env files.
 //
+// Element parse-failure semantics differ by source: an indexed element that
+// fails to parse is audited and skipped (the rest of the slice is kept),
+// while a parse failure in the comma-separated fallback discards the whole
+// list and returns the default (or nil).
+//
 // Type parameter T is constrained to: string, int, int64, uint, uint64, bool, float64, time.Duration.
 //
 // # Why a Function Instead of a Method?
@@ -345,7 +360,8 @@ func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, def
 	const maxSliceSize = 10000
 
 	var result []T
-	for i := range maxSliceSize {
+	i := 0
+	for ; i < maxSliceSize; i++ {
 		indexedKey := buildIndexedKey(baseKey, i)
 		value, ok := loader.vars.Get(indexedKey)
 		if !ok {
@@ -362,8 +378,10 @@ func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, def
 		result = append(result, parsed)
 	}
 
-	// SECURITY: Log if we hit the slice size limit (potential DoS attempt)
-	if len(result) >= maxSliceSize {
+	// SECURITY: Log if we exhausted the slice size limit (potential DoS
+	// attempt). Compare the iteration count, not len(result): elements
+	// skipped due to parse failures also count toward the limit.
+	if i == maxSliceSize {
 		_ = loader.factory.Auditor().LogError(internal.ActionGet, baseKey,
 			fmt.Sprintf("slice size limit reached (%d elements)", maxSliceSize))
 	}

@@ -23,7 +23,7 @@ This library is designed for **high-security environments** with the following b
 | Protection | Description |
 |------------|-------------|
 | **Key Pattern Validation** | Only allows `^[A-Za-z][A-Za-z0-9_]*$` by default |
-| **Value Content Validation** | Blocks null bytes and control characters |
+| **Value Content Validation** | Blocks null bytes and control characters (tab, newline, and carriage return are permitted) |
 | **Key Length Limits** | Default: 64 chars, Hard limit: 1024 chars |
 | **Value Length Limits** | Default: 4096 chars, Hard limit: 1MB |
 
@@ -72,6 +72,26 @@ COMSPEC, PATHEXT, SYSTEMROOT, WINDIR
 | **Depth Limiting** | Default: 5 levels, Hard limit: 20 levels |
 | **Cycle Detection** | Prevents infinite expansion loops |
 | **Key Validation** | Only valid keys are expanded |
+
+### Expansion Scope
+
+By default, `${VAR}` references resolve from the loaded file first and then
+**fall back to the process environment** (traditional dotenv semantics).
+This means a configuration file can reference — and capture into its values —
+any variable already present in the process (e.g. `${AWS_SECRET_ACCESS_KEY}`).
+If those values are later logged, marshaled, or persisted, the secret leaks.
+
+When configuration files come from a less-trusted source, restrict expansion
+to file-local variables:
+
+```go
+cfg := env.DefaultConfig()
+cfg.ExpansionScope = env.ExpansionFileOnly
+```
+
+With `ExpansionFileOnly`, references that are not defined in the file(s)
+being loaded expand to the empty string instead of reading `os.Environ`.
+The default (`ExpansionFileThenProcess`) preserves dotenv compatibility.
 
 ### Concurrency Safety
 
@@ -192,7 +212,7 @@ non-sensitive keys are logged verbatim. Optional fields (`file`, `masked`,
     "timestamp": "2026-03-11T10:30:00Z",
     "action": "set",
     "key": "[MASKED:7 chars]",
-    "reason": "loaded (sensitive)",
+    "reason": "loaded",
     "success": true,
     "masked": true
 }
@@ -200,7 +220,8 @@ non-sensitive keys are logged verbatim. Optional fields (`file`, `masked`,
 
 > Note: The `AP***` (2-char prefix) style is used only in validator/path error
 > messages (`DefaultMaskKey`), not in audit output. Sensitive keys loaded from
-> files are audited with reason `"loaded (sensitive)"` on the fast path.
+> files use the same reason `"loaded"` as other keys; sensitivity is reflected
+> by the masked `key` field and `"masked": true`.
 
 ### Built-in Handlers
 
@@ -208,7 +229,8 @@ non-sensitive keys are logged verbatim. Optional fields (`file`, `masked`,
 |---------|----------|
 | `JSONAuditHandler` | Structured logs, SIEM integration |
 | `LogAuditHandler` | Standard Go log package |
-| `ChannelAuditHandler` | Custom async processing |
+| `ChannelAuditHandler` | Custom async processing (caller-owned channel) |
+| `CloseableChannelHandler` | Async processing with owned channel lifecycle (`Close()` closes the channel) |
 | `NopAuditHandler` | Disabled auditing |
 
 ---

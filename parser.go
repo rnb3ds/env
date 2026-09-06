@@ -158,8 +158,8 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 	// This reduces map growth operations for larger files
 	// Use a conservative estimate: 1 variable per 60 characters
 	initialCap := min(p.config.MaxVariables, 64)
-	if seeker, ok := r.(interface{ Len() int }); ok {
-		if size := seeker.Len(); size > 0 {
+	if sizer, ok := r.(interface{ Len() int }); ok {
+		if size := sizer.Len(); size > 0 {
 			estimatedVars := size / 60
 			if estimatedVars > initialCap {
 				initialCap = min(estimatedVars, p.config.MaxVariables)
@@ -211,6 +211,7 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 			_ = p.auditor.LogError(internal.ActionParse, "", "maximum variables exceeded")
 			parseErr = &ValidationError{
 				Field:   "variables",
+				Rule:    "max_variables",
 				Message: fmt.Sprintf("exceeded maximum of %d variables", p.config.MaxVariables),
 			}
 			break
@@ -271,8 +272,7 @@ func parseString(s string) (map[string]string, error) {
 		return nil, err
 	}
 
-	result, err := p.Parse(strings.NewReader(s), "")
-	return result, err
+	return p.Parse(strings.NewReader(s), "")
 }
 
 // sharedParseFactory caches a ComponentFactory for parseString to reuse.

@@ -56,7 +56,9 @@ const (
 	TokenValue
 	// TokenDash represents the start of an array item.
 	TokenDash
-	// TokenColon represents the colon separator.
+	// TokenColon represents the colon separator. It is never emitted by the
+	// Lexer (scanKey consumes the colon inline); the constant is kept as a
+	// synthetic "unknown token" fixture for parser tests.
 	TokenColon
 	// TokenComment represents a comment.
 	TokenComment
@@ -87,7 +89,7 @@ var lexerPool = sync.Pool{
 
 // Lexer tokenizes YAML input.
 type Lexer struct {
-	input    string
+	input    []byte
 	pos      int
 	line     int
 	column   int
@@ -98,8 +100,12 @@ type Lexer struct {
 	eof      bool    // Whether we've reached EOF
 }
 
-// NewYAMLLexer creates a new YAML lexer (from pool if available).
-func NewYAMLLexer(input string) *Lexer {
+// newYAMLLexer creates a lexer over a byte slice without copying it.
+// This is the hot-path entry used by ParseYAML: the input aliases the
+// caller's read buffer, which stays valid for the duration of Tokenize
+// because every token value is copied out as an independent string
+// (see trimInputRange and scanQuotedString).
+func newYAMLLexer(input []byte) *Lexer {
 	l, ok := lexerPool.Get().(*Lexer)
 	if !ok {
 		l = &Lexer{
@@ -121,7 +127,7 @@ func NewYAMLLexer(input string) *Lexer {
 
 // release returns the Lexer to the pool.
 func (l *Lexer) release() {
-	l.input = ""
+	l.input = nil
 	l.tokens = nil
 	lexerPool.Put(l)
 }
@@ -376,8 +382,6 @@ func (l *Lexer) isKeyStart() bool {
 func (l *Lexer) scanKey() (Token, error) {
 	startLine := l.line
 	startCol := l.column
-	buf := getLexerBuffer()
-	defer putLexerBuffer(buf)
 
 	// Handle quoted keys
 	if l.pos < len(l.input) {
@@ -397,42 +401,95 @@ func (l *Lexer) scanKey() (Token, error) {
 		}
 	}
 
-	// Unquoted key
+	// Unquoted key: scan by index and slice the input once instead of copying
+	// byte-by-byte through a pooled buffer. The string() conversion makes an
+	// exact-size copy so the token value stays independent of l.input.
+	contentStart := l.pos
+	contentEnd := l.pos
 	for l.pos < len(l.input) {
 		ch := l.input[l.pos]
 		if ch == ':' {
 			// Check if colon is followed by space, newline, or end
 			if l.pos+1 >= len(l.input) {
+				contentEnd = l.pos
 				l.pos++
 				break
 			}
 			next := l.input[l.pos+1]
 			if next == ' ' || next == '\t' || next == '\n' || next == '\r' {
+				contentEnd = l.pos
 				l.pos++
 				l.column++
 				break
 			}
 		}
 		if ch == '\n' || ch == '\r' {
+			contentEnd = l.pos
 			break
 		}
-		if ch == '#' {
+		if ch == '#' && isCommentStart(l.input, l.pos) {
+			// Same whitespace rule as scanValue: '#' after whitespace ends the
+			// key and starts a comment; '#' mid-token stays part of the key and
+			// is then rejected by key validation as an explicit error instead
+			// of silently truncating the key.
+			contentEnd = l.pos
 			break
 		}
-		buf.WriteByte(ch)
 		l.pos++
 		l.column++
+		contentEnd = l.pos
 	}
 
-	return Token{Type: TokenKey, Value: TrimSpaceBytes(buf.Bytes()), Line: startLine, Column: startCol, Indent: l.indent}, nil
+	return Token{Type: TokenKey, Value: trimInputRange(l.input, contentStart, contentEnd), Line: startLine, Column: startCol, Indent: l.indent}, nil
+}
+
+// trimInputRange trims ASCII spaces and tabs (and, defensively, CR/LF) from
+// both ends of input[start:end] and returns an exact-size copy.
+// It replaces the previous buffered WriteByte round-trip: the scanned region
+// can never contain a newline (the scanners stop there), so the same trim
+// semantics apply with one allocation and no buffer churn.
+//
+// SECURITY/RETENTION: the string() copy is deliberate — returning the
+// substring input[start:end] would be zero-copy but would keep the entire
+// input alive for as long as any token value (and any result-map entry built
+// from it) is referenced.
+func trimInputRange(input []byte, start, end int) string {
+	for start < end {
+		c := input[start]
+		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+			break
+		}
+		start++
+	}
+	for end > start {
+		c := input[end-1]
+		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+			break
+		}
+		end--
+	}
+	return string(input[start:end])
+}
+
+// isCommentStart reports whether the '#' at input[pos] begins a YAML comment.
+// Per the YAML spec a comment starts at the beginning of a line or where '#'
+// is preceded by whitespace; '#' anywhere else is plain-scalar data. pos == 0
+// counts as a comment start (beginning of input/line).
+func isCommentStart(input []byte, pos int) bool {
+	if pos == 0 {
+		return true
+	}
+	switch input[pos-1] {
+	case ' ', '\t', '\n', '\r':
+		return true
+	}
+	return false
 }
 
 // scanValue scans a scalar value.
 func (l *Lexer) scanValue() (Token, error) {
 	startLine := l.line
 	startCol := l.column
-	buf := getLexerBuffer()
-	defer putLexerBuffer(buf)
 
 	// Skip leading spaces
 	l.skipSpaces()
@@ -451,13 +508,21 @@ func (l *Lexer) scanValue() (Token, error) {
 		return Token{Type: TokenValue, Value: str, Line: startLine, Column: startCol, Indent: l.indent, IsQuoted: true}, nil
 	}
 
-	// Unquoted value - scan until newline or comment
+	// Unquoted value: scan by index and slice the input once instead of
+	// copying byte-by-byte through a pooled buffer (see trimInputRange).
+	contentStart := l.pos
+	contentEnd := l.pos
 	for l.pos < len(l.input) {
 		ch := l.input[l.pos]
 		if ch == '\n' || ch == '\r' {
+			contentEnd = l.pos
 			break
 		}
-		if ch == '#' {
+		if ch == '#' && isCommentStart(l.input, l.pos) {
+			// YAML starts a comment only where '#' is preceded by whitespace
+			// (or begins the value). '#' inside a plain scalar — pa#ss,
+			// http://host/p#frag — is data, not a comment marker.
+			contentEnd = l.pos
 			break
 		}
 		if ch == ':' {
@@ -466,16 +531,17 @@ func (l *Lexer) scanValue() (Token, error) {
 				next := l.input[l.pos+1]
 				if next == ' ' || next == '\t' || next == '\n' || next == '\r' {
 					// This is a key, stop here
+					contentEnd = l.pos
 					break
 				}
 			}
 		}
-		buf.WriteByte(ch)
 		l.pos++
 		l.column++
+		contentEnd = l.pos
 	}
 
-	return Token{Type: TokenValue, Value: TrimSpaceBytes(buf.Bytes()), Line: startLine, Column: startCol, Indent: l.indent}, nil
+	return Token{Type: TokenValue, Value: trimInputRange(l.input, contentStart, contentEnd), Line: startLine, Column: startCol, Indent: l.indent}, nil
 }
 
 // scanQuotedString scans a quoted string.
@@ -558,39 +624,106 @@ func (l *Lexer) scanQuotedString(quote byte) (string, error) {
 func (l *Lexer) scanComment() (Token, error) {
 	startLine := l.line
 	startCol := l.column
-	l.pos++ // Skip #
+	contentStart := l.pos + 1 // skip '#'
+	l.pos++
 	l.column++
 
-	buf := getLexerBuffer()
-	defer putLexerBuffer(buf)
+	contentEnd := l.pos
 	for l.pos < len(l.input) {
 		ch := l.input[l.pos]
 		if ch == '\n' || ch == '\r' {
+			contentEnd = l.pos
 			break
 		}
-		buf.WriteByte(ch)
 		l.pos++
 		l.column++
+		contentEnd = l.pos
 	}
 
-	return Token{Type: TokenComment, Value: TrimSpaceBytes(buf.Bytes()), Line: startLine, Column: startCol, Indent: l.indent}, nil
+	return Token{Type: TokenComment, Value: trimInputRange(l.input, contentStart, contentEnd), Line: startLine, Column: startCol, Indent: l.indent}, nil
 }
 
-// Tokenize returns all tokens from the input.
-// Pre-allocates token slice based on input length for efficiency.
-func (l *Lexer) Tokenize() ([]Token, error) {
-	// Estimate token count based on input length
-	estimatedTokens := len(l.input)/20 + 10
+// tokenSlicePool reuses the token slices produced by tokenization.
+// A 100-variable document yields ~300 tokens ≈ 17KB — by far the largest
+// single allocation of a YAML parse — so pooling it removes most of the
+// per-parse allocation churn. The pool stores *[]Token because Tokenize may
+// reallocate while appending; the caller writes the final slice back through
+// the pointer before returning it (same pattern as the reader buffers in the
+// root package's structured_parser.go).
+var tokenSlicePool = sync.Pool{
+	New: func() any {
+		s := make([]Token, 0, 256)
+		return &s
+	},
+}
+
+// getTokenSlice retrieves a token slice from the pool.
+func getTokenSlice() *[]Token {
+	p, ok := tokenSlicePool.Get().(*[]Token)
+	if !ok {
+		s := make([]Token, 0, 256)
+		return &s
+	}
+	return p
+}
+
+// putTokenSlice returns a token slice to the pool.
+// It drops references to token values (which may hold file contents) so the
+// strings can be collected, and discards slices whose capacity exceeds
+// MaxPooledYAMLTokenCount to prevent memory bloat.
+func putTokenSlice(p *[]Token) {
+	if p == nil || *p == nil {
+		return
+	}
+	clear(*p) // drop Value string references
+	if cap(*p) > MaxPooledYAMLTokenCount {
+		return // too large, let GC reclaim it
+	}
+	*p = (*p)[:0]
+	tokenSlicePool.Put(p)
+}
+
+// tokenizeInto tokenizes into the provided slice, reusing its capacity and
+// growing it as needed, and returns the (possibly reallocated) slice. On
+// error the partially-filled slice is returned alongside the error so pooled
+// callers can return it to the pool. Callers that do not pool the token slice
+// pass nil.
+//
+// Pre-allocates for efficiency: a typical line yields ~3 tokens (newline,
+// key, value), while single-line flow-style input is better estimated by
+// length. Taking the max of both heuristics lands within one growth step of
+// the exact count and avoids reallocating the 56-byte-per-token slice
+// mid-parse.
+func (l *Lexer) tokenizeInto(tokens []Token) ([]Token, error) {
+	// Line-count estimate (3 tokens per line + slack), floored by the
+	// length-based estimate for inputs with few or no newlines.
+	estimatedTokens := bytes.Count(l.input, []byte{'\n'})*3 + 8
+	if byLength := len(l.input)/20 + 10; byLength > estimatedTokens {
+		estimatedTokens = byLength
+	}
 	if estimatedTokens > 1024 {
 		estimatedTokens = 1024
 	}
-
-	tokens := make([]Token, 0, estimatedTokens)
+	if cap(tokens) < estimatedTokens {
+		tokens = make([]Token, 0, estimatedTokens)
+	}
+	tokens = tokens[:0]
 
 	for {
 		tok, err := l.NextToken()
 		if err != nil {
-			return nil, err
+			return tokens, err
+		}
+		// SECURITY (SEC-02): fail fast once the token count reaches the hard
+		// cap. Every token is ~56 bytes, so tokenizing a size-legal file made
+		// of tiny lines would otherwise amplify the input into gigabytes of
+		// memory before the parser's MaxVariables check ever runs.
+		if len(tokens) >= HardMaxYAMLTokens {
+			return tokens, &YAMLError{
+				Line:    l.line,
+				Column:  l.column,
+				Message: fmt.Sprintf("maximum token count exceeded (%d)", HardMaxYAMLTokens),
+			}
 		}
 		tokens = append(tokens, tok)
 		if tok.Type == TokenEOF {

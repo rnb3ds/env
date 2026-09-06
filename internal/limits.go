@@ -51,6 +51,22 @@ const (
 
 	// HardMaxExpansionDepth is the absolute maximum expansion depth.
 	HardMaxExpansionDepth int = 20
+
+	// HardMaxYAMLTokens is the absolute maximum number of tokens the YAML
+	// lexer will produce for a single document. Each token costs ~56 bytes,
+	// so a file of tiny lines ("a\n") amplifies input bytes ~56× into token
+	// memory — before any MaxVariables check runs (SEC-02, CWE-400). This
+	// cap makes Tokenize fail fast instead of letting a size-legal file
+	// allocate gigabytes. 200K tokens ≈ 11 MB, roughly 20× what a document
+	// at the HardMaxVariables ceiling needs.
+	HardMaxYAMLTokens int = 200_000
+
+	// HardMaxJSONNodes is the absolute maximum number of structural JSON
+	// nodes (opening brackets, commas, colons — a proxy for decoded values)
+	// accepted per document. json.Unmarshal into interface{} can amplify
+	// input bytes up to ~48× into parse-tree memory (SEC-02, CWE-400); the
+	// pre-scan rejects oversized documents before that allocation happens.
+	HardMaxJSONNodes int = 200_000
 )
 
 // Pool size limits for sync.Pool objects.
@@ -72,4 +88,10 @@ const (
 	// MaxPooledMapSize is the maximum size for pooled map objects.
 	// Maps with more entries than this are discarded instead of pooled.
 	MaxPooledMapSize = 128
+
+	// MaxPooledYAMLTokenCount is the maximum capacity for pooled YAML token
+	// slices (each token is ~56 bytes). 8192 tokens (~450KB) covers documents
+	// several times larger than the DefaultMaxVariables (500) ceiling, which
+	// produces roughly 1500 tokens; larger tokenizations allocate fresh slices.
+	MaxPooledYAMLTokenCount = 8192
 )
