@@ -1,13 +1,12 @@
 package internal
 
 import (
+	"bytes"
 	"encoding/json"
-	"fmt"
 	"log"
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -172,20 +171,62 @@ func TestJSONHandler(t *testing.T) {
 }
 
 func TestLogHandler(t *testing.T) {
-	logger := log.New(os.Stdout, "[TEST] ", 0)
-	handler := NewLogHandler(logger)
-
-	event := Event{
-		Timestamp: time.Now(),
-		Action:    ActionSet,
-		Key:       "KEY",
-		Reason:    "test",
-		Success:   true,
+	tests := []struct {
+		name      string
+		event     Event
+		wantParts []string // substrings expected in the log line
+		skipParts []string // substrings that must NOT appear
+	}{
+		{
+			name:      "event with key",
+			event:     Event{Timestamp: time.Now(), Action: ActionSet, Key: "KEY", Reason: "test", Success: true},
+			wantParts: []string{"action=set", "key=KEY", "success=true", `reason="test"`},
+			skipParts: []string{"file=", "duration="},
+		},
+		{
+			name:      "event without key omits key field",
+			event:     Event{Timestamp: time.Now(), Action: ActionLoad, Reason: "nofile", Success: false},
+			wantParts: []string{"action=load", "success=false", `reason="nofile"`},
+			skipParts: []string{"key="},
+		},
+		{
+			name:      "event with file appends file field",
+			event:     Event{Timestamp: time.Now(), Action: ActionLoad, Key: "KEY", File: ".env", Success: true},
+			wantParts: []string{"file=.env"},
+		},
+		{
+			name:      "sub-millisecond duration formatted in microseconds",
+			event:     Event{Timestamp: time.Now(), Action: ActionLoad, Key: "KEY", Success: true, Duration: 1500},
+			wantParts: []string{"duration=1μs"},
+		},
+		{
+			name:      "millisecond duration formatted in ms",
+			event:     Event{Timestamp: time.Now(), Action: ActionLoad, Key: "KEY", Success: true, Duration: 2500000},
+			wantParts: []string{"duration=2.50ms"},
+		},
 	}
 
-	err := handler.Log(event)
-	if err != nil {
-		t.Errorf("LogHandler.Log() error = %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			handler := NewLogHandler(log.New(&buf, "[TEST] ", 0))
+
+			if err := handler.Log(tt.event); err != nil {
+				t.Fatalf("LogHandler.Log() error = %v", err)
+			}
+
+			output := buf.String()
+			for _, want := range tt.wantParts {
+				if !strings.Contains(output, want) {
+					t.Errorf("log output missing %q: %s", want, output)
+				}
+			}
+			for _, skip := range tt.skipParts {
+				if strings.Contains(output, skip) {
+					t.Errorf("log output should not contain %q: %s", skip, output)
+				}
+			}
+		})
 	}
 }
 
@@ -308,279 +349,8 @@ func TestAuditor_Close(t *testing.T) {
 	})
 }
 
-func TestAuditor_LogSecurity(t *testing.T) {
-	t.Run("logs security event", func(t *testing.T) {
-		ch := make(chan Event, 1)
-		handler := NewChannelHandler(ch)
-		a := NewAuditor(handler, nil, nil, true)
-
-		err := a.LogSecurity("SENSITIVE_KEY", "forbidden key access")
-		if err != nil {
-			t.Errorf("LogSecurity() error = %v", err)
-			return
-		}
-
-		select {
-		case event := <-ch:
-			if event.Action != ActionSecurity {
-				t.Errorf("event action = %v, want %v", event.Action, ActionSecurity)
-			}
-			if event.Success {
-				t.Error("security event should have success=false")
-			}
-			if event.Key != "SENSITIVE_KEY" {
-				t.Errorf("event key = %v, want SENSITIVE_KEY", event.Key)
-			}
-		case <-time.After(time.Second):
-			t.Error("timeout waiting for event")
-		}
-	})
-
-	t.Run("disabled auditor", func(t *testing.T) {
-		a := NewAuditor(nil, nil, nil, false)
-		err := a.LogSecurity("KEY", "test")
-		if err != nil {
-			t.Errorf("LogSecurity() when disabled should return nil, got %v", err)
-		}
-	})
-}
-
-// ============================================================================
-// BufferedHandler Tests
-// ============================================================================
-
-func TestBufferedHandler_Basic(t *testing.T) {
-	// Create a channel to collect events
-	ch := make(chan Event, 100)
-	underlying := NewChannelHandler(ch)
-
-	handler := NewBufferedHandler(BufferedHandlerConfig{
-		Handler:       underlying,
-		BufferSize:    10,
-		FlushInterval: 0, // Disable auto-flush for this test
-	})
-	defer handler.Close()
-
-	// Log some events
-	for i := 0; i < 5; i++ {
-		err := handler.Log(Event{Action: ActionSet, Key: "KEY"})
-		if err != nil {
-			t.Errorf("Log() error = %v", err)
-		}
-	}
-
-	// Buffer should contain 5 events, not flushed yet
-	if len(ch) != 0 {
-		t.Errorf("expected 0 events in channel, got %d", len(ch))
-	}
-
-	// Manual flush
-	if err := handler.Flush(); err != nil {
-		t.Errorf("Flush() error = %v", err)
-	}
-
-	// Now we should have 5 events
-	if len(ch) != 5 {
-		t.Errorf("expected 5 events in channel, got %d", len(ch))
-	}
-}
-
-func TestBufferedHandler_AutoFlushOnFull(t *testing.T) {
-	ch := make(chan Event, 100)
-	underlying := NewChannelHandler(ch)
-
-	handler := NewBufferedHandler(BufferedHandlerConfig{
-		Handler:       underlying,
-		BufferSize:    5,
-		FlushInterval: 0, // Disable auto-flush
-	})
-	defer handler.Close()
-
-	// Log exactly BufferSize events
-	for i := 0; i < 5; i++ {
-		_ = handler.Log(Event{Action: ActionSet})
-	}
-
-	// Buffer should auto-flush when full
-	if len(ch) != 5 {
-		t.Errorf("expected 5 events after auto-flush, got %d", len(ch))
-	}
-}
-
-func TestBufferedHandler_CloseFlushes(t *testing.T) {
-	ch := make(chan Event, 100)
-	underlying := NewChannelHandler(ch)
-
-	handler := NewBufferedHandler(BufferedHandlerConfig{
-		Handler:       underlying,
-		BufferSize:    10,
-		FlushInterval: 0, // Disable auto-flush
-	})
-
-	// Log some events
-	for i := 0; i < 3; i++ {
-		_ = handler.Log(Event{Action: ActionSet})
-	}
-
-	// Close should flush remaining events
-	if err := handler.Close(); err != nil {
-		t.Errorf("Close() error = %v", err)
-	}
-
-	// All events should be flushed
-	if len(ch) != 3 {
-		t.Errorf("expected 3 events after close, got %d", len(ch))
-	}
-
-	// Second close should be idempotent
-	if err := handler.Close(); err != nil {
-		t.Errorf("Second Close() error = %v", err)
-	}
-}
-
-func TestBufferedHandler_TimeBasedFlush(t *testing.T) {
-	ch := make(chan Event, 100)
-	underlying := NewChannelHandler(ch)
-
-	handler := NewBufferedHandler(BufferedHandlerConfig{
-		Handler:       underlying,
-		BufferSize:    100, // Large buffer so time-based flush happens first
-		FlushInterval: 50 * time.Millisecond,
-	})
-	defer handler.Close()
-
-	// Log an event
-	_ = handler.Log(Event{Action: ActionSet})
-
-	// Event should not be flushed immediately
-	if len(ch) != 0 {
-		t.Errorf("expected 0 events immediately, got %d", len(ch))
-	}
-
-	// Wait for time-based flush
-	time.Sleep(100 * time.Millisecond)
-
-	// Event should be flushed now
-	if len(ch) != 1 {
-		t.Errorf("expected 1 event after time-based flush, got %d", len(ch))
-	}
-}
-
-func TestBufferedHandler_BufferLen(t *testing.T) {
-	underlying := NewNopHandler()
-	handler := NewBufferedHandler(BufferedHandlerConfig{
-		Handler:       underlying,
-		BufferSize:    10,
-		FlushInterval: 0,
-	})
-	defer handler.Close()
-
-	if handler.BufferLen() != 0 {
-		t.Errorf("initial BufferLen() = %d, want 0", handler.BufferLen())
-	}
-
-	_ = handler.Log(Event{Action: ActionSet})
-	_ = handler.Log(Event{Action: ActionSet})
-
-	if handler.BufferLen() != 2 {
-		t.Errorf("BufferLen() = %d, want 2", handler.BufferLen())
-	}
-
-	_ = handler.Flush()
-
-	if handler.BufferLen() != 0 {
-		t.Errorf("BufferLen() after flush = %d, want 0", handler.BufferLen())
-	}
-}
-
-func TestBufferedHandler_IsFull(t *testing.T) {
-	underlying := NewNopHandler()
-	handler := NewBufferedHandler(BufferedHandlerConfig{
-		Handler:       underlying,
-		BufferSize:    3,
-		FlushInterval: 0,
-	})
-	defer handler.Close()
-
-	if handler.IsFull() {
-		t.Error("IsFull() = true for empty buffer")
-	}
-
-	_ = handler.Log(Event{Action: ActionSet})
-	_ = handler.Log(Event{Action: ActionSet})
-
-	if handler.IsFull() {
-		t.Error("IsFull() = true for buffer with 2/3 events")
-	}
-
-	// This should trigger auto-flush
-	_ = handler.Log(Event{Action: ActionSet})
-
-	// After auto-flush, buffer should be empty
-	if handler.IsFull() {
-		t.Error("IsFull() = true after auto-flush")
-	}
-}
-
-func TestBufferedHandler_RequestFlush(t *testing.T) {
-	ch := make(chan Event, 100)
-	underlying := NewChannelHandler(ch)
-
-	handler := NewBufferedHandler(BufferedHandlerConfig{
-		Handler:       underlying,
-		BufferSize:    100,
-		FlushInterval: 10 * time.Minute, // Long interval, rely on RequestFlush
-	})
-	defer handler.Close()
-
-	_ = handler.Log(Event{Action: ActionSet})
-
-	// Request flush
-	handler.RequestFlush()
-
-	// Wait for flush to complete
-	time.Sleep(50 * time.Millisecond)
-
-	// Event should be flushed
-	if len(ch) != 1 {
-		t.Errorf("expected 1 event after RequestFlush, got %d", len(ch))
-	}
-}
-
-func TestBufferedHandler_OnError(t *testing.T) {
-	// Create a handler that always errors
-	errorHandler := &errorTestHandler{}
-
-	var capturedError error
-	handler := NewBufferedHandler(BufferedHandlerConfig{
-		Handler:    errorHandler,
-		BufferSize: 10,
-		OnError: func(err error) {
-			capturedError = err
-		},
-	})
-	defer handler.Close()
-
-	_ = handler.Log(Event{Action: ActionSet})
-	_ = handler.Flush()
-
-	if capturedError == nil {
-		t.Error("OnError should have been called")
-	}
-}
-
-// errorTestHandler always returns an error on Log
-type errorTestHandler struct{}
-
-func (h *errorTestHandler) Log(event Event) error {
-	return fmt.Errorf("test error")
-}
-
-func (h *errorTestHandler) Close() error {
-	return nil
-}
-
-// panicTestHandler panics on Log to verify recover protection in flushLoop.
+// panicTestHandler panics on Log to verify recover protection when the
+// auditor invokes a user-supplied handler.
 type panicTestHandler struct{}
 
 func (h *panicTestHandler) Log(event Event) error {
@@ -591,231 +361,54 @@ func (h *panicTestHandler) Close() error {
 	return nil
 }
 
-// TestBufferedHandler_FlushLoopPanicRecovery verifies that a panic in a
-// user-supplied handler during the background flushLoop goroutine does not
-// crash the process. The panic is recovered and reported via OnError.
-func TestBufferedHandler_FlushLoopPanicRecovery(t *testing.T) {
-	var (
-		mu       sync.Mutex
-		captured error
-	)
+// closePanicTestHandler panics on Close to verify recover protection when the
+// auditor or buffered handler closes a user-supplied handler.
+type closePanicTestHandler struct{}
 
-	handler := NewBufferedHandler(BufferedHandlerConfig{
-		Handler:       &panicTestHandler{},
-		BufferSize:    100,
-		FlushInterval: 20 * time.Millisecond,
-		OnError: func(err error) {
-			mu.Lock()
-			captured = err
-			mu.Unlock()
-		},
-	})
-
-	// Log an event so the background flush has something to flush.
-	_ = handler.Log(Event{Action: ActionSet})
-
-	// Wait for the background flush to trigger and the panic to be recovered.
-	deadline := time.After(2 * time.Second)
-	for {
-		mu.Lock()
-		done := captured != nil
-		mu.Unlock()
-		if done {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for panic recovery via OnError")
-		default:
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	// Close should still succeed — the goroutine is alive.
-	if err := handler.Close(); err != nil {
-		t.Errorf("Close() after panic recovery error = %v", err)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if !strings.Contains(captured.Error(), "panic during background flush") {
-		t.Errorf("OnError message = %q, want substring %q", captured.Error(), "panic during background flush")
-	}
+func (h *closePanicTestHandler) Log(event Event) error {
+	return nil
 }
 
-func TestBufferedHandler_Defaults(t *testing.T) {
-	// Test with minimal config
-	handler := NewBufferedHandler(BufferedHandlerConfig{
-		Handler: NewNopHandler(),
-	})
-	defer handler.Close()
-
-	// Should use default buffer size
-	if handler.size != DefaultBufferSize {
-		t.Errorf("buffer size = %d, want %d", handler.size, DefaultBufferSize)
-	}
-
-	// Should use default flush interval
-	if handler.interval != DefaultFlushInterval {
-		t.Errorf("flush interval = %v, want %v", handler.interval, DefaultFlushInterval)
-	}
+func (h *closePanicTestHandler) Close() error {
+	panic("simulated close panic")
 }
 
-func TestBufferedHandler_NilHandler(t *testing.T) {
-	// Should not panic with nil handler
-	handler := NewBufferedHandler(BufferedHandlerConfig{})
-	defer handler.Close()
+// TestAuditor_LogHandlerPanicRecovery verifies that a panic in a user-supplied
+// handler during a foreground Auditor.Log call is recovered and returned as an
+// error instead of crashing the process.
+func TestAuditor_LogHandlerPanicRecovery(t *testing.T) {
+	a := NewAuditor(&panicTestHandler{}, nil, nil, true)
 
-	// Should use NopHandler
-	err := handler.Log(Event{Action: ActionSet})
-	if err != nil {
-		t.Errorf("Log() error = %v", err)
-	}
-}
-
-func TestBufferedHandler_LogAfterClose(t *testing.T) {
-	handler := NewBufferedHandler(BufferedHandlerConfig{
-		Handler:       NewNopHandler(),
-		FlushInterval: 0,
-	})
-
-	_ = handler.Close()
-
-	// Should return error after close
-	err := handler.Log(Event{Action: ActionSet})
+	err := a.Log(ActionSet, "KEY", "test", true)
 	if err == nil {
-		t.Error("Log() after Close() should return error")
+		t.Fatal("Log() with panicking handler should return an error")
+	}
+	if !strings.Contains(err.Error(), "audit handler panicked") {
+		t.Errorf("Log() error = %q, want substring %q", err.Error(), "audit handler panicked")
+	}
+
+	// The auditor must remain usable after recovering.
+	if err := a.Log(ActionSet, "KEY", "test", true); err == nil {
+		t.Error("subsequent Log() should still report the panic as an error")
+	}
+	if err := a.Close(); err != nil {
+		t.Errorf("Close() error = %v, want nil", err)
 	}
 }
 
-func TestBufferedHandler_Concurrent(t *testing.T) {
-	ch := make(chan Event, 1000)
-	underlying := NewChannelHandler(ch)
+// TestAuditor_CloseHandlerPanicRecovery verifies that a panic in a
+// user-supplied handler during Auditor.Close is recovered and returned as an
+// error instead of crashing the process.
+func TestAuditor_CloseHandlerPanicRecovery(t *testing.T) {
+	a := NewAuditor(&closePanicTestHandler{}, nil, nil, true)
 
-	handler := NewBufferedHandler(BufferedHandlerConfig{
-		Handler:       underlying,
-		BufferSize:    50,
-		FlushInterval: 0,
-	})
-	defer handler.Close()
-
-	// Concurrent logging
-	done := make(chan bool)
-	for i := 0; i < 10; i++ {
-		go func() {
-			for j := 0; j < 10; j++ {
-				_ = handler.Log(Event{Action: ActionSet})
-			}
-			done <- true
-		}()
+	err := a.Close()
+	if err == nil {
+		t.Fatal("Close() with panicking handler should return an error")
 	}
-
-	// Wait for all goroutines
-	for i := 0; i < 10; i++ {
-		<-done
+	if !strings.Contains(err.Error(), "audit handler panicked during Close") {
+		t.Errorf("Close() error = %q, want substring %q", err.Error(), "audit handler panicked during Close")
 	}
-
-	// Final flush
-	_ = handler.Flush()
-
-	// Should have 100 events
-	if len(ch) != 100 {
-		t.Errorf("expected 100 events, got %d", len(ch))
-	}
-}
-
-// TestBufferedHandler_ConcurrentStressDuringFlush tests for race conditions
-// when concurrent Log() calls happen during buffer flush operations.
-// This validates the lock/unlock pattern in BufferedHandler.Log() is safe.
-func TestBufferedHandler_ConcurrentStressDuringFlush(t *testing.T) {
-	// Use a slow underlying handler to increase the chance of races during flush
-	slowHandler := &slowTestHandler{delay: time.Microsecond}
-
-	handler := NewBufferedHandler(BufferedHandlerConfig{
-		Handler:       slowHandler,
-		BufferSize:    10, // Small buffer to trigger frequent flushes
-		FlushInterval: 0,  // Manual flush only
-	})
-	defer handler.Close()
-
-	const (
-		numGoroutines = 20
-		eventsPerGoro = 50
-		totalEvents   = numGoroutines * eventsPerGoro
-	)
-
-	var wg sync.WaitGroup
-	var logErrors int64 // atomic counter for log errors
-	var flushErrors int64
-
-	// Start goroutines that continuously log events
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < eventsPerGoro; j++ {
-				if err := handler.Log(Event{
-					Action: ActionSet,
-					Key:    fmt.Sprintf("KEY_%d_%d", id, j),
-				}); err != nil {
-					// Log after close is expected, count but don't fail
-				}
-			}
-		}(i)
-	}
-
-	// Concurrently flush while logging
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 20; i++ {
-			time.Sleep(time.Microsecond * 100)
-			if err := handler.Flush(); err != nil {
-				// Flush after close is expected
-			}
-		}
-	}()
-
-	wg.Wait()
-
-	// Final flush to capture any remaining events
-	_ = handler.Flush()
-
-	// Verify all events were processed (logged to slow handler)
-	finalCount := slowHandler.Count()
-	if finalCount != totalEvents {
-		t.Errorf("expected %d events in slow handler, got %d", totalEvents, finalCount)
-	}
-
-	t.Logf("Stress test completed: %d events logged, %d log errors, %d flush errors",
-		finalCount, logErrors, flushErrors)
-}
-
-// slowTestHandler is a handler that introduces a delay to simulate slow I/O
-type slowTestHandler struct {
-	count int64
-	delay time.Duration
-}
-
-func (h *slowTestHandler) Log(event Event) error {
-	time.Sleep(h.delay)
-	// Use atomic to avoid race in counter
-	// Note: This is a test helper; the actual library code uses proper mutex protection
-	for {
-		old := atomic.LoadInt64(&h.count)
-		if atomic.CompareAndSwapInt64(&h.count, old, old+1) {
-			break
-		}
-	}
-	return nil
-}
-
-func (h *slowTestHandler) Close() error {
-	return nil
-}
-
-func (h *slowTestHandler) Count() int64 {
-	return atomic.LoadInt64(&h.count)
 }
 
 // ============================================================================
@@ -993,5 +586,40 @@ func TestCloseableChannelHandler_Concurrent(t *testing.T) {
 			t.Errorf("timeout waiting for events, received %d/100", count)
 			return
 		}
+	}
+}
+
+// TestAuditEventPool_Boundary covers the audit event pool's defensive paths:
+// nil puts are ignored, and a pool poisoned with an unexpected type falls
+// back to a fresh Event.
+func TestAuditEventPool_Boundary(t *testing.T) {
+	t.Run("nil event is ignored", func(t *testing.T) {
+		putAuditEvent(nil) // must not panic
+	})
+
+	t.Run("unexpected pool type falls back to a fresh event", func(t *testing.T) {
+		auditEventPool.Put(new(int)) // poison the pool with a foreign type
+		ev := getAuditEvent()
+		if ev == nil {
+			t.Fatal("getAuditEvent() = nil, want a fresh fallback Event")
+		}
+		putAuditEvent(ev) // restore a well-typed event to the pool
+	})
+}
+
+// TestCloseableChannelHandler_IsClosedStates covers both states of the
+// closed flag: false while open, true after Close.
+func TestCloseableChannelHandler_IsClosedStates(t *testing.T) {
+	handler := NewCloseableChannelHandler(1)
+	defer handler.Close()
+
+	if handler.IsClosed() {
+		t.Error("IsClosed() = true before Close(), want false")
+	}
+	if err := handler.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if !handler.IsClosed() {
+		t.Error("IsClosed() = false after Close(), want true")
 	}
 }

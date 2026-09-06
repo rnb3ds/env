@@ -4,6 +4,7 @@ package internal
 import (
 	"encoding"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -147,12 +148,16 @@ func StructInto(data map[string]string, val reflect.Value, prefix string) error 
 
 		// Handle nested structs
 		if field.Kind() == reflect.Struct {
-			// Only pass prefix to nested struct if this field has an explicit env tag.
-			// If no env tag, child fields use their full env tags directly.
-			nestedPrefix := ""
-			if tag != "" {
-				nestedPrefix = key
-			}
+			// Prefix nested fields with this field's key (tag or uppercased
+			// field name), accumulating the outer prefix — mirroring
+			// marshalStruct and the JSON/YAML flatteners so an untagged
+			// Inner{Host} round-trips through INNER_HOST in both directions.
+			// Regression: the prefix was previously passed only when the
+			// field had an explicit env tag and did not accumulate, so
+			// untagged nested structs looked up HOST and silently dropped the
+			// flattened value, and tagged multi-level nesting looked up
+			// I_HOST where marshal emits M_I_HOST.
+			nestedPrefix := buildPrefixedKey(prefix, key)
 			if err := StructInto(data, field, nestedPrefix); err != nil {
 				return err
 			}
@@ -166,11 +171,8 @@ func StructInto(data map[string]string, val reflect.Value, prefix string) error 
 				if field.IsNil() {
 					field.Set(reflect.New(field.Type().Elem()))
 				}
-				// Only pass prefix to nested struct if this field has an explicit env tag
-				nestedPrefix := ""
-				if tag != "" {
-					nestedPrefix = key
-				}
+				// Same prefix accumulation as the struct branch above.
+				nestedPrefix := buildPrefixedKey(prefix, key)
 				if err := StructInto(data, field.Elem(), nestedPrefix); err != nil {
 					return err
 				}
@@ -285,6 +287,22 @@ func valueToString(v reflect.Value) (string, error) {
 	}
 }
 
+// convError converts a strconv/time conversion error into a MarshalError
+// that does not echo the offending input value. Raw strconv and
+// time.ParseDuration errors embed the input in their message (e.g.
+// `strconv.ParseInt: parsing "<secret>": invalid syntax`), so returning
+// them from ParseInto/UnmarshalInto leaks the value into logs and error
+// reports whenever the caller prints the error (SEC-01, CWE-209).
+// The failure reason is preserved; the value is not.
+func convError(kind string, err error) error {
+	msg := "invalid " + kind + " value"
+	var ne *strconv.NumError
+	if errors.As(err, &ne) && ne.Err == strconv.ErrRange {
+		msg += ": value out of range"
+	}
+	return &MarshalError{Field: kind, Message: msg}
+}
+
 // setFieldValue sets a struct field from a string value.
 func setFieldValue(field reflect.Value, value string) error {
 	if value == "" && field.Kind() != reflect.String {
@@ -313,7 +331,7 @@ func setFieldValue(field reflect.Value, value string) error {
 	case reflect.Bool:
 		b, err := strconv.ParseBool(value)
 		if err != nil {
-			return err
+			return convError("boolean", err)
 		}
 		field.SetBool(b)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
@@ -321,26 +339,30 @@ func setFieldValue(field reflect.Value, value string) error {
 		if field.Type().String() == "time.Duration" {
 			d, err := time.ParseDuration(value)
 			if err != nil {
-				return err
+				return convError("duration", err)
 			}
 			field.SetInt(int64(d))
 			return nil
 		}
-		i, err := strconv.ParseInt(value, 10, 64)
+		// Parse with the field's actual bit width: reflect's SetInt converts
+		// like a C cast, so parsing at 64 bits would silently truncate
+		// out-of-range values (300 → 44 in an int8 field) instead of failing.
+		i, err := strconv.ParseInt(value, 10, field.Type().Bits())
 		if err != nil {
-			return err
+			return convError("integer", err)
 		}
 		field.SetInt(i)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		u, err := strconv.ParseUint(value, 10, 64)
+		// Same bit-width rule as the signed case (SetUint silently wraps).
+		u, err := strconv.ParseUint(value, 10, field.Type().Bits())
 		if err != nil {
-			return err
+			return convError("unsigned integer", err)
 		}
 		field.SetUint(u)
 	case reflect.Float32, reflect.Float64:
 		f, err := strconv.ParseFloat(value, 64)
 		if err != nil {
-			return err
+			return convError("float", err)
 		}
 		field.SetFloat(f)
 	case reflect.Slice:
@@ -372,27 +394,32 @@ func setSliceValue(field reflect.Value, value string) error {
 		case reflect.String:
 			slice.Index(i).SetString(part)
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			n, err := strconv.ParseInt(part, 10, 64)
+			// Bit width of the element type — parsing at the element's own
+			// width makes out-of-range values an error instead of a silent
+			// truncate on Set (same rationale as setFieldValue). Bits() is
+			// only valid for arithmetic types, so it must stay inside the
+			// numeric branches — calling it for []string panics.
+			n, err := strconv.ParseInt(part, 10, field.Type().Elem().Bits())
 			if err != nil {
-				return err
+				return convError("integer", err)
 			}
 			slice.Index(i).SetInt(n)
 		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			n, err := strconv.ParseUint(part, 10, 64)
+			n, err := strconv.ParseUint(part, 10, field.Type().Elem().Bits())
 			if err != nil {
-				return err
+				return convError("unsigned integer", err)
 			}
 			slice.Index(i).SetUint(n)
 		case reflect.Bool:
 			b, err := strconv.ParseBool(part)
 			if err != nil {
-				return err
+				return convError("boolean", err)
 			}
 			slice.Index(i).SetBool(b)
 		case reflect.Float32, reflect.Float64:
 			f, err := strconv.ParseFloat(part, 64)
 			if err != nil {
-				return err
+				return convError("float", err)
 			}
 			slice.Index(i).SetFloat(f)
 		default:

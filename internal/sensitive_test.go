@@ -188,3 +188,28 @@ func TestPatternsList(t *testing.T) {
 		}
 	}
 }
+
+// TestSanitizeForLog_NonASCIIAlignment verifies pattern indices stay aligned
+// with the original string when it contains non-ASCII characters whose
+// lowercased form has a different byte length. Regression test: matching ran
+// on a strings.ToLower copy, and characters like U+023A (2 bytes -> 3 bytes
+// lowercased) shifted the computed index past len(s), silently skipping the
+// replacement and leaking the secret.
+func TestSanitizeForLog_NonASCIIAlignment(t *testing.T) {
+	// U+023A (LATIN CAPITAL LETTER A WITH STROKE) grows under ToLower.
+	expand := strings.Repeat("Ⱥ", 20) + "password=supersecret tail"
+	if out := SanitizeForLog(expand); strings.Contains(out, "supersecret") {
+		t.Errorf("SanitizeForLog() leaked secret with length-expanding runes: %q", out)
+	}
+
+	// U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE) shrinks under ToLower.
+	shrink := strings.Repeat("İ", 20) + "token=abc123xyz more"
+	if out := SanitizeForLog(shrink); strings.Contains(out, "abc123xyz") {
+		t.Errorf("SanitizeForLog() leaked secret with length-shrinking runes: %q", out)
+	}
+
+	// Pure ASCII behavior is unchanged.
+	if out := SanitizeForLog("user=bob Password=hunter2"); !strings.Contains(out, "[MASKED]") || strings.Contains(out, "hunter2") {
+		t.Errorf("SanitizeForLog() = %q, want masked password", out)
+	}
+}

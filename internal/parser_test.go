@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestParseLine(t *testing.T) {
+func TestParseLineBytes(t *testing.T) {
 	v := NewValidator(ValidatorConfig{
 		MaxKeyLength:   64,
 		MaxValueLength: 1024,
@@ -86,22 +86,22 @@ func TestParseLine(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			key, value, err := lp.ParseLine(tt.line)
+			key, value, err := lp.ParseLineBytes([]byte(tt.line))
 			if (err != nil) != tt.wantErr {
-				t.Errorf("ParseLine() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("ParseLineBytes() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if key != tt.wantKey {
-				t.Errorf("ParseLine() key = %q, want %q", key, tt.wantKey)
+				t.Errorf("ParseLineBytes() key = %q, want %q", key, tt.wantKey)
 			}
 			if value != tt.wantValue {
-				t.Errorf("ParseLine() value = %q, want %q", value, tt.wantValue)
+				t.Errorf("ParseLineBytes() value = %q, want %q", value, tt.wantValue)
 			}
 		})
 	}
 }
 
-func TestParseDoubleQuoted(t *testing.T) {
+func TestParseDoubleQuotedBytes(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    string
@@ -153,129 +153,19 @@ func TestParseDoubleQuoted(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := ParseDoubleQuoted(tt.input)
+			result, err := ParseDoubleQuotedBytes([]byte(tt.input))
 			if (err != nil) != tt.wantErr {
-				t.Errorf("ParseDoubleQuoted() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("ParseDoubleQuotedBytes() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if result != tt.expected {
-				t.Errorf("ParseDoubleQuoted() = %q, want %q", result, tt.expected)
+				t.Errorf("ParseDoubleQuotedBytes() = %q, want %q", result, tt.expected)
 			}
 		})
 	}
 }
 
-func TestParseSingleQuoted(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-		wantErr  bool
-	}{
-		{
-			name:     "simple",
-			input:    `'hello world'`,
-			expected: "hello world",
-			wantErr:  false,
-		},
-		{
-			name:     "no escape processing",
-			input:    `'line1\nline2'`,
-			expected: "line1\\nline2",
-			wantErr:  false,
-		},
-		{
-			name:    "unclosed quote",
-			input:   `'unclosed`,
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := ParseSingleQuoted(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ParseSingleQuoted() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if result != tt.expected {
-				t.Errorf("ParseSingleQuoted() = %q, want %q", result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestTryParseYamlValue(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-		ok       bool
-	}{
-		{
-			name:     "boolean true",
-			input:    "true",
-			expected: "true",
-			ok:       true,
-		},
-		{
-			name:     "boolean false",
-			input:    "false",
-			expected: "false",
-			ok:       true,
-		},
-		{
-			name:     "null",
-			input:    "null",
-			expected: "",
-			ok:       true,
-		},
-		{
-			name:     "tilde null",
-			input:    "~",
-			expected: "",
-			ok:       true,
-		},
-		{
-			name:     "integer",
-			input:    "123",
-			expected: "123",
-			ok:       true,
-		},
-		{
-			name:     "float",
-			input:    "3.14",
-			expected: "3.14",
-			ok:       true,
-		},
-		{
-			name:     "negative number",
-			input:    "-42",
-			expected: "-42",
-			ok:       true,
-		},
-		{
-			name:     "regular string",
-			input:    "hello",
-			expected: "",
-			ok:       false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, ok := TryParseYamlValue(tt.input)
-			if ok != tt.ok {
-				t.Errorf("TryParseYamlValue() ok = %v, want %v", ok, tt.ok)
-			}
-			if result != tt.expected {
-				t.Errorf("TryParseYamlValue() = %q, want %q", result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestIsYamlNumber(t *testing.T) {
+func TestIsYamlNumberBytes(t *testing.T) {
 	tests := []struct {
 		input string
 		want  bool
@@ -294,27 +184,10 @@ func TestIsYamlNumber(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			if got := IsYamlNumber(tt.input); got != tt.want {
-				t.Errorf("IsYamlNumber(%q) = %v, want %v", tt.input, got, tt.want)
+			if got := IsYamlNumberBytes([]byte(tt.input)); got != tt.want {
+				t.Errorf("IsYamlNumberBytes(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestKeysToUpper(t *testing.T) {
-	input := map[string]string{
-		"key1": "value1",
-		"KEY2": "value2",
-		"Key3": "value3",
-	}
-
-	result := KeysToUpper(input)
-
-	// All keys should be uppercase
-	for key := range result {
-		if key != "KEY1" && key != "KEY2" && key != "KEY3" {
-			t.Errorf("unexpected key: %q", key)
-		}
 	}
 }
 
@@ -556,6 +429,8 @@ func TestParseSingleQuotedBytes(t *testing.T) {
 	}{
 		{"valid", "'hello'", "hello", false},
 		{"empty quotes", "''", "", false},
+		// Single-quoted values do not process escape sequences: \n stays literal.
+		{"no escape processing", `'line1\nline2'`, "line1\\nline2", false},
 		{"too short", "'", "", true},
 		{"missing closing quote", "'hello", "", true},
 	}

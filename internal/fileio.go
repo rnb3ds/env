@@ -2,75 +2,12 @@
 package internal
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 )
-
-// WriteFile writes content to a file using an atomic write pattern.
-// It writes to a temp file first, then renames for atomicity.
-func WriteFile(filename string, buf *bytes.Buffer) (err error) {
-	// Create parent directory if needed
-	dir := filepath.Dir(filename)
-	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return &FileError{Path: filename, Op: "mkdir", Err: err}
-		}
-	}
-
-	// Write to temp file first for atomic operation
-	tempFile := filename + ".tmp"
-
-	// Create with restricted permissions (0600 for sensitive env files)
-	file, err := os.OpenFile(tempFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		return &FileError{Path: filename, Op: "create", Err: err}
-	}
-
-	// Track whether file is still open for cleanup purposes
-	fileClosed := false
-
-	// Use named return parameter to ensure cleanup on error
-	defer func() {
-		if err != nil {
-			// Best effort cleanup on error - only close if still open
-			if !fileClosed {
-				_ = file.Close() /* best-effort cleanup; error not actionable */
-			}
-			_ = os.Remove(tempFile) /* best-effort cleanup; error not actionable */
-		}
-	}()
-
-	// Write content
-	if _, err = buf.WriteTo(file); err != nil {
-		return &FileError{Path: filename, Op: "write", Err: err}
-	}
-
-	// Ensure data is flushed to disk
-	if err = file.Sync(); err != nil {
-		return &FileError{Path: filename, Op: "sync", Err: err}
-	}
-
-	// Close before rename (required on Windows)
-	if closeErr := file.Close(); closeErr != nil {
-		err = closeErr
-		return &FileError{Path: filename, Op: "close", Err: closeErr}
-	}
-	fileClosed = true
-
-	// Atomic rename
-	if err = os.Rename(tempFile, filename); err != nil {
-		_ = os.Remove(tempFile) /* best-effort cleanup; error not actionable */
-		return &FileError{Path: filename, Op: "rename", Err: err}
-	}
-
-	return nil
-}
 
 // MarshalEnv converts a map to .env file format.
 func MarshalEnv(m map[string]string, sorted bool) (string, error) {
@@ -79,6 +16,11 @@ func MarshalEnv(m map[string]string, sorted bool) (string, error) {
 	// Calculate exact size needed to avoid grow calls
 	totalSize := 0
 	for k, v := range m {
+		// SECURITY (SEC-06): reject keys that cannot survive a re-parse
+		// before emitting anything.
+		if err := validateEnvKeyForMarshal(k); err != nil {
+			return "", err
+		}
 		keys = append(keys, k)
 		// key + '=' + escaped_value + '\n'
 		// Estimate escape overhead: special chars might double in size
@@ -183,14 +125,65 @@ func escapeValueToBuilder(buf *strings.Builder, value string) {
 	buf.WriteByte('"')
 }
 
-// EscapeValue escapes a value for .env file format.
-// This function uses pooled builder for efficiency.
-func EscapeValue(value string) string {
-	buf := GetBuilder()
-	defer PutBuilder(buf)
-	buf.Grow(len(value) + 10)
-	escapeValueToBuilder(buf, value)
-	return buf.String()
+// validateEnvKeyForMarshal reports whether key can be represented verbatim
+// in .env output. Keys are never escaped (the .env parser does not support
+// quoted keys), so a key that would change tokenization on re-parse must
+// fail the marshal instead of producing output that re-parses as different
+// — potentially attacker-chosen — lines (SEC-06, CWE-74).
+func validateEnvKeyForMarshal(key string) error {
+	if key == "" {
+		return &MarshalError{Field: "key", Message: "key cannot be empty"}
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if c < 0x20 || c == 0x7F {
+			return &MarshalError{Field: "key", Message: "key contains control characters and cannot be represented in .env output"}
+		}
+		if c == '=' || c == ':' {
+			return &MarshalError{Field: "key", Message: "key contains '=' or ':' and cannot be represented in .env output"}
+		}
+	}
+	if key[0] == '#' {
+		return &MarshalError{Field: "key", Message: "key starts with '#' and would be parsed as a comment"}
+	}
+	if strings.HasPrefix(key, "export ") {
+		return &MarshalError{Field: "key", Message: `key starts with "export " and would be stripped on re-parse`}
+	}
+	if key[0] == ' ' || key[len(key)-1] == ' ' {
+		return &MarshalError{Field: "key", Message: "key has leading or trailing whitespace, which would be trimmed on re-parse"}
+	}
+	return nil
+}
+
+// validateYAMLKeyForMarshal reports whether key can be represented verbatim
+// as an unquoted YAML mapping key. A key is rejected when it contains
+// control characters, a ':' that terminates the key token (followed by
+// whitespace or end of key), a comment-starting '#' (at the start or after
+// whitespace), an array-item prefix ("- "), or leading/trailing whitespace
+// that would be trimmed on re-parse (SEC-06, CWE-74).
+func validateYAMLKeyForMarshal(key string) error {
+	if key == "" {
+		return &MarshalError{Field: "key", Message: "key cannot be empty"}
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if c < 0x20 || c == 0x7F {
+			return &MarshalError{Field: "key", Message: "key contains control characters and cannot be represented in YAML output"}
+		}
+		if c == ':' && (i+1 == len(key) || key[i+1] == ' ' || key[i+1] == '\t') {
+			return &MarshalError{Field: "key", Message: "key contains ':' followed by whitespace or end of key and cannot be represented in YAML output"}
+		}
+		if c == '#' && (i == 0 || key[i-1] == ' ' || key[i-1] == '\t') {
+			return &MarshalError{Field: "key", Message: "key contains a comment-starting '#' and cannot be represented in YAML output"}
+		}
+	}
+	if key[0] == '-' && len(key) > 1 && key[1] == ' ' {
+		return &MarshalError{Field: "key", Message: `key starts with "- " and would be parsed as an array item`}
+	}
+	if key[0] == ' ' || key[len(key)-1] == ' ' {
+		return &MarshalError{Field: "key", Message: "key has leading or trailing whitespace, which would be trimmed on re-parse"}
+	}
+	return nil
 }
 
 // MarshalFormat represents the output format for marshaling.
@@ -325,6 +318,14 @@ func marshalToYAML(m map[string]string, sorted bool) (string, error) {
 		return "", nil
 	}
 
+	// SECURITY (SEC-06): reject keys that cannot survive a re-parse before
+	// emitting anything.
+	for k := range m {
+		if err := validateYAMLKeyForMarshal(k); err != nil {
+			return "", err
+		}
+	}
+
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
@@ -364,8 +365,19 @@ func escapeYAMLValue(value string) string {
 		}
 	}
 
-	// Also quote if it starts with special characters
-	if len(value) > 0 && (value[0] == ' ' || value[0] == '\t' || value[0] == '-' || value[0] == '*') {
+	// Quote scalars the YAML reader would type-coerce on the way back in
+	// (null/~/true/false/numbers), so Marshal→Unmarshal round-trips unchanged.
+	if EqualFoldASCII(value, "true") || EqualFoldASCII(value, "false") ||
+		value == "null" || value == "~" || looksLikeNumber(value) {
+		needsQuoting = true
+	}
+
+	// Also quote if it starts or ends with special characters. Leading/trailing
+	// whitespace is stripped from plain-style scalars, so quoting is required
+	// for the value to survive a round trip.
+	last := len(value) - 1
+	if value[0] == ' ' || value[0] == '\t' || value[0] == '-' || value[0] == '*' ||
+		value[last] == ' ' || value[last] == '\t' {
 		needsQuoting = true
 	}
 

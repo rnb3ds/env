@@ -134,7 +134,8 @@ func IsMemoryLockSupported() bool {
 	return memLockConfig.supported
 }
 
-// The following functions are implemented by platform-specific files:
-// - memLockSupported() bool - Returns true if platform supports memory locking
-// - lockMemory(data []byte) error - Locks memory to prevent swapping
-// - unlockMemory(data []byte) - Unlocks previously locked memory
+// The platform primitives live in the internal package (mlock_unix.go,
+// mlock_windows.go, mlock_other.go):
+// - internal.MemLockSupported() bool - Reports platform support
+// - internal.LockMemory(data []byte) error - Locks memory to prevent swapping
+// - internal.UnlockMemory(data []byte) - Unlocks previously locked memory

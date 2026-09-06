@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -187,6 +188,35 @@ func TestExtractNumericIndex(t *testing.T) {
 			if gotBase != tt.wantBase || gotIndex != tt.wantIndex || gotOK != tt.wantOK {
 				t.Errorf("ExtractNumericIndex(%q) = (%q, %d, %v), want (%q, %d, %v)",
 					tt.path, gotBase, gotIndex, gotOK, tt.wantBase, tt.wantIndex, tt.wantOK)
+			}
+		})
+	}
+}
+
+// TestResolvePath_HardMaxKeyLength pins the memory-exhaustion guard: paths
+// longer than HardMaxKeyLength resolve to no candidates.
+func TestResolvePath_HardMaxKeyLength(t *testing.T) {
+	if got := ResolvePath(strings.Repeat("A", HardMaxKeyLength+1)); got != nil {
+		t.Errorf("ResolvePath(overlong path) = %v, want nil", got)
+	}
+}
+
+// TestExtractNumericIndex_OverflowBranches covers the two integer-overflow
+// guards: digit strings longer than the 10-digit length cap, and values that
+// exceed maxSafeIndex during accumulation.
+func TestExtractNumericIndex_OverflowBranches(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+	}{
+		{"eleven-digit index exceeds length cap", "KEY.12345678901"},
+		{"ten digits above maxSafeIndex", "KEY.9999999999"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			basePath, index, ok := ExtractNumericIndex(tt.in)
+			if ok || index != -1 || basePath != "" {
+				t.Errorf("ExtractNumericIndex(%q) = (%q, %d, %v), want (\"\", -1, false)", tt.in, basePath, index, ok)
 			}
 		})
 	}

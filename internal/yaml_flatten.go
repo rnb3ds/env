@@ -3,6 +3,7 @@ package internal
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 )
@@ -77,16 +78,33 @@ func flattenYAMLValue(value *Value, prefix string, cfg YAMLFlattenConfig, result
 		if prefix == "" {
 			return nil
 		}
+		if value.Quoted {
+			// Quoted scalars are always strings per YAML semantics: no inline
+			// JSON parsing, no null/bool/number coercion, and interior
+			// whitespace (including trailing) is significant. This is also
+			// what makes Marshal→Unmarshal round trips lossless.
+			result[prefix] = value.Scalar
+			return nil
+		}
 		// Check for inline JSON array or object
 		scalar := TrimSpace(value.Scalar)
 		if len(scalar) >= 2 {
 			if (scalar[0] == '[' && scalar[len(scalar)-1] == ']') ||
 				(scalar[0] == '{' && scalar[len(scalar)-1] == '}') {
-				// Try to parse as inline JSON
-				if err := flattenInlineJSON(scalar, prefix, cfg, result, depth); err == nil {
+				// Try to parse as inline JSON. A syntax failure falls back to
+				// treating the text as a plain scalar (lenient recovery), but
+				// depth-limit errors must propagate: swallowing them made the
+				// MaxDepth boundary advisory-only — a depth hit silently
+				// stored the raw scalar instead of erroring.
+				if err := flattenInlineJSON(scalar, prefix, cfg, result, depth); err != nil {
+					var depthErr *YAMLError
+					if errors.As(err, &depthErr) {
+						return err
+					}
+					// Not valid inline JSON (syntax): fall through to regular scalar
+				} else {
 					return nil
 				}
-				// If parsing fails, fall through to treat as regular scalar
 			}
 		}
 		result[prefix] = convertYAMLScalar(value.Scalar, cfg)
@@ -204,72 +222,35 @@ func looksLikeNumber(s string) bool {
 }
 
 // buildYAMLKey constructs a key from prefix and key parts.
-// Uses direct concatenation for the common case (short keys) to avoid pool overhead.
+// Delegates to the shared flattener key builder (see flatten_keys.go).
 func buildYAMLKey(prefix, key string, cfg YAMLFlattenConfig) string {
-	key = ToUpperASCII(key)
-	if prefix == "" {
-		return key
-	}
-	// For the common case of short keys, direct concatenation is faster
-	// than pool Get/Put overhead. The pool is beneficial only for very long keys.
-	totalLen := len(prefix) + len(cfg.KeyDelimiter) + len(key)
-	if totalLen <= 64 {
-		return prefix + cfg.KeyDelimiter + key
-	}
-	sb := GetBuilder()
-	defer PutBuilder(sb)
-	sb.Grow(totalLen)
-	sb.WriteString(prefix)
-	sb.WriteString(cfg.KeyDelimiter)
-	sb.WriteString(key)
-	return sb.String()
+	return buildFlatKey(prefix, key, cfg.KeyDelimiter)
 }
 
 // buildYAMLArrayIndex constructs a key for array elements.
-// Uses direct concatenation for short keys to avoid pool overhead.
+// Delegates to the shared flattener key builder (see flatten_keys.go).
 func buildYAMLArrayIndex(prefix string, index int, cfg YAMLFlattenConfig) string {
-	indexStr := strconv.Itoa(index)
-
-	switch cfg.ArrayIndexFormat {
-	case "bracket":
-		// prefix[index] format
-		totalLen := len(prefix) + 1 + len(indexStr) + 1
-		if totalLen <= 64 {
-			return prefix + "[" + indexStr + "]"
-		}
-		sb := GetBuilder()
-		defer PutBuilder(sb)
-		sb.Grow(totalLen)
-		sb.WriteString(prefix)
-		sb.WriteByte('[')
-		sb.WriteString(indexStr)
-		sb.WriteByte(']')
-		return sb.String()
-	default: // underscore
-		// prefix_index format
-		totalLen := len(prefix) + len(cfg.KeyDelimiter) + len(indexStr)
-		if totalLen <= 64 {
-			return prefix + cfg.KeyDelimiter + indexStr
-		}
-		sb := GetBuilder()
-		defer PutBuilder(sb)
-		sb.Grow(totalLen)
-		sb.WriteString(prefix)
-		sb.WriteString(cfg.KeyDelimiter)
-		sb.WriteString(indexStr)
-		return sb.String()
-	}
+	return buildFlatArrayIndex(prefix, index, cfg.KeyDelimiter, cfg.ArrayIndexFormat)
 }
 
 // flattenInlineJSON parses and flattens inline JSON arrays or objects within YAML.
 func flattenInlineJSON(jsonStr, prefix string, cfg YAMLFlattenConfig, result map[string]string, depth int) error {
-	// SECURITY: Pre-validate JSON nesting depth to prevent excessive memory
-	// allocation during json.Unmarshal. Shares the same bracket-scanning logic
-	// as the standalone JSON path (see nestingDepthExceeded in json_flatten.go).
-	if nestingDepthExceeded([]byte(jsonStr), depth, cfg.MaxDepth) {
+	// SECURITY: Pre-validate JSON nesting depth and node count to prevent
+	// excessive memory allocation during json.Unmarshal. Shares the same
+	// scanning logic as the standalone JSON path (see scanJSONLimits in
+	// json_flatten.go). Both violations propagate as *YAMLError so the
+	// caller treats them as hard errors, not syntax-recovery fallbacks.
+	depthExceeded, nodesExceeded := scanJSONLimits([]byte(jsonStr), depth, cfg.MaxDepth, HardMaxJSONNodes)
+	if depthExceeded {
 		return &YAMLError{
 			Path:    prefix,
 			Message: fmt.Sprintf("maximum nesting depth exceeded (%d)", cfg.MaxDepth),
+		}
+	}
+	if nodesExceeded {
+		return &YAMLError{
+			Path:    prefix,
+			Message: fmt.Sprintf("maximum node count exceeded (%d)", HardMaxJSONNodes),
 		}
 	}
 
@@ -323,11 +304,9 @@ func flattenInlineValue(value interface{}, prefix string, cfg YAMLFlattenConfig,
 			result[prefix] = "null"
 		}
 	case bool:
-		if cfg.BoolAsString {
-			result[prefix] = strconv.FormatBool(v)
-		} else {
-			result[prefix] = fmt.Sprintf("%t", v)
-		}
+		// BoolAsString does not apply here: a decoded JSON bool has no raw
+		// text to preserve, so both settings render the canonical form.
+		result[prefix] = strconv.FormatBool(v)
 	case float64:
 		if cfg.NumberAsString {
 			if v == float64(int64(v)) {

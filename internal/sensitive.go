@@ -169,6 +169,40 @@ func containsIgnoreCase(s, pattern string) bool {
 	return false
 }
 
+// indexFoldASCII returns the byte offset of the first case-insensitive ASCII
+// occurrence of pattern (which must be lowercase ASCII) in s at or after from,
+// or -1 if there is none. Matching runs directly on s, so the returned index
+// is always a valid index into the ORIGINAL string — unlike an index computed
+// on a strings.ToLower copy, which can be misaligned when non-ASCII runes
+// change length when lowercased. Non-ASCII bytes in s never match.
+func indexFoldASCII(s, pattern string, from int) int {
+	patternLen := len(pattern)
+	if from < 0 {
+		from = 0
+	}
+	for i := from; i+patternLen <= len(s); i++ {
+		match := true
+		for j := 0; j < patternLen; j++ {
+			c := s[i+j]
+			if c >= 0x80 {
+				match = false
+				break
+			}
+			if c >= 'A' && c <= 'Z' {
+				c += 32
+			}
+			if c != pattern[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
 // maxValueDisplayLen is the maximum length of non-sensitive values displayed in logs.
 const maxValueDisplayLen = 20
 
@@ -190,26 +224,33 @@ func MaskKey(key string) string {
 }
 
 // MaskInString masks potentially sensitive content in a string.
+// Long strings are truncated to 50 characters, then key=value style secrets
+// are masked via SanitizeForLog — truncation alone let "password=..." pairs
+// through unmasked (SEC-04), leaving raw secrets in ValidationError.Value
+// and ParseError.Content fields that Error() does not print but callers can
+// still inspect via errors.As.
 func MaskInString(s string) string {
 	const maxLen = 50
 	if len(s) > maxLen {
-		return s[:maxLen-3] + "..."
+		s = s[:maxLen-3] + "..."
 	}
-	return s
+	return SanitizeForLog(s)
 }
 
 // SanitizeForLog removes potentially sensitive information from a string.
 // It scans for patterns that might indicate sensitive data and masks them.
 //
-// Performance: Uses single-pass scanning with strings.Builder to avoid
-// O(n*m) complexity from multiple string scans and allocations.
+// SECURITY: Pattern matching operates directly on the original bytes via
+// indexFoldASCII. It must NOT precompute strings.ToLower(s) and reuse those
+// indices: ToLower can change the byte length of non-ASCII input (e.g. U+023A
+// expands from 2 to 3 bytes when lowercased), so indices derived from the
+// lowercased copy point into the wrong region of the original string — and
+// when they run past len(s), the replacement is silently skipped and the
+// secret passes through unmasked.
 func SanitizeForLog(s string) string {
 	if len(s) == 0 {
 		return s
 	}
-
-	// Convert to lowercase for pattern matching
-	lowerS := strings.ToLower(s)
 
 	// Find all replacements needed (pattern end position -> mask position)
 	// Use a slice of structs to avoid map allocation for small number of matches
@@ -219,17 +260,16 @@ func SanitizeForLog(s string) string {
 	}
 	var replacements []replacement
 
-	// Single pass: find all pattern matches
+	// Find all pattern matches
 	for _, pattern := range sanitizePatterns {
 		patternLen := len(pattern)
 		searchStart := 0
 
 		for {
-			idx := strings.Index(lowerS[searchStart:], pattern)
+			idx := indexFoldASCII(s, pattern, searchStart)
 			if idx == -1 {
 				break
 			}
-			idx += searchStart // Adjust to absolute position
 
 			// Find the value after the pattern
 			valueStart := idx + patternLen
@@ -246,7 +286,7 @@ func SanitizeForLog(s string) string {
 
 			// Continue searching after this match
 			searchStart = valueStart + 1
-			if searchStart >= len(lowerS) {
+			if searchStart >= len(s) {
 				break
 			}
 		}

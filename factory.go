@@ -117,6 +117,15 @@ func (c *Config) buildComponentFactoryWithFS(fs FileSystem) *ComponentFactory {
 	lookup := func(key string) (string, bool) {
 		return fs.LookupEnv(key)
 	}
+	// SECURITY (SEC-03): in file-only scope the expander must not fall back
+	// to the process environment — a less-trusted config file could
+	// otherwise capture unrelated process secrets (${AWS_SECRET_...}) into
+	// values that are later logged or persisted. A nil Lookup makes
+	// NewExpander substitute an always-unset lookup; ExpandAllInMap still
+	// resolves file-local variables from the parsed map before consulting it.
+	if c.ExpansionScope == ExpansionFileOnly {
+		lookup = nil
+	}
 
 	// Start with pre-computed default forbidden keys
 	forbiddenKeys := make([]string, 0, len(defaultForbiddenKeysSlice)+len(c.ForbiddenKeys))

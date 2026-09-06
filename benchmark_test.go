@@ -192,7 +192,9 @@ func BenchmarkLoader_Get(b *testing.B) {
 	keys := make([]string, 100)
 	for i := 0; i < 100; i++ {
 		keys[i] = fmt.Sprintf("VAR_%d", i)
-		loader.Set(keys[i], fmt.Sprintf("value_%d", i))
+		if err := loader.Set(keys[i], fmt.Sprintf("value_%d", i)); err != nil {
+			b.Fatal(err)
+		}
 	}
 
 	b.ResetTimer()
@@ -213,7 +215,9 @@ func BenchmarkLoader_Lookup(b *testing.B) {
 	keys := make([]string, 100)
 	for i := 0; i < 100; i++ {
 		keys[i] = fmt.Sprintf("VAR_%d", i)
-		loader.Set(keys[i], fmt.Sprintf("value_%d", i))
+		if err := loader.Set(keys[i], fmt.Sprintf("value_%d", i)); err != nil {
+			b.Fatal(err)
+		}
 	}
 
 	b.ResetTimer()
@@ -237,12 +241,14 @@ func BenchmarkLoader_Set(b *testing.B) {
 	for i := 0; i < 100; i++ {
 		keys[i] = fmt.Sprintf("VAR_%d", i)
 		values[i] = fmt.Sprintf("value_%d", i)
-		loader.Set(keys[i], values[i])
+		if err := loader.Set(keys[i], values[i]); err != nil {
+			b.Fatal(err)
+		}
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		loader.Set(keys[i%100], values[i%100])
+		_ = loader.Set(keys[i%100], values[i%100]) // hot loop; valid keys cannot fail
 	}
 }
 
@@ -266,7 +272,7 @@ func BenchmarkLineParser_SimpleLine(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		lp.ParseLineBytes(line)
+		_, _, _ = lp.ParseLineBytes(line) // benchmark measures the call; result unused
 	}
 }
 
@@ -286,7 +292,7 @@ func BenchmarkLineParser_QuotedValue(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		lp.ParseLineBytes(line)
+		_, _, _ = lp.ParseLineBytes(line) // benchmark measures the call; result unused
 	}
 }
 
@@ -306,7 +312,7 @@ func BenchmarkLineParser_WithExport(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		lp.ParseLineBytes(line)
+		_, _, _ = lp.ParseLineBytes(line) // benchmark measures the call; result unused
 	}
 }
 
@@ -324,7 +330,7 @@ func BenchmarkExpander_NoVariables(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		expander.Expand(input)
+		_, _ = expander.Expand(input) // benchmark measures the call; result unused
 	}
 }
 
@@ -338,7 +344,7 @@ func BenchmarkExpander_SingleVariable(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		expander.Expand(input)
+		_, _ = expander.Expand(input) // benchmark measures the call; result unused
 	}
 }
 
@@ -352,7 +358,7 @@ func BenchmarkExpander_BracedVariable(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		expander.Expand(input)
+		_, _ = expander.Expand(input) // benchmark measures the call; result unused
 	}
 }
 
@@ -377,7 +383,7 @@ func BenchmarkExpander_MultipleVariables(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		expander.Expand(input)
+		_, _ = expander.Expand(input) // benchmark measures the call; result unused
 	}
 }
 
@@ -391,7 +397,7 @@ func BenchmarkExpander_WithDefault(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		expander.Expand(input)
+		_, _ = expander.Expand(input) // benchmark measures the call; result unused
 	}
 }
 
@@ -484,7 +490,7 @@ func BenchmarkSecureMap_SetAll(b *testing.B) {
 // Key Interning Benchmarks
 // ============================================================================
 
-func BenchmarkInternKey_New(b *testing.B) {
+func BenchmarkInternKeyBytes_New(b *testing.B) {
 	// Clear cache first
 	internal.ClearInternCache()
 
@@ -492,28 +498,31 @@ func BenchmarkInternKey_New(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// Use different keys to avoid cache hits
 		key := fmt.Sprintf("KEY_%d", i)
-		internal.InternKey(key)
+		internal.InternKeyBytes([]byte(key))
 	}
 }
 
-func BenchmarkInternKey_Cached(b *testing.B) {
+// BenchmarkInternKeyBytes_CachedFromStrings measures the cached interning path
+// for keys built as strings (then converted) — contrast with
+// BenchmarkInternKeyBytes_Cached below, which interns pre-built byte slices.
+func BenchmarkInternKeyBytes_CachedFromStrings(b *testing.B) {
 	// Clear cache and pre-populate
 	internal.ClearInternCache()
 	for i := 0; i < 100; i++ {
-		internal.InternKey(fmt.Sprintf("KEY_%d", i))
+		internal.InternKeyBytes([]byte(fmt.Sprintf("KEY_%d", i)))
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("KEY_%d", i%100)
-		internal.InternKey(key)
+		internal.InternKeyBytes([]byte(key))
 	}
 }
 
 // BenchmarkInternKeyBytes_Cached measures the byte-slice interning path used by
 // the parser (keys arrive as []byte from the scanner buffer). On a cache hit it
-// allocates nothing, unlike InternKey(string(b)) which allocates a temporary
-// string on every call.
+// allocates nothing, unlike interning a freshly-built string, which allocates
+// a temporary string on every call.
 func BenchmarkInternKeyBytes_Cached(b *testing.B) {
 	internal.ClearInternCache()
 	keys := make([][]byte, 100)
@@ -573,7 +582,7 @@ func BenchmarkParseDoubleQuoted_NoEscape(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		internal.ParseDoubleQuotedBytes(input)
+		_, _ = internal.ParseDoubleQuotedBytes(input) // benchmark measures the call; result unused
 	}
 }
 
@@ -582,7 +591,7 @@ func BenchmarkParseDoubleQuoted_WithEscape(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		internal.ParseDoubleQuotedBytes(input)
+		_, _ = internal.ParseDoubleQuotedBytes(input) // benchmark measures the call; result unused
 	}
 }
 
@@ -596,7 +605,7 @@ func BenchmarkScannerBuffer(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		reader.Seek(0, 0)
+		_, _ = reader.Seek(0, 0)
 		buf := make([]byte, 64*1024)
 		scanner := bytes.NewReader(buf)
 		_, _ = scanner.ReadAt(buf, 0)
@@ -620,7 +629,9 @@ func BenchmarkLoader_ConcurrentGet(b *testing.B) {
 	for i := 0; i < 100; i++ {
 		key := fmt.Sprintf("VAR_%d", i)
 		keys[i] = key
-		loader.Set(key, "value")
+		if err := loader.Set(key, "value"); err != nil {
+			b.Fatal(err)
+		}
 	}
 
 	b.ResetTimer()
@@ -766,7 +777,7 @@ func BenchmarkLoader_ConcurrentSet(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		i := 0
 		for pb.Next() {
-			loader.Set(keys[i%100], "value")
+			_ = loader.Set(keys[i%100], "value") // hot loop; valid keys cannot fail
 			i++
 		}
 	})
@@ -788,7 +799,7 @@ func BenchmarkExpander_SingleVariable_Leaf(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		expander.Expand(input)
+		_, _ = expander.Expand(input) // benchmark measures the call; result unused
 	}
 }
 
@@ -804,7 +815,7 @@ func BenchmarkExpander_BracedVariable_Leaf(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		expander.Expand(input)
+		_, _ = expander.Expand(input) // benchmark measures the call; result unused
 	}
 }
 
@@ -870,7 +881,7 @@ func BenchmarkYAMLConvertScalar(b *testing.B) {
 		b.Run(tt.name, func(b *testing.B) {
 			// Access internal FlattenYAML to test the full path including convertYAMLScalar
 			for i := 0; i < b.N; i++ {
-				internal.FlattenYAML(
+				_, _ = internal.FlattenYAML( // benchmark measures the call; result unused
 					internal.NewScalarValue(tt.value, 1, 1),
 					cfg,
 				)

@@ -363,26 +363,42 @@ func TestExpansionError_Message(t *testing.T) {
 }
 
 func TestLineParserExpandAll(t *testing.T) {
-	v := NewValidator(ValidatorConfig{MaxKeyLength: 64, MaxValueLength: 1024})
-	a := NewAuditor(nil, nil, nil, false)
-	e := NewExpander(ExpanderConfig{
-		MaxDepth: 5,
-		Lookup: func(key string) (string, bool) {
-			vars := map[string]string{"BASE": "value"}
-			v, ok := vars[key]
-			return v, ok
-		},
-		Mode: ModeAll,
+	newParser := func(vars map[string]string) *LineParser {
+		v := NewValidator(ValidatorConfig{MaxKeyLength: 64, MaxValueLength: 1024})
+		a := NewAuditor(nil, nil, nil, false)
+		e := NewExpander(ExpanderConfig{
+			MaxDepth: 5,
+			Lookup: func(key string) (string, bool) {
+				val, ok := vars[key]
+				return val, ok
+			},
+			Mode: ModeAll,
+		})
+		return NewLineParser(LineParserConfig{ExpandVariables: true}, v, a, e)
+	}
+
+	t.Run("expands variables in map", func(t *testing.T) {
+		lp := newParser(map[string]string{"BASE": "value"})
+		result, err := lp.ExpandAll(map[string]string{"KEY": "$BASE"})
+		if err != nil {
+			t.Fatalf("ExpandAll() error = %v", err)
+		}
+		if result["KEY"] != "value" {
+			t.Errorf("ExpandAll() = %v, want KEY=value", result)
+		}
 	})
 
-	lp := NewLineParser(LineParserConfig{ExpandVariables: true}, v, a, e)
-	result, err := lp.ExpandAll(map[string]string{"KEY": "$BASE"})
-	if err != nil {
-		t.Errorf("ExpandAll() error = %v", err)
-	}
-	if result["KEY"] != "value" {
-		t.Errorf("ExpandAll() = %v, want KEY=value", result)
-	}
+	t.Run("cycle detection returns expansion error", func(t *testing.T) {
+		lp := newParser(map[string]string{"A": "$B", "B": "$A"})
+		_, err := lp.ExpandAll(map[string]string{"A": "$B", "B": "$A"})
+		if err == nil {
+			t.Fatal("ExpandAll() expected cycle detection error, got nil")
+		}
+		var expErr *ExpansionError
+		if !errors.As(err, &expErr) {
+			t.Errorf("error type = %T, want *ExpansionError", err)
+		}
+	})
 }
 
 func TestExpandAllInMap(t *testing.T) {
@@ -505,6 +521,146 @@ func TestBuildChain_MasksSensitiveKeys(t *testing.T) {
 			}
 			if tt.shouldNotContain != "" && strings.Contains(chain, tt.shouldNotContain) {
 				t.Errorf("buildChain() = %q, should NOT contain %q", chain, tt.shouldNotContain)
+			}
+		})
+	}
+}
+
+// TestExpand_SingleVarPreservesLiteralSuffix verifies the single-variable fast
+// paths keep any literal suffix after the reference. Regression test: the fast
+// paths returned "" for the whole string when the variable was unset (or the
+// key invalid / braces empty), silently dropping text the general path
+// (multiple references) preserves — "$FOO bar" with FOO unset must expand to
+// " bar", not "".
+func TestExpand_SingleVarPreservesLiteralSuffix(t *testing.T) {
+	unset := NewExpander(ExpanderConfig{
+		MaxDepth: 5,
+		Mode:     ModeAll,
+		Lookup:   func(string) (string, bool) { return "", false },
+	})
+	set := NewExpander(ExpanderConfig{
+		MaxDepth: 5,
+		Mode:     ModeAll,
+		Lookup: func(k string) (string, bool) {
+			if k == "FOO" {
+				return "v", true
+			}
+			return "", false
+		},
+	})
+
+	tests := []struct {
+		name    string
+		e       *Expander
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{"unset $VAR with suffix", unset, "$FOO bar", " bar", false},
+		{"unset ${VAR} with suffix", unset, "${FOO} bar", " bar", false},
+		{"unset $VAR whole string", unset, "$FOO", "", false},
+		{"unset ${VAR} whole string", unset, "${FOO}", "", false},
+		{"invalid key with suffix", unset, "${1BAD} tail", "${1BAD} tail", false},
+		{"empty braces with suffix", unset, "${} tail", "{} tail", false},
+		{"set $VAR with suffix", set, "$FOO bar", "v bar", false},
+		{"default with suffix", unset, "${BAZ:-def} tail", "def tail", false},
+		{"general path consistency", unset, "$FOO bar$X", " bar", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.e.Expand(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Expand() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("Expand(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestExpander_RequiredOperatorExpandsValue pins the ${VAR:?msg} semantics for
+// the set case: the value must be recursively expanded like the plain ${VAR}
+// path. Regression: the branch previously returned the raw value, so with
+// HOST=$BASE the reference ${HOST:?required} expanded to the literal "$BASE".
+func TestExpander_RequiredOperatorExpandsValue(t *testing.T) {
+	lookup := func(key string) (string, bool) {
+		vars := map[string]string{"HOST": "$BASE", "BASE": "example.com"}
+		v, ok := vars[key]
+		return v, ok
+	}
+	exp := NewExpander(ExpanderConfig{MaxDepth: 5, Lookup: lookup, Mode: ModeAll})
+
+	// General path: reference with a literal suffix.
+	got, err := exp.Expand("${HOST:?required}/x")
+	if err != nil {
+		t.Fatalf("Expand() error = %v", err)
+	}
+	if got != "example.com/x" {
+		t.Errorf("Expand(${HOST:?required}/x) = %q, want %q", got, "example.com/x")
+	}
+
+	// Fast path: the reference is the entire input.
+	got, err = exp.Expand("${HOST:?required}")
+	if err != nil {
+		t.Fatalf("Expand() error = %v", err)
+	}
+	if got != "example.com" {
+		t.Errorf("Expand(${HOST:?required}) = %q, want %q", got, "example.com")
+	}
+
+	// Plain ${VAR} path for parity.
+	got, err = exp.Expand("${HOST}/x")
+	if err != nil {
+		t.Fatalf("Expand() error = %v", err)
+	}
+	if got != "example.com/x" {
+		t.Errorf("Expand(${HOST}/x) = %q, want %q", got, "example.com/x")
+	}
+}
+
+// TestExpander_RequiredOperatorCycle verifies that mutually required variables
+// (A="${B:?}", B="${A:?}") surface a cycle error instead of recursing until
+// the depth limit.
+func TestExpander_RequiredOperatorCycle(t *testing.T) {
+	lookup := func(key string) (string, bool) {
+		vars := map[string]string{"A": "${B:?}", "B": "${A:?}"}
+		v, ok := vars[key]
+		return v, ok
+	}
+	exp := NewExpander(ExpanderConfig{MaxDepth: 5, Lookup: lookup, Mode: ModeAll})
+	if _, err := exp.Expand("${A:?required}"); err == nil {
+		t.Error("expected cycle error for mutually-required variables, got nil")
+	}
+}
+
+// TestExpander_DollarEdgeCases pins the lexer edge cases of variable
+// references: an escaped dollar ($$) and a lone/trailing dollar that has no
+// name to expand must survive expansion unchanged.
+func TestExpander_DollarEdgeCases(t *testing.T) {
+	lookup := func(key string) (string, bool) { return "", false }
+	exp := NewExpander(ExpanderConfig{MaxDepth: 5, Lookup: lookup, Mode: ModeAll})
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"escaped dollar", "cost: $$5", "cost: $5"},
+		{"lone dollar", "$", "$"},
+		{"trailing dollar", "value$", "value$"},
+		{"double dollar alone", "$$", "$"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := exp.Expand(tt.input)
+			if err != nil {
+				t.Fatalf("Expand(%q) error = %v", tt.input, err)
+			}
+			if got != tt.want {
+				t.Errorf("Expand(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
 	}

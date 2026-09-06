@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -64,81 +65,6 @@ func TestIsValidJSONKey(t *testing.T) {
 	}
 }
 
-func TestToUpperASCIISafe(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-		wantErr  bool
-	}{
-		// Valid ASCII cases
-		{"lowercase", "hello", "HELLO", false},
-		{"uppercase", "HELLO", "HELLO", false},
-		{"mixed", "HeLLo", "HELLO", false},
-		{"empty", "", "", false},
-		{"with numbers", "abc123", "ABC123", false},
-		{"with symbols", "abc-xyz", "ABC-XYZ", false},
-
-		// Non-ASCII cases (should error)
-		{"unicode letter", "héllo", "", true},
-		{"unicode at start", "éabc", "", true},
-		{"unicode at end", "abcé", "", true},
-		{"unicode in middle", "abéc", "", true},
-		{"chinese", "你好", "", true},
-		{"emoji", "test🔥", "", true},
-		{"mixed unicode", "test世界", "", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := ToUpperASCIISafe(tt.input)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("ToUpperASCIISafe(%q) expected error, got nil", tt.input)
-				}
-				if err != ErrNonASCII {
-					t.Errorf("ToUpperASCIISafe(%q) error = %v, want ErrNonASCII", tt.input, err)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("ToUpperASCIISafe(%q) unexpected error: %v", tt.input, err)
-				}
-				if result != tt.expected {
-					t.Errorf("ToUpperASCIISafe(%q) = %q, want %q", tt.input, result, tt.expected)
-				}
-			}
-		})
-	}
-}
-
-func TestIsASCII(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected bool
-	}{
-		{"empty", "", true},
-		{"simple", "hello", true},
-		{"with symbols", "hello-world_123!", true},
-		{"all printable ASCII", strings.Repeat("a", 128), true},
-		{"unicode", "héllo", false},
-		{"chinese", "你好", false},
-		{"emoji", "🔥", false},
-		{"mixed", "hello世界", false},
-		{"byte 128", string([]byte{128}), false},
-		{"byte 255", string([]byte{255}), false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := IsASCII(tt.input)
-			if result != tt.expected {
-				t.Errorf("IsASCII(%q) = %v, want %v", tt.input, result, tt.expected)
-			}
-		})
-	}
-}
-
 func TestTrimSpace(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -169,7 +95,7 @@ func TestTrimSpace(t *testing.T) {
 	}
 }
 
-func TestInternKey_EdgeCases(t *testing.T) {
+func TestInternKeyBytes_EdgeCases(t *testing.T) {
 	ClearInternCache()
 
 	tests := []struct {
@@ -184,52 +110,49 @@ func TestInternKey_EdgeCases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := InternKey(tt.key)
+			got := InternKeyBytes([]byte(tt.key))
 			if got != tt.want {
-				t.Errorf("InternKey(%q) = %q, want %q", tt.key, got, tt.want)
+				t.Errorf("InternKeyBytes(%q) = %q, want %q", tt.key, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestInternKey_Eviction(t *testing.T) {
+func TestInternKeyBytes_Eviction(t *testing.T) {
 	ClearInternCache()
 
 	// Fill the cache to trigger eviction
 	for i := 0; i < maxInternSize*2; i++ {
 		key := "EVICT_KEY_" + strings.Repeat("x", i%20+1)
-		InternKey(key)
+		InternKeyBytes([]byte(key))
 	}
 
 	// Verify cache still works after eviction
 	key := "POST_EVICT_KEY"
-	if got := InternKey(key); got != key {
-		t.Errorf("InternKey after eviction = %q, want %q", got, key)
+	if got := InternKeyBytes([]byte(key)); got != key {
+		t.Errorf("InternKeyBytes after eviction = %q, want %q", got, key)
 	}
 }
 
-func TestInternKeyConsistency(t *testing.T) {
+func TestInternKeyBytes_Consistency(t *testing.T) {
 	// Clear cache before test
 	ClearInternCache()
 
 	// Test that cache and order slice remain consistent
-	keys := make([]string, 0, maxInternSize+10)
-
 	// Fill cache beyond capacity to trigger eviction
 	for i := 0; i < maxInternSize+50; i++ {
 		key := "KEY_" + strings.Repeat("A", i%10)
-		keys = append(keys, key)
-		interned := InternKey(key)
+		interned := InternKeyBytes([]byte(key))
 		if interned != key {
-			t.Errorf("InternKey(%q) = %q, want %q", key, interned, key)
+			t.Errorf("InternKeyBytes(%q) = %q, want %q", key, interned, key)
 		}
 	}
 
 	// Verify we can still intern new keys after eviction
 	newKey := "NEW_TEST_KEY"
-	interned := InternKey(newKey)
+	interned := InternKeyBytes([]byte(newKey))
 	if interned != newKey {
-		t.Errorf("InternKey(%q) = %q, want %q", newKey, interned, newKey)
+		t.Errorf("InternKeyBytes(%q) = %q, want %q", newKey, interned, newKey)
 	}
 }
 
@@ -287,36 +210,11 @@ func TestEqualFoldASCII(t *testing.T) {
 	}
 }
 
-func TestInternKey_LongKey(t *testing.T) {
+func TestInternKeyBytes_LongKey(t *testing.T) {
 	ClearInternCache()
 	longKey := strings.Repeat("X", maxInternKeyLen+1)
-	if got := InternKey(longKey); got != longKey {
-		t.Errorf("InternKey(long) = %q, want %q", got, longKey)
-	}
-}
-
-func TestInternKeyBytes_ParityWithInternKey(t *testing.T) {
-	ClearInternCache()
-
-	keys := []string{
-		"",
-		"SIMPLE",
-		"MY_KEY_NAME",
-		"lowercase_key",
-		"MixedCase_Key_123",
-		strings.Repeat("X", maxInternKeyLen),   // boundary: internable
-		strings.Repeat("Y", maxInternKeyLen+1), // too long: not interned, copied as-is
-	}
-	for _, k := range keys {
-		// Prime the cache via the string path so the byte path observes a hit.
-		want := InternKey(k)
-		got := InternKeyBytes([]byte(k))
-		if got != want {
-			t.Errorf("InternKeyBytes(%q) = %q, want InternKey result %q", k, got, want)
-		}
-		if got != k {
-			t.Errorf("InternKeyBytes(%q) = %q, want %q", k, got, k)
-		}
+	if got := InternKeyBytes([]byte(longKey)); got != longKey {
+		t.Errorf("InternKeyBytes(long) = %q, want %q", got, longKey)
 	}
 }
 
@@ -383,23 +281,25 @@ func TestToUpperASCII(t *testing.T) {
 	}
 }
 
-func TestTrimSpaceBytes(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"", ""},
-		{"hello", "hello"},
-		{"  hello  ", "hello"},
-		{"\thello\t", "hello"},
-		{"\nhello\n", "hello"},
-		{"   ", ""},
+// TestStoreInterned_EvictsWhenFull pins the bounded-eviction contract: when a
+// shard is at maxInternSize, inserting one more key evicts exactly one
+// existing entry rather than growing the cache.
+func TestStoreInterned_EvictsWhenFull(t *testing.T) {
+	shard := &internShard{cache: make(map[string]string, maxInternSize)}
+
+	for i := 0; i < maxInternSize; i++ {
+		shard.cache[fmt.Sprintf("KEY_%d", i)] = fmt.Sprintf("KEY_%d", i)
 	}
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			if got := TrimSpaceBytes([]byte(tt.input)); got != tt.want {
-				t.Errorf("TrimSpaceBytes(%q) = %q, want %q", tt.input, got, tt.want)
-			}
-		})
+
+	got := storeInterned(shard, "NEW_KEY")
+
+	if got != "NEW_KEY" {
+		t.Errorf("storeInterned() = %q, want %q", got, "NEW_KEY")
+	}
+	if shard.cache["NEW_KEY"] != "NEW_KEY" {
+		t.Error("storeInterned() should store the new key in the shard")
+	}
+	if len(shard.cache) != maxInternSize {
+		t.Errorf("len(cache) = %d after insert into a full shard, want %d (one eviction)", len(shard.cache), maxInternSize)
 	}
 }

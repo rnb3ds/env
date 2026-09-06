@@ -31,16 +31,23 @@ func FlattenJSON(data []byte, cfg JSONFlattenConfig) (map[string]string, error) 
 		return make(map[string]string), nil
 	}
 
-	// SECURITY: Pre-validate JSON nesting depth BEFORE json.Unmarshal so that
-	// MaxDepth is enforced as a fail-fast boundary. Without this, json.Unmarshal
-	// recursively decodes the entire document into nested interface{} values
-	// before flattenValue can enforce the limit, defeating its purpose and
-	// risking excessive allocation (or goroutine-stack exhaustion on a document
-	// crafted entirely of nested brackets at the size ceiling). The YAML inline
-	// path (yaml_flatten.go) uses the same nestingDepthExceeded check.
-	if nestingDepthExceeded(data, 0, cfg.MaxDepth) {
+	// SECURITY: Pre-validate JSON nesting depth and node count BEFORE
+	// json.Unmarshal so that MaxDepth and the node cap are enforced as
+	// fail-fast boundaries. Without this, json.Unmarshal recursively decodes
+	// the entire document into nested interface{} values before flattenValue
+	// can enforce the limit, defeating its purpose and risking excessive
+	// allocation (or goroutine-stack exhaustion on a document crafted
+	// entirely of nested brackets at the size ceiling). The YAML inline
+	// path (yaml_flatten.go) uses the same scanJSONLimits check.
+	depthExceeded, nodesExceeded := scanJSONLimits(data, 0, cfg.MaxDepth, HardMaxJSONNodes)
+	if depthExceeded {
 		return nil, &JSONError{
 			Message: fmt.Sprintf("maximum nesting depth exceeded (%d)", cfg.MaxDepth),
+		}
+	}
+	if nodesExceeded {
+		return nil, &JSONError{
+			Message: fmt.Sprintf("maximum node count exceeded (%d)", HardMaxJSONNodes),
 		}
 	}
 
@@ -68,28 +75,36 @@ func FlattenJSON(data []byte, cfg JSONFlattenConfig) (map[string]string, error) 
 	return result, nil
 }
 
-// nestingDepthExceeded pre-scans JSON bytes and reports whether the bracket
-// nesting (starting at startDepth) exceeds maxDepth. String contents are
-// skipped so brackets inside JSON strings are not counted. Counting is
-// conservative (it may over-count on malformed input), which is safe — the
-// goal is to reject deeply nested input before json.Unmarshal allocates a
-// deep structure, not to compute an exact depth.
+// scanJSONLimits pre-scans JSON bytes and reports whether the bracket
+// nesting (starting at startDepth) exceeds maxDepth, or the structural node
+// count (opening brackets, commas and colons — a proxy for the number of
+// decoded values) exceeds maxNodes. String contents are skipped so brackets
+// and commas inside JSON strings are not counted. Both counters are
+// conservative (they may over-count on malformed input), which is safe — the
+// goal is to reject oversized input before json.Unmarshal allocates a parse
+// tree whose memory is disproportionate to the input byte size, not to
+// compute exact counts.
 //
-// Called BEFORE json.Unmarshal so MaxDepth acts as a fail-fast boundary
-// rather than a check that runs only after a full recursive parse. Shared by
-// the standalone JSON path (FlattenJSON) and the inline-JSON-in-YAML path.
-func nestingDepthExceeded(data []byte, startDepth, maxDepth int) bool {
+// Called BEFORE json.Unmarshal so MaxDepth and the node cap act as fail-fast
+// boundaries rather than checks that run only after a full recursive parse.
+// Shared by the standalone JSON path (FlattenJSON) and the
+// inline-JSON-in-YAML path (yaml_flatten.go).
+func scanJSONLimits(data []byte, startDepth, maxDepth, maxNodes int) (depthExceeded, nodesExceeded bool) {
 	nesting := 0
+	nodes := 0
 	for i := 0; i < len(data); i++ {
 		switch data[i] {
 		case '{', '[':
+			nodes++
 			if nesting++; startDepth+nesting > maxDepth {
-				return true
+				return true, false
 			}
 		case '}', ']':
 			if nesting--; nesting < 0 {
 				nesting = 0
 			}
+		case ',', ':':
+			nodes++
 		case '"':
 			// Skip string body so brackets inside strings are not counted.
 			i++
@@ -102,8 +117,11 @@ func nestingDepthExceeded(data []byte, startDepth, maxDepth int) bool {
 				i++
 			}
 		}
+		if nodes > maxNodes {
+			return false, true
+		}
 	}
-	return false
+	return false, false
 }
 
 // flattenValue recursively flattens a JSON value.
@@ -131,11 +149,9 @@ func flattenValue(value interface{}, prefix string, cfg JSONFlattenConfig, resul
 		if prefix == "" {
 			return nil
 		}
-		if cfg.BoolAsString {
-			result[prefix] = strconv.FormatBool(v)
-		} else {
-			result[prefix] = fmt.Sprintf("%t", v)
-		}
+		// BoolAsString does not apply here: a decoded JSON bool has no raw
+		// text to preserve, so both settings render the canonical form.
+		result[prefix] = strconv.FormatBool(v)
 
 	case float64:
 		if prefix == "" {
@@ -185,55 +201,13 @@ func flattenValue(value interface{}, prefix string, cfg JSONFlattenConfig, resul
 }
 
 // buildKey constructs a key from prefix and key parts.
-// Uses direct concatenation for short keys to avoid pool overhead.
+// Delegates to the shared flattener key builder (see flatten_keys.go).
 func buildKey(prefix, key string, cfg JSONFlattenConfig) string {
-	key = ToUpperASCII(key)
-	if prefix == "" {
-		return key
-	}
-	totalLen := len(prefix) + len(cfg.KeyDelimiter) + len(key)
-	if totalLen <= 64 {
-		return prefix + cfg.KeyDelimiter + key
-	}
-	sb := GetBuilder()
-	defer PutBuilder(sb)
-	sb.Grow(totalLen)
-	sb.WriteString(prefix)
-	sb.WriteString(cfg.KeyDelimiter)
-	sb.WriteString(key)
-	return sb.String()
+	return buildFlatKey(prefix, key, cfg.KeyDelimiter)
 }
 
 // buildArrayIndex constructs a key for array elements.
-// Uses direct concatenation for short keys to avoid pool overhead.
+// Delegates to the shared flattener key builder (see flatten_keys.go).
 func buildArrayIndex(prefix string, index int, cfg JSONFlattenConfig) string {
-	indexStr := strconv.Itoa(index)
-
-	switch cfg.ArrayIndexFormat {
-	case "bracket":
-		totalLen := len(prefix) + 1 + len(indexStr) + 1
-		if totalLen <= 64 {
-			return prefix + "[" + indexStr + "]"
-		}
-		sb := GetBuilder()
-		defer PutBuilder(sb)
-		sb.Grow(totalLen)
-		sb.WriteString(prefix)
-		sb.WriteByte('[')
-		sb.WriteString(indexStr)
-		sb.WriteByte(']')
-		return sb.String()
-	default:
-		totalLen := len(prefix) + len(cfg.KeyDelimiter) + len(indexStr)
-		if totalLen <= 64 {
-			return prefix + cfg.KeyDelimiter + indexStr
-		}
-		sb := GetBuilder()
-		defer PutBuilder(sb)
-		sb.Grow(totalLen)
-		sb.WriteString(prefix)
-		sb.WriteString(cfg.KeyDelimiter)
-		sb.WriteString(indexStr)
-		return sb.String()
-	}
+	return buildFlatArrayIndex(prefix, index, cfg.KeyDelimiter, cfg.ArrayIndexFormat)
 }

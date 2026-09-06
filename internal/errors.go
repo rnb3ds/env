@@ -20,6 +20,22 @@ var (
 	// ErrSecurityViolation indicates a security policy violation.
 	ErrSecurityViolation = errors.New("security policy violation")
 
+	// ErrInvalidKey indicates the key does not match the required pattern.
+	// Matches key-rule ValidationErrors via errors.Is.
+	ErrInvalidKey = errors.New("invalid key format")
+
+	// ErrForbiddenKey indicates the key is not allowed for security reasons.
+	// Matches key_access SecurityErrors (forbidden list / allowed list) via errors.Is.
+	ErrForbiddenKey = errors.New("key is forbidden for security reasons")
+
+	// ErrMaxVariables indicates the maximum number of variables has been reached.
+	// Matches the max-variables ValidationError (Rule "max_variables") via errors.Is.
+	ErrMaxVariables = errors.New("maximum number of variables exceeded")
+
+	// ErrMissingRequired indicates a required key is missing.
+	// Matches the required-keys ValidationError (Rule "required") via errors.Is.
+	ErrMissingRequired = errors.New("required key is missing")
+
 	// ErrExpansionDepth indicates variable expansion exceeded the maximum depth
 	// or hit a variable cycle. errors.Is(err, ErrExpansionDepth) matches an
 	// *ExpansionError whose Kind is ExpansionDepthKind (the common case).
@@ -64,13 +80,29 @@ func (e *ValidationError) Error() string {
 }
 
 // Is implements errors.Is for ValidationError.
-// Only matches ErrInvalidValue when the error is value-related (not key or config errors).
+// Matches sentinels by rule category:
+//   - ErrInvalidValue: value-related rules (value, null_byte, control_char, utf8)
+//   - ErrInvalidKey: key-related rules on field "key" (non_empty, max_length, ascii_only, pattern)
+//   - ErrMissingRequired: rule "required"
+//   - ErrMaxVariables: rule "max_variables"
 func (e *ValidationError) Is(target error) bool {
-	if target == ErrInvalidValue {
+	switch target {
+	case ErrInvalidValue:
 		switch e.Rule {
 		case "value", "null_byte", "control_char", "utf8":
 			return true
 		}
+	case ErrInvalidKey:
+		if e.Field == "key" {
+			switch e.Rule {
+			case "non_empty", "max_length", "ascii_only", "pattern":
+				return true
+			}
+		}
+	case ErrMissingRequired:
+		return e.Rule == "required"
+	case ErrMaxVariables:
+		return e.Rule == "max_variables"
 	}
 	return false
 }
@@ -93,8 +125,13 @@ func (e *SecurityError) Error() string {
 
 // Is implements errors.Is for SecurityError.
 // This allows errors.Is(err, ErrSecurityViolation) to match SecurityError.
+// key_access rejections (forbidden list / not in allowed list) additionally
+// match ErrForbiddenKey.
 func (e *SecurityError) Is(target error) bool {
-	return target == ErrSecurityViolation
+	if target == ErrSecurityViolation {
+		return true
+	}
+	return target == ErrForbiddenKey && e.Action == actionKeyAccess
 }
 
 // FileError provides detailed information about file-related errors.

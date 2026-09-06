@@ -41,13 +41,15 @@ type Validator struct {
 func defaultIsSensitive(key string) bool { return false }
 
 // defaultMaskSensitive is the default sensitive value masking function.
+// It truncates long values the same way as MaskInString.
 func defaultMaskSensitive(s string) string {
-	const maxLen = 50
-	if len(s) > maxLen {
-		return s[:maxLen-3] + "..."
-	}
-	return s
+	return MaskInString(s)
 }
+
+// actionKeyAccess is the SecurityError.Action value used when a key is
+// rejected by the forbidden-keys or allowed-keys policy. SecurityError.Is
+// matches ErrForbiddenKey for this action.
+const actionKeyAccess = "key_access"
 
 // NewValidator creates a new Validator with the specified configuration.
 func NewValidator(cfg ValidatorConfig) *Validator {
@@ -113,37 +115,58 @@ func (v *Validator) ValidateKey(key string) error {
 	}
 
 	// SECURITY: Check for non-ASCII characters to prevent Unicode homograph attacks
-	// This must be done before pattern validation to avoid bypass via lookalike characters
-	// e.g., ℌOST (U+210C) looks similar to HOST but would bypass ASCII-only validation
-	for i := 0; i < len(key); i++ {
-		if key[i] >= 0x80 {
+	// (e.g., ℌOST, U+210C, looks similar to HOST but would bypass ASCII-only
+	// validation). For the default pattern this check is folded into the same
+	// scan as the pattern validation — every byte >= 0x80 fails the pattern's
+	// character classes anyway, so a separate pass would duplicate work. The
+	// ascii_only rule still takes precedence over pattern, matching the
+	// previous scan-order behavior. Custom patterns keep the dedicated scan
+	// because a user-supplied pattern may permit non-ASCII characters.
+	if v.useDefaultKeyCheck {
+		valid, hasNonASCII := validateDefaultKeyScan(key)
+		if hasNonASCII {
 			return v.newValidationError("key", key, "ascii_only", "key contains non-ASCII characters")
 		}
-	}
-
-	// Check pattern - use fast byte-level check for default pattern
-	if v.useDefaultKeyCheck {
-		// Fast path: validate default pattern ^[A-Za-z][A-Za-z0-9_]*$ without regex
-		if !isValidDefaultKey(key) {
+		if !valid {
 			return v.newValidationError("key", key, "pattern", "key does not match required pattern")
 		}
-	} else if v.keyPattern != nil && !v.keyPattern.MatchString(key) {
-		return v.newValidationError("key", key, "pattern", "key does not match required pattern")
+	} else {
+		for i := 0; i < len(key); i++ {
+			if key[i] >= 0x80 {
+				return v.newValidationError("key", key, "ascii_only", "key contains non-ASCII characters")
+			}
+		}
+		if v.keyPattern != nil && !v.keyPattern.MatchString(key) {
+			return v.newValidationError("key", key, "pattern", "key does not match required pattern")
+		}
 	}
 
+	return v.ValidateKeyPolicy(key)
+}
+
+// ValidateKeyPolicy checks a key against the allowed-keys / forbidden-keys
+// policy only, skipping the pattern and length checks that are format-specific.
+//
+// Structured formats (JSON/YAML) use their own key pattern (IsValidJSONKey,
+// which permits dots, hyphens and other characters the .env pattern rejects)
+// but MUST still enforce the same security policy as the .env parser —
+// otherwise a config.json containing "PATH" or "LD_PRELOAD" would bypass the
+// default forbidden-keys list and be applied to the process environment.
+func (v *Validator) ValidateKeyPolicy(key string) error {
 	// Only compute uppercase key if we need to check lists
-	if len(v.allowedKeys) > 0 || len(v.forbiddenKeys) > 0 {
-		upperKey := ToUpperASCII(key)
+	if len(v.allowedKeys) == 0 && len(v.forbiddenKeys) == 0 {
+		return nil
+	}
+	upperKey := ToUpperASCII(key)
 
-		// Check if in allowed list (if specified)
-		if len(v.allowedKeys) > 0 && !v.allowedKeys[upperKey] {
-			return v.newSecurityError("key_access", "key not in allowed list", key)
-		}
+	// Check if in allowed list (if specified)
+	if len(v.allowedKeys) > 0 && !v.allowedKeys[upperKey] {
+		return v.newSecurityError(actionKeyAccess, "key not in allowed list", key)
+	}
 
-		// Check forbidden list
-		if v.forbiddenKeys[upperKey] {
-			return v.newSecurityError("key_access", "key is forbidden", key)
-		}
+	// Check forbidden list
+	if v.forbiddenKeys[upperKey] {
+		return v.newSecurityError(actionKeyAccess, "key is forbidden", key)
 	}
 
 	return nil

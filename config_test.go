@@ -467,39 +467,15 @@ func TestNewValidationError(t *testing.T) {
 }
 
 // ============================================================================
-// Config with Custom FileSystem Tests
-// ============================================================================
-
-func TestConfig_WithCustomFileSystem(t *testing.T) {
-	fs := newTestFileSystem()
-	fs.files[".env"] = "KEY=value"
-
-	cfg := DefaultConfig()
-	cfg.FileSystem = fs
-
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	defer loader.Close()
-
-	if err := loader.LoadFiles(".env"); err != nil {
-		t.Fatalf("LoadFiles() error = %v", err)
-	}
-
-	if loader.GetString("KEY") != "value" {
-		t.Errorf("GetString(\"KEY\") = %q, want %q", loader.GetString("KEY"), "value")
-	}
-}
-
-// ============================================================================
 // Config with AuditHandler Tests
 // ============================================================================
 
 func TestConfig_WithAuditHandler(t *testing.T) {
+	ch := make(chan AuditEvent, 10)
+
 	cfg := DefaultConfig()
 	cfg.AuditEnabled = true
-	cfg.AuditHandler = NewNopAuditHandler()
+	cfg.AuditHandler = NewChannelAuditHandler(ch)
 
 	loader, err := New(cfg)
 	if err != nil {
@@ -507,9 +483,31 @@ func TestConfig_WithAuditHandler(t *testing.T) {
 	}
 	defer loader.Close()
 
-	// Should not error with audit handler configured
+	// The configured handler must receive audit events produced by loader
+	// operations, not just be accepted during construction. New() emits
+	// load events first, so drain the channel until the Set event arrives.
 	if err := loader.Set("KEY", "value"); err != nil {
-		t.Errorf("Set() error = %v", err)
+		t.Fatalf("Set() error = %v", err)
+	}
+
+	found := false
+	for range cap(ch) {
+		select {
+		case event := <-ch:
+			if event.Action == ActionSet && event.Key == "KEY" {
+				found = true
+				if !event.Success {
+					t.Errorf("audit event success = false, want true")
+				}
+			}
+		default:
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		t.Error("no Set audit event received on channel after Set()")
 	}
 }
 
@@ -679,6 +677,7 @@ func TestConfigIsZero_Completeness(t *testing.T) {
 		{"YAMLBoolAsString", Config{YAMLConfig: YAMLConfig{YAMLBoolAsString: true}}},
 		{"AllowExportPrefix", Config{ParsingConfig: ParsingConfig{AllowExportPrefix: true}}},
 		{"ExpandVariables", Config{ParsingConfig: ParsingConfig{ExpandVariables: true}}},
+		{"ExpansionScope", Config{ParsingConfig: ParsingConfig{ExpansionScope: ExpansionFileOnly}}},
 		{"KeyPattern", Config{ValidationConfig: ValidationConfig{KeyPattern: regexp.MustCompile(".")}}},
 		{"Filenames", Config{FileConfig: FileConfig{Filenames: []string{".env"}}}},
 		{"FileSystem", Config{ComponentConfig: ComponentConfig{FileSystem: DefaultFileSystem}}},

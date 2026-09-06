@@ -19,7 +19,7 @@ var _ EnvParser = (*jsonParser)(nil)
 func newJSONParserWithFactory(cfg Config, factory *ComponentFactory) (*jsonParser, error) {
 	maxDepth := cfg.JSONMaxDepth
 	if maxDepth <= 0 {
-		maxDepth = 10
+		maxDepth = defaultStructuredMaxDepth
 	}
 
 	flattenCfg := internal.JSONFlattenConfig{

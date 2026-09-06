@@ -6,7 +6,7 @@
 [![Security Policy](https://img.shields.io/badge/security-policy-blue.svg)](docs/SECURITY.md)
 [![Thread Safe](https://img.shields.io/badge/thread%20safe-%E2%9C%93-brightgreen.svg)](docs/CONCURRENCY_SAFETY.md)
 
-**[中文文档](README_zh-CN.md)** | **[www.cybergo.dev/env](https://www.cybergo.dev/env)**
+**[中文文档](README_zh-CN.md)** | **[www.cybergo.dev/env](https://www.cybergo.dev/env/)**
 
 ---
 
@@ -95,8 +95,11 @@ func main() {
 ### Basic Operations
 
 ```go
-// Load multiple files (later files override earlier ones)
-env.Load(".env", "config.json", ".env.local")
+// Load multiple files (with the default config the first value wins;
+// set cfg.OverwriteExisting = true to let later files override)
+if err := env.Load(".env", "config.json", ".env.local"); err != nil {
+    log.Fatal(err)
+}
 
 // Check existence
 value, exists := env.Lookup("KEY")
@@ -111,6 +114,13 @@ keys := env.Keys()                // Get all keys
 all := env.All()                  // Get all variables as map
 count := env.Len()                // Variable count
 ```
+
+> **Note:** Package-level functions (`GetString`, `Set`, `Lookup`, ...) require `Load()`
+> or `LoadWithConfig()` to be called first. Before initialization, `Get*`/`Lookup`/
+> `Keys`/`All`/`Len`/`GetSecure` silently return defaults/zero values, while `Set`,
+> `Delete`, `Validate`, and `ParseInto` return `ErrNotInitialized`.
+> `Load()` initializes the default loader exactly once; a second call returns
+> `ErrAlreadyInitialized`. To reinitialize (e.g., between tests), call `ResetDefaultLoader()` first.
 
 ### Type Access
 
@@ -160,6 +170,11 @@ env.GetString("test_app.key")   // resolves to TEST_APP_KEY
 // Works with all Get* methods
 env.GetInt("app.port")          // resolves to APP_PORT
 env.GetBool("debug.mode")       // resolves to DEBUG_MODE
+
+// Indexed access into comma-separated values (virtual lookup)
+// Given .env: LIST=a,b,c
+env.GetString("LIST.0")         // "a" — first element
+env.GetString("list.2")         // "c" — third element (case-insensitive base)
 ```
 
 **Resolution strategy:**
@@ -168,6 +183,7 @@ env.GetBool("debug.mode")       // resolves to DEBUG_MODE
 |:-----|:---------------------|:-----------------|
 | 1 | Exact match | Convert dots to underscores, uppercase → lookup |
 | 2 | Uppercase fallback | (done in step 1) |
+| 3 | — | If key ends in a numeric index: resolve base key, split comma-separated value at that index |
 
 **Best practice:** Use `UPPER_SNAKE_CASE` in `.env` files. This ensures all lookup styles work correctly.
 
@@ -175,8 +191,8 @@ env.GetBool("debug.mode")       // resolves to DEBUG_MODE
 
 ```go
 type Config struct {
-    Port    int           `env:"PORT,envDefault:8080"`
-    Debug   bool          `env:"DEBUG,envDefault:false"`
+    Port    int           `env:"PORT,envDefault:8080"` // inline default
+    Debug   bool          `env:"DEBUG" envDefault:"false"` // separate tag — both syntaxes work
     Timeout time.Duration `env:"TIMEOUT"`
     Origins []string      `env:"CORS_ORIGINS"`
 }
@@ -194,7 +210,7 @@ if err := env.ParseInto(&cfg); err != nil {
 
 ```go
 cfg := env.ProductionConfig()
-cfg.Filenames = []string{"/etc/app/.env"}
+cfg.Filenames = []string{"app.env"} // relative paths only; absolute paths are rejected
 
 loader, err := env.New(cfg)
 if err != nil {
@@ -374,12 +390,30 @@ defer secret.Release()
 ## 📝 Audit Logging
 
 ```go
+auditFile, err := os.Create("audit.log")
+if err != nil {
+    log.Fatal(err)
+}
+defer auditFile.Close()
+
 cfg := env.ProductionConfig()
 cfg.AuditEnabled = true
-cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
+// Use a file, not os.Stdout: loader.Close() closes the handler, which closes the writer
+cfg.AuditHandler = env.NewJSONAuditHandler(auditFile)
 
-loader, _ := env.New(cfg)
-// Output: {"action":"set","key":"API_KEY","success":true,"timestamp":"..."}
+loader, err := env.New(cfg)
+if err != nil {
+    log.Fatal(err)
+}
+defer loader.Close()
+
+if err := loader.LoadFiles("app.env"); err != nil {
+    log.Fatal(err)
+}
+// Output: {"timestamp":"...","action":"parse","reason":"parsed: app.env","success":true,"duration_ns":150000}
+//         {"timestamp":"...","action":"set","key":"[MASKED:7 chars]","reason":"loaded","success":true,"masked":true}
+//
+// Sensitive keys (e.g. API_KEY) are masked as [MASKED:<len> chars] in audit output.
 ```
 
 **Built-in Handlers:**
@@ -412,9 +446,11 @@ func TestConfig(t *testing.T) {
     // Test your code...
 }
 
-// Reset default loader between tests
+// Reset default loader between tests (required if Load() was already called)
 func TestMain(m *testing.M) {
-    env.ResetDefaultLoader()
+    if err := env.ResetDefaultLoader(); err != nil {
+        log.Printf("reset default loader: %v", err)
+    }
     os.Exit(m.Run())
 }
 ```
@@ -428,11 +464,12 @@ func TestMain(m *testing.M) {
 env.IsSensitiveKey("API_SECRET")  // true
 env.IsSensitiveKey("HOST")        // false
 
-// Value masking
-env.MaskValue("API_KEY", "secret123")  // "***"
+// Value masking — sensitive keys become "[MASKED:n chars]";
+// non-sensitive values ≤ 20 chars pass through, longer ones are truncated + "..."
+env.MaskValue("API_KEY", "secret123")  // "[MASKED:9 chars]"
 
-// Key masking for logging
-env.MaskKey("DB_PASSWORD")  // "DB_***"
+// Key masking for logging — keeps the first 2 chars + "***" (≤3 chars → "***")
+env.MaskKey("DB_PASSWORD")  // "DB***"
 
 // String sanitization
 safe := env.SanitizeForLog(userInput)
@@ -441,7 +478,7 @@ safe := env.SanitizeForLog(userInput)
 masked := env.MaskSensitiveInString(logMessage)
 
 // Format detection
-env.DetectFormat("config.yaml")  // FormatYAML
+env.DetectFormat("config.yaml")  // FormatYAML (String() → "yaml")
 ```
 
 ### Sensitive Key Patterns
@@ -534,7 +571,7 @@ cfg.FileSystem = nil         // nil = OS filesystem
 
 // === Audit Logging (ComponentConfig) ===
 cfg.AuditEnabled = true
-cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
+cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout) // demo only; prefer a file — Close() closes the writer
 ```
 
 > **Note:** Config uses nested structs (`FileConfig`, `ValidationConfig`, `LimitsConfig`,
@@ -554,14 +591,49 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 
 ---
 
+## ⚠️ Error Handling
+
+The library exposes sentinel errors for `errors.Is` and structured error types for `errors.As`:
+
+```go
+if err := env.Load(".env"); err != nil {
+    switch {
+    case errors.Is(err, env.ErrFileNotFound):
+        // file missing — provide a fallback or fail fast
+    case errors.Is(err, env.ErrFileTooLarge):
+        // exceeds cfg.MaxFileSize
+    case errors.Is(err, env.ErrSecurityViolation):
+        // forbidden key or security policy violation
+    }
+}
+
+var parseErr *env.ParseError
+if errors.As(err, &parseErr) {
+    fmt.Printf("%s:%d: %v\n", parseErr.File, parseErr.Line, parseErr.Err)
+}
+```
+
+**Sentinel errors:** `ErrFileNotFound`, `ErrFileTooLarge`, `ErrLineTooLong`, `ErrInvalidKey`,
+`ErrForbiddenKey`, `ErrSecurityViolation`, `ErrInvalidValue`, `ErrMissingRequired`,
+`ErrMaxVariables`, `ErrExpansionDepth`, `ErrClosed`, `ErrInvalidConfig`,
+`ErrNotInitialized`, `ErrAlreadyInitialized`, `ErrDuplicateKey`
+
+**Structured error types:** `ParseError` (file/line), `ValidationError`, `SecurityError`,
+`FileError`, `ExpansionError`, `JSONError`, `YAMLError`, `MarshalError` — check with
+`env.IsMarshalError(err)` where applicable.
+
+See [examples/09_error_handling](examples/09_error_handling/) for a runnable demo.
+
+---
+
 ## 📖 API Reference
 
 ### Package Functions
 
 | Function | Description |
 |:---------|:------------|
-| `Load(files...)` | Load files and apply to `os.Environ` |
-| `LoadWithConfig(cfg)` | Load with custom config |
+| `Load(files...)` | Load files and apply to `os.Environ` (one-time; see note above) |
+| `LoadWithConfig(cfg)` | Load with custom config (forces `AutoApply = true`) |
 | `GetString(key, def...)` | Get string value |
 | `GetInt(key, def...)` | Get `int64` value |
 | `GetBool(key, def...)` | Get boolean value |
@@ -585,7 +657,11 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `UnmarshalInto(map, &struct)` | Populate struct from map |
 | `MarshalStruct(struct)` | Convert struct to map |
 | `IsMarshalError(err)` | Check if error is a marshal error |
-| `New(cfg)` | Create new loader with config |
+| `DefaultConfig()` | Safe default configuration |
+| `DevelopmentConfig()` | Relaxed limits + overwrite enabled |
+| `TestingConfig()` | Tight limits, isolated testing |
+| `ProductionConfig()` | Strict security + audit enabled |
+| `New(cfg...)` | Create new loader (cfg optional; zero value → defaults) |
 | `NewSecureValue(string)` | Create SecureValue from string |
 | `NewSecureValueStrict(string)` | Create SecureValue with error on lock failure |
 | `ResetDefaultLoader()` | Reset singleton for testing (returns error) |

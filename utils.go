@@ -15,10 +15,6 @@ import (
 // Type Constraints
 // ============================================================================
 
-// defaultUnmarshalDepth is the default nesting depth used by UnmarshalMap
-// when no Config is available. Matches the DefaultConfig depth of 10.
-const defaultUnmarshalDepth = 10
-
 // sliceElement is a type constraint for supported slice element types.
 // This constraint is used by GetSlice and GetSliceFrom functions to ensure
 // type-safe parsing of slice values from environment variables.
@@ -167,6 +163,14 @@ func parseFloat64(s string) (float64, error) {
 // Supported formats: FormatEnv, FormatJSON, FormatYAML.
 //
 // Keys are always sorted for consistent output.
+//
+// Round-trip caveats:
+//   - '$' is not escaped. A value containing "$VAR" or "${VAR}" expands when
+//     the output is re-parsed with ExpandVariables enabled (the default).
+//     Disable expansion on the reading side, or avoid Marshal for such values.
+//   - When marshaling a struct, fields whose value marshals to an empty
+//     string (empty strings, nil pointers, empty slices) are omitted;
+//     scalar zero values such as 0 and false are kept (see MarshalStruct).
 //
 // Example:
 //
@@ -344,7 +348,7 @@ func unmarshalJSON(data string) (map[string]string, error) {
 		NullAsEmpty:      true,
 		NumberAsString:   true,
 		BoolAsString:     true,
-		MaxDepth:         defaultUnmarshalDepth,
+		MaxDepth:         defaultStructuredMaxDepth,
 	}
 
 	result, err := internal.FlattenJSON([]byte(data), cfg)
@@ -367,13 +371,17 @@ func unmarshalYAML(data string) (map[string]string, error) {
 		NullAsEmpty:      true,
 		NumberAsString:   true,
 		BoolAsString:     true,
-		MaxDepth:         defaultUnmarshalDepth,
+		MaxDepth:         defaultStructuredMaxDepth,
 	}
 
 	value, err := internal.ParseYAML([]byte(data), cfg.MaxDepth)
 	if err != nil {
 		return nil, err
 	}
+	// ParseYAML's contract requires the caller to return the node tree to
+	// the pool; FlattenYAML copies scalars into independent strings, so the
+	// result does not alias the tree (same pattern as the YAML file parser).
+	defer internal.ReleaseValue(value)
 
 	result, err := internal.FlattenYAML(value, cfg)
 	if err != nil {
@@ -406,6 +414,10 @@ type Unmarshaler interface {
 // MarshalStruct converts a struct to environment variables.
 // Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
 // Nested structs are flattened with underscore-separated keys.
+//
+// Fields whose value marshals to an empty string — empty strings, nil
+// pointers, and empty slices — are omitted from the output. Scalar zero
+// values are kept ("0", "false"), since they do not marshal to "".
 func MarshalStruct(v any) (map[string]string, error) {
 	// Check for Marshaler interface
 	if m, ok := v.(Marshaler); ok {
@@ -512,7 +524,9 @@ func parseSliceElement[T sliceElement](value string) (T, error) {
 		}
 		return any(n).(T), nil
 	case uint:
-		n, e := strconv.ParseUint(trimmed, 10, 64)
+		// strconv.IntSize (not a fixed 64) so 32-bit platforms reject values
+		// that would silently truncate when converted to uint.
+		n, e := strconv.ParseUint(trimmed, 10, strconv.IntSize)
 		if e != nil {
 			return zero, &ValidationError{Field: "uint", Value: MaskSensitiveInString(value), Message: "invalid unsigned integer value"}
 		}

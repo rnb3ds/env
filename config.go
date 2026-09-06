@@ -2,6 +2,7 @@ package env
 
 import (
 	"regexp"
+	"strconv"
 
 	"github.com/cybergodev/env/internal"
 )
@@ -78,6 +79,25 @@ type YAMLConfig struct {
 	YAMLMaxDepth int
 }
 
+// ExpansionScope controls which variables are visible to ${VAR} and $VAR
+// expansion in values.
+type ExpansionScope int
+
+const (
+	// ExpansionFileThenProcess resolves references against the variables in
+	// the parsed file first, then falls back to the process environment
+	// (os.LookupEnv). This is the zero value and matches traditional dotenv
+	// semantics.
+	ExpansionFileThenProcess ExpansionScope = iota
+	// ExpansionFileOnly restricts expansion to variables defined in the
+	// parsed file(s) alone. References to variables that exist only in the
+	// process environment expand to the empty string. Use this when
+	// configuration files come from a less-trusted source: it prevents the
+	// file from capturing unrelated process secrets (cloud credentials,
+	// tokens) into values that are later logged or persisted (SEC-03).
+	ExpansionFileOnly
+)
+
 // ParsingConfig controls general parsing behavior.
 type ParsingConfig struct {
 	// AllowExportPrefix allows the "export KEY=value" shell syntax in .env files.
@@ -86,6 +106,12 @@ type ParsingConfig struct {
 	AllowYamlSyntax bool
 	// ExpandVariables enables ${VAR} and $VAR expansion in values.
 	ExpandVariables bool
+	// ExpansionScope restricts which variables ${VAR} references can resolve
+	// from. The default (ExpansionFileThenProcess) resolves file-local
+	// variables first and then falls back to the process environment.
+	// Set to ExpansionFileOnly to prevent an untrusted configuration file
+	// from reading unrelated process environment variables (SEC-03).
+	ExpansionScope ExpansionScope
 }
 
 // ComponentConfig holds custom component implementations and advanced options.
@@ -185,6 +211,10 @@ func (c *Config) validateFormatConfig() error {
 
 // validateAdvancedOptions validates advanced options like custom key patterns.
 func (c *Config) validateAdvancedOptions() error {
+	if c.ExpansionScope != ExpansionFileThenProcess && c.ExpansionScope != ExpansionFileOnly {
+		return newValidationError("ExpansionScope", strconv.Itoa(int(c.ExpansionScope)), "enum",
+			"must be ExpansionFileThenProcess or ExpansionFileOnly")
+	}
 	if c.KeyPattern != nil {
 		return validateKeyPattern(c.KeyPattern)
 	}
@@ -211,6 +241,18 @@ func validateKeyPattern(pattern *regexp.Regexp) error {
 	if pattern.MatchString("123_INVALID") {
 		return newValidationError("KeyPattern", pattern.String(), "reject_numeric_start",
 			"key pattern must not match keys starting with numbers")
+	}
+
+	// SECURITY (SEC-06): a pattern that also matches keys containing
+	// separators or control characters lets such keys pass Set(). The .env
+	// emitter cannot represent them, previously producing output that
+	// re-parses as different (attacker-chosen) lines — round-trip injection.
+	// Reject patterns that match any of these probes.
+	for _, probe := range []string{"A=B", "A:B", "A\nB", "A\rB", "A\x00B"} {
+		if pattern.MatchString(probe) {
+			return newValidationError("KeyPattern", pattern.String(), "reject_unsafe_chars",
+				"key pattern must not match keys containing '=', ':', newline, or control characters")
+		}
 	}
 
 	return nil
@@ -243,6 +285,15 @@ func (c *Config) IsZero() bool {
 		return false
 	}
 
+	// ExpansionScope is an enum, not a bool: any value other than the zero
+	// value (ExpansionFileThenProcess) means initialized. Without this check
+	// a Config whose only non-default field is the scope was mistaken for
+	// zero and silently replaced by DefaultConfig() in New(), dropping the
+	// SEC-03 file-only expansion restriction.
+	if c.ExpansionScope != ExpansionFileThenProcess {
+		return false
+	}
+
 	// Check pointer/interface fields (non-nil means initialized)
 	if c.KeyPattern != nil || c.FileSystem != nil ||
 		c.CustomValidator != nil || c.CustomExpander != nil ||
@@ -267,6 +318,12 @@ func (c *Config) IsZero() bool {
 // ============================================================================
 // Configuration Factories
 // ============================================================================
+
+// defaultStructuredMaxDepth is the default nesting-depth limit for JSON and
+// YAML documents. It backs DefaultConfig (JSONMaxDepth/YAMLMaxDepth),
+// UnmarshalMap's structured paths, and the structured parsers' defensive
+// fallback when constructed with a non-positive depth.
+const defaultStructuredMaxDepth = 10
 
 // DefaultConfig returns a Config with secure default values.
 // These defaults are suitable for high-security environments.
@@ -297,13 +354,13 @@ func DefaultConfig() Config {
 			JSONNullAsEmpty:    true,
 			JSONNumberAsString: true,
 			JSONBoolAsString:   true,
-			JSONMaxDepth:       10,
+			JSONMaxDepth:       defaultStructuredMaxDepth,
 		},
 		YAMLConfig: YAMLConfig{
 			YAMLNullAsEmpty:    true,
 			YAMLNumberAsString: true,
 			YAMLBoolAsString:   true,
-			YAMLMaxDepth:       10,
+			YAMLMaxDepth:       defaultStructuredMaxDepth,
 		},
 		ParsingConfig: ParsingConfig{
 			AllowExportPrefix: true,
@@ -327,7 +384,7 @@ func DefaultConfig() Config {
 //   - FailOnMissingFile: false (graceful handling of missing .env files)
 //   - OverwriteExisting: true (easy iteration during development)
 //   - AllowYamlSyntax: true (supports YAML-style values)
-//   - Relaxed size limits (10MB files, 500 variables)
+//   - Relaxed file-size limit (10MB; variable count keeps the default 500)
 //   - Value validation ENABLED for security (prevents injection attacks)
 //
 // Example:

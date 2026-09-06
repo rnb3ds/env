@@ -1,4 +1,10 @@
-//go:build !unix && !linux && !darwin && !freebsd && !netbsd && !openbsd && !windows
+//go:build !linux && !darwin && !windows
+
+// No-op memory locking fallback for every platform without stdlib
+// syscall.Mlock — the BSDs, Solaris, Illumos, AIX, Plan 9, WASM, etc.
+// (Windows uses mlock_windows.go; Linux and Darwin use mlock_unix.go.)
+// The previous "!unix && ..." form wrongly excluded the BSDs and Solaris
+// from this fallback, leaving those platforms with no implementation.
 
 package internal
 

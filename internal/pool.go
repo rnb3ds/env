@@ -57,18 +57,6 @@ func PutBuilder(sb *strings.Builder) {
 	}
 }
 
-// PutBuilderDiscard discards a builder without returning it to the pool.
-// Use this when the builder may have processed sensitive content (passwords,
-// API keys, tokens) to prevent residual data from persisting in pooled buffers.
-// The builder will be garbage collected and its memory reclaimed.
-func PutBuilderDiscard(sb *strings.Builder) {
-	if sb == nil {
-		return
-	}
-	sb.Reset()
-	// Intentionally do not return to pool — let GC reclaim
-}
-
 // ============================================================================
 // Byte Slice Pool for Value Parsing
 // ============================================================================

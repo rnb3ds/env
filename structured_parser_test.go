@@ -1,10 +1,13 @@
 package env
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"strconv"
 	"strings"
 	"testing"
+	"testing/iotest"
 )
 
 // This file exercises structuredParserConfig.validateResult (structured_parser.go),
@@ -125,5 +128,198 @@ func TestStructuredParser_ValidateResult(t *testing.T) {
 				t.Errorf("LoadFiles() error = %v, want nil", err)
 			}
 		})
+	}
+}
+
+// TestReadAllInto covers the buffer-growth and read-error paths of the
+// structured-parser file reader directly.
+func TestReadAllInto(t *testing.T) {
+	t.Run("grows buffer beyond initial capacity", func(t *testing.T) {
+		content := strings.Repeat("x", 2048)
+		buf, err := readAllInto(make([]byte, 0, 64), strings.NewReader(content))
+		if err != nil {
+			t.Fatalf("readAllInto() error = %v", err)
+		}
+		if string(buf) != content {
+			t.Errorf("readAllInto() read %d bytes, want %d", len(buf), len(content))
+		}
+	})
+
+	t.Run("read error is returned", func(t *testing.T) {
+		wantErr := errors.New("disk failure")
+		_, err := readAllInto(make([]byte, 0, 64), io.MultiReader(strings.NewReader("partial"), iotest.ErrReader(wantErr)))
+		if !errors.Is(err, wantErr) {
+			t.Errorf("readAllInto() error = %v, want %v", err, wantErr)
+		}
+	})
+
+	t.Run("empty reader returns empty buffer", func(t *testing.T) {
+		buf, err := readAllInto(make([]byte, 0, 64), strings.NewReader(""))
+		if err != nil {
+			t.Fatalf("readAllInto() error = %v", err)
+		}
+		if len(buf) != 0 {
+			t.Errorf("readAllInto() = %d bytes, want 0", len(buf))
+		}
+	})
+
+	t.Run("zero-capacity buffer grows from the 512-byte floor", func(t *testing.T) {
+		buf, err := readAllInto(make([]byte, 0), strings.NewReader("hello"))
+		if err != nil {
+			t.Fatalf("readAllInto() error = %v", err)
+		}
+		if string(buf) != "hello" {
+			t.Errorf("readAllInto() = %q, want %q", buf, "hello")
+		}
+	})
+}
+
+// TestReaderBufferPool_Boundary covers the defensive paths of the structured
+// parser's reader buffer pool: nil puts, oversized buffers refused entry, and
+// the fallback allocation when the pool returns an unexpected type.
+func TestReaderBufferPool_Boundary(t *testing.T) {
+	t.Run("nil buffer is ignored", func(t *testing.T) {
+		putReaderBuffer(nil) // must not panic
+	})
+
+	t.Run("oversized buffer is not pooled", func(t *testing.T) {
+		big := make([]byte, 0, maxPooledReaderBufferSize+1)
+		putReaderBuffer(&big)
+		// No observable assertion: the contract is that the oversized buffer is
+		// simply dropped, and the pool's buffers stay ≤ maxPooledReaderBufferSize.
+	})
+
+	t.Run("unexpected pool type falls back to a fresh buffer", func(t *testing.T) {
+		readerBufferPool.Put(new(int)) // poison the pool with a foreign type
+		buf := getReaderBuffer()
+		if cap(*buf) != 64*1024 {
+			t.Errorf("fallback buffer capacity = %d, want %d", cap(*buf), 64*1024)
+		}
+		putReaderBuffer(buf) // restore a well-typed buffer to the pool
+	})
+}
+
+// TestStructuredParseResult_Boundaries drives the remaining structured-parse
+// branches directly: generic (non-limit) read errors passed through unwrapped,
+// MaxKeyLength enforcement, and the audit-enabled duration log on success.
+func TestStructuredParseResult_Boundaries(t *testing.T) {
+	t.Run("generic read error is returned as-is", func(t *testing.T) {
+		wantErr := errors.New("device not ready")
+		c := &structuredParserConfig{config: DefaultConfig(), auditor: &mockFullAuditLogger{}}
+
+		_, err := c.structuredParseResult(&partialReader{data: []byte("{"), err: wantErr}, "f.json", "JSON",
+			func([]byte) (map[string]string, error) { return nil, nil })
+		if !errors.Is(err, wantErr) {
+			t.Errorf("structuredParseResult() error = %v, want the raw %v", err, wantErr)
+		}
+	})
+
+	t.Run("key exceeding MaxKeyLength is rejected", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.MaxKeyLength = 4
+		c := &structuredParserConfig{config: cfg, auditor: &mockFullAuditLogger{}}
+
+		_, err := c.structuredParseResult(strings.NewReader(`{}`), "f.json", "JSON",
+			func([]byte) (map[string]string, error) { return map[string]string{"TOOLONGKEY": "v"}, nil })
+		var ve *ValidationError
+		if !errors.As(err, &ve) || ve.Rule != "max_length" {
+			t.Errorf("structuredParseResult() error = %v, want ValidationError rule max_length", err)
+		}
+	})
+
+	t.Run("audit enabled logs parse duration on success", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.AuditEnabled = true
+		factory := cfg.buildComponentFactory()
+		defer factory.Close()
+		auditor := &mockFullAuditLogger{}
+		c := &structuredParserConfig{config: cfg, validator: factory.Validator(), auditor: auditor}
+
+		result, err := c.structuredParseResult(strings.NewReader(`{"K":"v"}`), "f.json", "JSON",
+			func(data []byte) (map[string]string, error) { return map[string]string{"K": "v"}, nil })
+		if err != nil {
+			t.Fatalf("structuredParseResult() error = %v", err)
+		}
+		if result["K"] != "v" {
+			t.Errorf("result[K] = %q, want %q", result["K"], "v")
+		}
+		found := false
+		for _, entry := range auditor.logs {
+			if entry == "LogWithDuration" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("audit log entries = %v, want a LogWithDuration entry", auditor.logs)
+		}
+	})
+}
+
+// partialReader yields the given bytes once, then fails with a custom error.
+type partialReader struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (r *partialReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, r.err
+	}
+	r.done = true
+	n := copy(p, r.data)
+	return n, r.err
+}
+
+// TestReadAllIntoReturnsPartialBufferOnError pins the readAllInto contract the
+// structured-parse error path relies on: on error it must return the
+// partially-filled buffer, not nil, so the caller can clear it before pooling.
+// Regression: the error path in structuredParseResult previously pooled the
+// untouched original pointer, whose zero length made clear() a no-op and left
+// raw file contents resident in readerBufferPool.
+func TestReadAllIntoReturnsPartialBufferOnError(t *testing.T) {
+	secret := []byte("PASSWORD=supersecret-value")
+	wantErr := errors.New("read failed")
+	buf := make([]byte, 0, 64)
+
+	data, err := readAllInto(buf, &partialReader{data: secret, err: wantErr})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("readAllInto() error = %v, want %v", err, wantErr)
+	}
+	if data == nil {
+		t.Fatal("readAllInto() returned nil buffer on error; caller cannot clear pooled memory")
+	}
+	if string(data) != string(secret) {
+		t.Errorf("partial data = %q, want %q", data, secret)
+	}
+}
+
+// TestStructuredParseErrorPathClearsPooledBuffer verifies end to end that a
+// failing structured parse leaves no raw file contents in the reader buffer
+// pool: after the error, the next pooled buffer contains only zeroes.
+func TestStructuredParseErrorPathClearsPooledBuffer(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxFileSize = 32
+	cfg.MaxLineLength = 1024
+
+	// Content longer than MaxFileSize so the read fails mid-file with
+	// ErrFileTooLarge after ~32 bytes of secret-bearing content.
+	oversized := []byte("PASSWORD=supersecret-payload-that-exceeds-the-limit")
+	c := &structuredParserConfig{
+		config:  cfg,
+		auditor: &mockFullAuditLogger{},
+	}
+	flattenStub := func([]byte) (map[string]string, error) { return nil, nil }
+
+	if _, err := c.structuredParseResult(bytes.NewReader(oversized), "test.json", "JSON", flattenStub); err == nil {
+		t.Fatal("expected ErrFileTooLarge from oversized input")
+	}
+
+	// The buffer just returned to the pool must be fully zeroed.
+	next := getReaderBuffer()
+	for i, b := range *next {
+		if b != 0 {
+			t.Fatalf("pooled buffer dirty at byte %d after read error; raw file contents would persist in the pool", i)
+		}
 	}
 }

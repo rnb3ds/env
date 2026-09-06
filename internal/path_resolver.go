@@ -115,10 +115,10 @@ func ResolvePath(path string) []string {
 		}
 	}
 
+	// The bracket rendering always differs from the underscore rendering
+	// once a numeric part exists (brackets where the underscore form uses
+	// separators or bare digits), so both candidates are always returned.
 	bracketKey := bracketResult.String()
-	if bracketKey == converted {
-		return []string{converted}
-	}
 	return []string{converted, bracketKey}
 }
 
@@ -148,10 +148,7 @@ func ExtractNumericIndex(path string) (basePath string, index int, ok bool) {
 	// Find the last dot in the path
 	lastDot := strings.LastIndex(path, ".")
 	if lastDot < 0 {
-		// No dot found, check if entire path is numeric
-		if isNumericIndex(path) {
-			return "", -1, false // Single numeric is not a valid indexed path
-		}
+		// No dot found: a single numeric (or any other key) is not an indexed path
 		return "", -1, false
 	}
 

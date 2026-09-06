@@ -325,7 +325,10 @@ func Validate() error {
 //
 // For isolated instances without auto-apply, use New().
 //
-// Files are loaded sequentially; later files can override values from earlier files.
+// Files are loaded sequentially. Whether a later file can override values from
+// an earlier one depends on OverwriteExisting: this function keeps the
+// DefaultConfig value (false), so the first file to set a key wins; set
+// cfg.OverwriteExisting = true via LoadWithConfig for last-file-wins.
 //
 // Supported file formats:
 //   - .env files (dotenv format)

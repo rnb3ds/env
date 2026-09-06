@@ -18,13 +18,25 @@ import (
 
 // secureValuePool provides a pool of reusable SecureValue objects.
 // This significantly reduces allocations for high-frequency Set operations.
-// Note: We do NOT set the finalizer in pool.New because:
-// 1. Release() clears the finalizer before returning to pool
-// 2. NewSecureValue() sets the finalizer when taking from pool
-// This avoids "finalizer already set" panics.
+//
+// FINALIZER INVARIANT: the finalizer is set exactly once, when a SecureValue
+// object is first created, and is never cleared. Keeping it set while the
+// object sits in the pool is safe because sync.Pool holds a reference to
+// pooled objects, and finalizers only run on unreachable objects:
+//   - If the runtime evicts a closed SecureValue from the pool, the finalizer
+//     observes closed=true and is a no-op.
+//   - If a caller abandons an OPEN SecureValue (the case the finalizer exists
+//     for — e.g. a dropped GetSecure result or an unclosed Loader), the
+//     finalizer runs and zeroes the data, exactly as before.
+//
+// SetFinalizer is a relatively expensive runtime call (~60% of NewSecureValue
+// cost in profiles), so paying it once per object lifetime instead of on
+// every pool cycle is a significant win on the Set/SetAll hot paths.
 var secureValuePool = sync.Pool{
 	New: func() any {
-		return &SecureValue{}
+		sv := &SecureValue{}
+		runtime.SetFinalizer(sv, (*SecureValue).finalize)
+		return sv
 	},
 }
 
@@ -52,13 +64,12 @@ type SecureValue struct {
 func NewSecureValue(value string) *SecureValue {
 	sv, ok := secureValuePool.Get().(*SecureValue)
 	if !ok {
-		// Fallback: create new SecureValue if pool returns unexpected type
+		// Fallback: create new SecureValue if pool returns unexpected type.
+		// The finalizer is set here (and in pool.New) exactly once per object;
+		// see the FINALIZER INVARIANT on secureValuePool.
 		sv = &SecureValue{}
+		runtime.SetFinalizer(sv, (*SecureValue).finalize)
 	}
-	// Set finalizer for secure cleanup on GC.
-	// This is safe because Release() clears the finalizer before
-	// returning to pool, so we always need to set it here.
-	runtime.SetFinalizer(sv, (*SecureValue).finalize)
 	sv.reset(value)
 	return sv
 }
@@ -92,9 +103,8 @@ func NewSecureValueStrict(value string) (*SecureValue, error) {
 
 // reset initializes or reinitializes the SecureValue with a new value.
 // This is used when reusing pooled SecureValue objects.
-// Note: The finalizer is set in NewSecureValue() for each use.
-// We do NOT reset the finalizer here - Release() clears it before
-// returning to the pool, and NewSecureValue() sets a fresh one when reused.
+// Note: The finalizer is set once at object creation (see the FINALIZER
+// INVARIANT on secureValuePool) and needs no maintenance here.
 //
 // State consistency: The entire operation is protected by mutex lock,
 // ensuring no concurrent reads can observe partial state. We mark the
@@ -193,19 +203,13 @@ func (sv *SecureValue) tryLockMemory() {
 // - We use atomic.Bool for the closed flag to ensure safe reads
 // - SECURITY: We acquire the mutex to prevent race with concurrent Release()
 //
-// Race Prevention:
-// - Release() clears the finalizer BEFORE putting the object back in the pool
-// - NewSecureValue() sets a fresh finalizer when taking from the pool
-// - This ensures no finalizer runs on pooled objects being reused
-// - Additional mutex protection provides defense-in-depth
-//
-// SECURITY REQUIREMENT:
-// Callers that return SecureValue to the pool MUST follow this sequence:
-//  1. Call runtime.SetFinalizer(sv, nil) to clear the finalizer
-//  2. Then call secureValuePool.Put(sv)
-//
-// Failure to clear the finalizer before Put() may cause the GC to run
-// finalize() while the object is being reused, leading to data corruption.
+// Pool interaction (see the FINALIZER INVARIANT on secureValuePool):
+//   - The finalizer stays set for the object's entire lifetime
+//   - Objects referenced by the pool (or by a live secureMap shard) are
+//     reachable, so this method cannot run on them
+//   - Pooled objects evicted by the runtime are always closed (Release closed
+//     them before pooling), so the fast-path check below makes this a no-op
+//   - Additional mutex protection provides defense-in-depth
 func (sv *SecureValue) finalize() {
 	// Fast path: if already closed, nothing to do
 	if sv.closed.Load() {
@@ -213,9 +217,8 @@ func (sv *SecureValue) finalize() {
 	}
 
 	// SECURITY: Acquire mutex to prevent race with Release()
-	// This is defense-in-depth - the finalizer should already be cleared
-	// before the object is returned to the pool, but we protect against
-	// any edge cases where this might not happen.
+	// This is defense-in-depth for the abandonment case (an open SecureValue
+	// becoming unreachable without an explicit Close/Release).
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
 
@@ -332,9 +335,10 @@ func (sv *SecureValue) Close() error {
 // This is more efficient than Close() for high-frequency operations
 // as it allows the SecureValue to be reused.
 //
-// The finalizer is cleared before returning to the pool to ensure:
-// 1. The object can be safely reused without finalizer interference
-// 2. NewSecureValue() will set a fresh finalizer when the object is reused
+// The finalizer is intentionally NOT cleared before pooling — see the
+// FINALIZER INVARIANT on secureValuePool. The object stays closed here, so
+// even if the runtime later finalizes an evicted pooled object, finalize()
+// observes closed=true and is a no-op.
 func (sv *SecureValue) Release() {
 	if sv == nil {
 		return
@@ -346,10 +350,6 @@ func (sv *SecureValue) Release() {
 	}
 	sv.clearDataLocked()
 	sv.closed.Store(true)
-	// Clear finalizer before returning to pool. This prevents a race condition
-	// where GC might trigger the finalizer while the object is being reused.
-	// NewSecureValue() will set a new finalizer when this object is taken from the pool.
-	runtime.SetFinalizer(sv, nil)
 	secureValuePool.Put(sv)
 }
 
@@ -479,12 +479,20 @@ func hashKey(key string) uint32 {
 }
 
 // newSecureMap creates a new secureMap with sharded storage.
+// Shard maps are created lazily on first write: reads and iteration over a
+// nil map are valid no-ops in Go, so an empty (or briefly-used) loader does
+// not pay for eight empty map headers up front.
 func newSecureMap() *secureMap {
-	sm := &secureMap{}
-	for i := range numSecureMapShards {
-		sm.shards[i].values = make(map[string]*SecureValue)
+	return &secureMap{}
+}
+
+// shardMapLocked returns the shard's map, creating it on first use.
+// The caller must already hold shard.mu.
+func shardMapLocked(shard *secureMapShard) map[string]*SecureValue {
+	if shard.values == nil {
+		shard.values = make(map[string]*SecureValue)
 	}
-	return sm
+	return shard.values
 }
 
 // getShard returns the shard for a given key.
@@ -505,7 +513,7 @@ func (sm *secureMap) Set(key string, value string) {
 		existing.reset(value)
 		shard.mu.Unlock()
 	} else {
-		shard.values[key] = NewSecureValue(value)
+		shardMapLocked(shard)[key] = NewSecureValue(value)
 		sm.count.Add(1)
 		shard.mu.Unlock()
 	}
@@ -521,24 +529,30 @@ type secureKV struct {
 	value string
 }
 
-// bucketByShard distributes values into per-shard slices, each sized exactly.
-// This is the shared bucketing logic used by SetAll and SetAllIfAbsent.
+// bucketByShard distributes values into per-shard slices backed by a single
+// flat allocation. One contiguous slice is cheaper to allocate and to GC than
+// up to numSecureMapShards separate slices, and gives better locality when
+// each shard's batch is processed in order. This is the shared bucketing
+// logic used by SetAll and SetAllIfAbsent.
 func bucketByShard(values map[string]string) [numSecureMapShards][]secureKV {
-	// First pass: count items per shard so each slice is sized exactly.
-	var counts [numSecureMapShards]int
+	// First pass: count items per shard and turn the counts into prefix
+	// offsets (offsets[i] is the start of shard i's segment in flat).
+	var offsets [numSecureMapShards + 1]int
 	for key := range values {
-		counts[hashKey(key)]++
+		offsets[hashKey(key)+1]++
+	}
+	for i := 1; i <= numSecureMapShards; i++ {
+		offsets[i] += offsets[i-1]
 	}
 
-	// Allocate one compact slice per non-empty shard.
+	// Second pass: distribute values into the per-shard segments. Each
+	// segment starts empty with capacity capped at its exact count, so
+	// appends always fit in the flat slice and never reallocate.
+	flat := make([]secureKV, len(values))
 	var buckets [numSecureMapShards][]secureKV
 	for i := range numSecureMapShards {
-		if counts[i] > 0 {
-			buckets[i] = make([]secureKV, 0, counts[i])
-		}
+		buckets[i] = flat[offsets[i]:offsets[i]:offsets[i+1]]
 	}
-
-	// Second pass: distribute values into the per-shard slices.
 	for key, value := range values {
 		idx := hashKey(key)
 		buckets[idx] = append(buckets[idx], secureKV{key: key, value: value})
@@ -577,13 +591,14 @@ func (sm *secureMap) setShardValues(shardIdx int, pairs []secureKV) {
 
 	// Track new keys for count update
 	newKeys := 0
+	values := shardMapLocked(shard)
 	for i := range pairs {
 		key, value := pairs[i].key, pairs[i].value
-		if existing, ok := shard.values[key]; ok {
+		if existing, ok := values[key]; ok {
 			// In-place update: reuse existing SecureValue
 			existing.reset(value)
 		} else {
-			shard.values[key] = NewSecureValue(value)
+			values[key] = NewSecureValue(value)
 			newKeys++
 		}
 	}
@@ -616,10 +631,11 @@ func (sm *secureMap) SetAllIfAbsent(values map[string]string) int {
 		}
 		shard := &sm.shards[i]
 		shard.mu.Lock()
+		values := shardMapLocked(shard)
 		for j := range buckets[i] {
 			key, value := buckets[i][j].key, buckets[i][j].value
-			if _, ok := shard.values[key]; !ok {
-				shard.values[key] = NewSecureValue(value)
+			if _, ok := values[key]; !ok {
+				values[key] = NewSecureValue(value)
 				newKeys++
 			}
 		}
@@ -738,7 +754,9 @@ func (sm *secureMap) Clear() {
 		for _, sv := range shard.values {
 			toRelease = append(toRelease, sv)
 		}
-		shard.values = make(map[string]*SecureValue)
+		// Drop the shard map entirely (lazy re-creation on next write)
+		// instead of keeping an empty map header alive.
+		shard.values = nil
 		shard.mu.Unlock()
 		// Release old values outside of shard lock to avoid lock order inversion
 		for _, sv := range toRelease {

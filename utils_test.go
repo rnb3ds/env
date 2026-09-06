@@ -2,6 +2,8 @@ package env
 
 import (
 	"errors"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -123,40 +125,6 @@ func TestParseInt(t *testing.T) {
 			}
 			if result != tt.expected {
 				t.Errorf("parseInt(%q) = %d, want %d", tt.input, result, tt.expected)
-			}
-		})
-	}
-}
-
-// ============================================================================
-// Marshal Tests
-// ============================================================================
-
-func TestMarshal(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   map[string]string
-		wantErr bool
-	}{
-		{
-			name:  "simple",
-			input: map[string]string{"KEY": "value", "OTHER": "other"},
-		},
-		{
-			name:  "empty",
-			input: map[string]string{},
-		},
-		{
-			name:  "special chars",
-			input: map[string]string{"SPECIAL": "value with \"quotes\""},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := Marshal(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Marshal() error = %v", err)
 			}
 		})
 	}
@@ -573,12 +541,59 @@ func TestUnmarshalInto(t *testing.T) {
 			t.Error("UnmarshalInto() should return error for pointer to non-struct")
 		}
 	})
+
+	t.Run("narrow integer field rejects out-of-range value", func(t *testing.T) {
+		// Regression: values were parsed at 64-bit width and then silently
+		// truncated by reflect (300 → 44 in an int8 field). They must error.
+		type NarrowConfig struct {
+			Port int8 `env:"PORT"`
+		}
+		var c NarrowConfig
+		err := UnmarshalInto(map[string]string{"PORT": "300"}, &c)
+		if err == nil {
+			t.Fatalf("UnmarshalInto() succeeded with out-of-range int8 value, Port = %d", c.Port)
+		}
+		if c.Port != 0 {
+			t.Errorf("Port = %d on failure, want untouched zero value", c.Port)
+		}
+	})
+}
+
+// TestMarshalYAMLRoundTripFidelity verifies that string values which look like
+// YAML scalars (bools, null, numbers) and values with trailing whitespace
+// survive a Marshal→UnmarshalMap round trip through FormatYAML unchanged.
+// Regression: they were emitted unquoted, so the YAML reader coerced them
+// ("null" → "", "true" → "true"/bool normalization, trailing space stripped).
+func TestMarshalYAMLRoundTripFidelity(t *testing.T) {
+	original := map[string]string{
+		"MODE":       "null",
+		"EMPTY_WORD": "~",
+		"FLAG":       "true",
+		"OTHER_FLAG": "false",
+		"NUMBER":     "8080",
+		"RATIO":      "3.14",
+		"SPACED":     "trailing ",
+	}
+	data, err := Marshal(original, FormatYAML)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+
+	roundTripped, err := UnmarshalMap(data, FormatYAML)
+	if err != nil {
+		t.Fatalf("UnmarshalMap() error = %v", err)
+	}
+
+	for key, want := range original {
+		if got := roundTripped[key]; got != want {
+			t.Errorf("round trip changed %s: got %q, want %q (marshaled as:\n%s)", key, got, want, data)
+		}
+	}
 }
 
 // ============================================================================
 // UnmarshalStruct (String Version) Tests
 // ============================================================================
-
 func TestUnmarshalStructFromString(t *testing.T) {
 	t.Run("env format to struct", func(t *testing.T) {
 		type TestConfig struct {
@@ -662,80 +677,118 @@ func TestUnmarshalStructFromString(t *testing.T) {
 // ============================================================================
 
 func TestUnmarshalMap(t *testing.T) {
-	t.Run("env format", func(t *testing.T) {
-		data := "KEY=value\nPORT=8080"
-		result, err := UnmarshalMap(data)
-		if err != nil {
-			t.Fatalf("UnmarshalMap() error = %v", err)
-		}
-		if result["KEY"] != "value" {
-			t.Errorf("result[\"KEY\"] = %q, want %q", result["KEY"], "value")
-		}
-		if result["PORT"] != "8080" {
-			t.Errorf("result[\"PORT\"] = %q, want %q", result["PORT"], "8080")
-		}
-	})
+	// deepYAML nests 12 levels deep (defaultUnmarshalDepth is 10) so the
+	// flatten step must reject it.
+	var deepYAML strings.Builder
+	for i := range 12 {
+		deepYAML.WriteString(strings.Repeat("  ", i))
+		deepYAML.WriteString("key:\n")
+	}
+	deepYAML.WriteString(strings.Repeat("  ", 12))
+	deepYAML.WriteString("leaf: deep")
 
-	t.Run("json format", func(t *testing.T) {
-		data := `{"database": {"host": "localhost", "port": 5432}}`
-		result, err := UnmarshalMap(data, FormatJSON)
-		if err != nil {
-			t.Fatalf("UnmarshalMap() error = %v", err)
-		}
-		if result["DATABASE_HOST"] != "localhost" {
-			t.Errorf("result[\"DATABASE_HOST\"] = %q, want %q", result["DATABASE_HOST"], "localhost")
-		}
-		if result["DATABASE_PORT"] != "5432" {
-			t.Errorf("result[\"DATABASE_PORT\"] = %q, want %q", result["DATABASE_PORT"], "5432")
-		}
-	})
+	tests := []struct {
+		name    string
+		data    string
+		formats []FileFormat
+		want    map[string]string
+		wantLen int // expected len(result); defaults to len(want)
+		wantErr bool
+	}{
+		{
+			name: "env format (default)",
+			data: "KEY=value\nPORT=8080",
+			want: map[string]string{"KEY": "value", "PORT": "8080"},
+		},
+		{
+			name:    "empty env input yields empty map",
+			data:    "",
+			wantLen: 0,
+		},
+		{
+			name:    "json format",
+			data:    `{"database": {"host": "localhost", "port": 5432}}`,
+			formats: []FileFormat{FormatJSON},
+			want:    map[string]string{"DATABASE_HOST": "localhost", "DATABASE_PORT": "5432"},
+		},
+		{
+			// Boundary: empty JSON input short-circuits to an empty map.
+			name:    "empty json input yields empty map",
+			data:    "",
+			formats: []FileFormat{FormatJSON},
+			wantLen: 0,
+		},
+		{
+			name:    "invalid json returns error",
+			data:    `{invalid json}`,
+			formats: []FileFormat{FormatJSON},
+			wantErr: true,
+		},
+		{
+			name:    "yaml format",
+			data:    "database:\n  host: localhost\n  port: 5432\n",
+			formats: []FileFormat{FormatYAML},
+			want:    map[string]string{"DATABASE_HOST": "localhost", "DATABASE_PORT": "5432"},
+		},
+		{
+			// Boundary: empty YAML input short-circuits to an empty map.
+			name:    "empty yaml input yields empty map",
+			data:    "",
+			formats: []FileFormat{FormatYAML},
+			wantLen: 0,
+		},
+		{
+			// Boundary: nesting beyond defaultUnmarshalDepth (10) errors.
+			name:    "yaml exceeding depth limit returns error",
+			data:    deepYAML.String(),
+			formats: []FileFormat{FormatYAML},
+			wantErr: true,
+		},
+		{
+			name:    "auto-detect json",
+			data:    `{"key": "value"}`,
+			formats: []FileFormat{FormatAuto},
+			want:    map[string]string{"KEY": "value"},
+		},
+		{
+			name:    "auto-detect yaml",
+			data:    "key: value\nother: test",
+			formats: []FileFormat{FormatAuto},
+			want:    map[string]string{"KEY": "value", "OTHER": "test"},
+		},
+		{
+			name:    "auto-detect env (default)",
+			data:    "KEY=value\nOTHER=test",
+			formats: []FileFormat{FormatAuto},
+			want:    map[string]string{"KEY": "value", "OTHER": "test"},
+		},
+	}
 
-	t.Run("yaml format", func(t *testing.T) {
-		data := "database:\n  host: localhost\n  port: 5432\n"
-		result, err := UnmarshalMap(data, FormatYAML)
-		if err != nil {
-			t.Fatalf("UnmarshalMap() error = %v", err)
-		}
-		if result["DATABASE_HOST"] != "localhost" {
-			t.Errorf("result[\"DATABASE_HOST\"] = %q, want %q", result["DATABASE_HOST"], "localhost")
-		}
-		if result["DATABASE_PORT"] != "5432" {
-			t.Errorf("result[\"DATABASE_PORT\"] = %q, want %q", result["DATABASE_PORT"], "5432")
-		}
-	})
-
-	t.Run("auto-detect json", func(t *testing.T) {
-		data := `{"key": "value"}`
-		result, err := UnmarshalMap(data, FormatAuto)
-		if err != nil {
-			t.Fatalf("UnmarshalMap() error = %v", err)
-		}
-		if result["KEY"] != "value" {
-			t.Errorf("result[\"KEY\"] = %q, want %q", result["KEY"], "value")
-		}
-	})
-
-	t.Run("auto-detect yaml", func(t *testing.T) {
-		data := "key: value\nother: test"
-		result, err := UnmarshalMap(data, FormatAuto)
-		if err != nil {
-			t.Fatalf("UnmarshalMap() error = %v", err)
-		}
-		if result["KEY"] != "value" {
-			t.Errorf("result[\"KEY\"] = %q, want %q", result["KEY"], "value")
-		}
-	})
-
-	t.Run("auto-detect env (default)", func(t *testing.T) {
-		data := "KEY=value\nOTHER=test"
-		result, err := UnmarshalMap(data, FormatAuto)
-		if err != nil {
-			t.Fatalf("UnmarshalMap() error = %v", err)
-		}
-		if result["KEY"] != "value" {
-			t.Errorf("result[\"KEY\"] = %q, want %q", result["KEY"], "value")
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := UnmarshalMap(tt.data, tt.formats...)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("UnmarshalMap() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			for key, want := range tt.want {
+				if result[key] != want {
+					t.Errorf("result[%q] = %q, want %q", key, result[key], want)
+				}
+			}
+			// wantLen defaults to len(want) so a row listing expected keys
+			// also pins the result size.
+			wantLen := tt.wantLen
+			if wantLen == 0 {
+				wantLen = len(tt.want)
+			}
+			if len(result) != wantLen {
+				t.Errorf("len(result) = %d, want %d (got %v)", len(result), wantLen, result)
+			}
+		})
+	}
 }
 
 // ============================================================================
@@ -1065,43 +1118,42 @@ func TestLoader_Validate_WithFullCustomValidator(t *testing.T) {
 // ErrValidateRequiredUnsupported Tests
 // ============================================================================
 
-func TestErrValidateRequiredUnsupported_ErrorMessage(t *testing.T) {
-	err := ErrValidateRequiredUnsupported
+func TestErrValidateRequiredUnsupported(t *testing.T) {
+	t.Run("error message contains guidance", func(t *testing.T) {
+		errMsg := ErrValidateRequiredUnsupported.Error()
+		if !strings.Contains(errMsg, "ValidateRequired") {
+			t.Errorf("Error message should mention ValidateRequired, got: %s", errMsg)
+		}
+		if !strings.Contains(errMsg, "Validator") {
+			t.Errorf("Error message should mention Validator interface, got: %s", errMsg)
+		}
+	})
 
-	// Verify error message contains helpful guidance
-	errMsg := err.Error()
-	if !strings.Contains(errMsg, "ValidateRequired") {
-		t.Errorf("Error message should mention ValidateRequired, got: %s", errMsg)
-	}
-	if !strings.Contains(errMsg, "Validator") {
-		t.Errorf("Error message should mention Validator interface, got: %s", errMsg)
-	}
-}
-
-func TestErrValidateRequiredUnsupported_ErrorsIs(t *testing.T) {
-	// Verify errors.Is works correctly
-	wrappedErr := errors.Join(errors.New("context"), ErrValidateRequiredUnsupported)
-	if !errors.Is(wrappedErr, ErrValidateRequiredUnsupported) {
-		t.Error("errors.Is should match ErrValidateRequiredUnsupported in wrapped error")
-	}
+	t.Run("errors.Is matches through wrapping", func(t *testing.T) {
+		wrappedErr := errors.Join(errors.New("context"), ErrValidateRequiredUnsupported)
+		if !errors.Is(wrappedErr, ErrValidateRequiredUnsupported) {
+			t.Error("errors.Is should match ErrValidateRequiredUnsupported in wrapped error")
+		}
+	})
 }
 
 // ============================================================================
 // auditorAdapter Tests
 // ============================================================================
 
-func TestAuditorAdapter_Nil(t *testing.T) {
-	adapter := newAuditorAdapter(nil)
-	if adapter != nil {
-		t.Error("newAuditorAdapter(nil) should return nil")
-	}
-}
+func TestAuditorAdapter_NilSafety(t *testing.T) {
+	t.Run("constructor returns nil for nil auditor", func(t *testing.T) {
+		if adapter := newAuditorAdapter(nil); adapter != nil {
+			t.Error("newAuditorAdapter(nil) should return nil")
+		}
+	})
 
-func TestAuditorAdapter_CloseNil(t *testing.T) {
-	var adapter *auditorAdapter
-	if err := adapter.Close(); err != nil {
-		t.Errorf("Close() on nil adapter should return nil, got %v", err)
-	}
+	t.Run("Close on nil adapter is a no-op", func(t *testing.T) {
+		var adapter *auditorAdapter
+		if err := adapter.Close(); err != nil {
+			t.Errorf("Close() on nil adapter should return nil, got %v", err)
+		}
+	})
 }
 
 func TestAuditorAdapter_IntegrationWithLoader(t *testing.T) {
@@ -1173,14 +1225,41 @@ func (m *mockFullAuditLogger) Close() error {
 	return nil
 }
 
-func TestAuditorInterfaceWrapper_Log(t *testing.T) {
+func TestAuditorInterfaceWrapper(t *testing.T) {
 	tests := []struct {
-		name     string
-		success  bool
-		expected string
+		name      string
+		invoke    func(w *auditorInterfaceWrapper) error
+		wantMsg   string // expected mockAuditLogger.lastErrMsg ("": assert non-empty)
+		wantMsgOK bool   // true: assert non-empty instead of exact match
 	}{
-		{"success true", true, "[ok] "},
-		{"success false", false, "[error] "},
+		{
+			name: "Log success",
+			invoke: func(w *auditorInterfaceWrapper) error {
+				return w.Log(ActionSet, "KEY", "reason", true)
+			},
+			wantMsg: "[ok] reason",
+		},
+		{
+			name: "Log failure",
+			invoke: func(w *auditorInterfaceWrapper) error {
+				return w.Log(ActionSet, "KEY", "reason", false)
+			},
+			wantMsg: "[error] reason",
+		},
+		{
+			name: "LogWithFile",
+			invoke: func(w *auditorInterfaceWrapper) error {
+				return w.LogWithFile(ActionSet, "KEY", "test.env", "reason", true)
+			},
+			wantMsg: "[ok] reason (file: test.env)",
+		},
+		{
+			name: "LogWithDuration",
+			invoke: func(w *auditorInterfaceWrapper) error {
+				return w.LogWithDuration(ActionSet, "KEY", "reason", true, 100*time.Millisecond)
+			},
+			wantMsgOK: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1188,52 +1267,28 @@ func TestAuditorInterfaceWrapper_Log(t *testing.T) {
 			mock := &mockAuditLogger{}
 			wrapper := &auditorInterfaceWrapper{AuditLogger: mock}
 
-			if err := wrapper.Log(ActionSet, "KEY", "reason", tt.success); err != nil {
-				t.Errorf("Log() error = %v", err)
+			if err := tt.invoke(wrapper); err != nil {
+				t.Fatalf("invoke() error = %v", err)
 			}
-			if mock.lastErrMsg != tt.expected+"reason" {
-				t.Errorf("Log() errMsg = %q, want %q", mock.lastErrMsg, tt.expected+"reason")
+			switch {
+			case tt.wantMsgOK:
+				if mock.lastErrMsg == "" {
+					t.Error("should produce non-empty message")
+				}
+			case mock.lastErrMsg != tt.wantMsg:
+				t.Errorf("errMsg = %q, want %q", mock.lastErrMsg, tt.wantMsg)
 			}
 		})
 	}
-}
 
-func TestAuditorInterfaceWrapper_LogWithFile(t *testing.T) {
-	mock := &mockAuditLogger{}
-	wrapper := &auditorInterfaceWrapper{AuditLogger: mock}
-
-	if err := wrapper.LogWithFile(ActionSet, "KEY", "test.env", "reason", true); err != nil {
-		t.Errorf("LogWithFile() error = %v", err)
-	}
-	expected := "[ok] reason (file: test.env)"
-	if mock.lastErrMsg != expected {
-		t.Errorf("LogWithFile() errMsg = %q, want %q", mock.lastErrMsg, expected)
-	}
-}
-
-func TestAuditorInterfaceWrapper_LogWithDuration(t *testing.T) {
-	mock := &mockAuditLogger{}
-	wrapper := &auditorInterfaceWrapper{AuditLogger: mock}
-
-	if err := wrapper.LogWithDuration(ActionSet, "KEY", "reason", true, 100*time.Millisecond); err != nil {
-		t.Errorf("LogWithDuration() error = %v", err)
-	}
-	if mock.lastErrMsg == "" {
-		t.Error("LogWithDuration() should produce non-empty message")
-	}
-}
-
-func TestAuditorInterfaceWrapper_Close(t *testing.T) {
-	t.Run("non-closer returns nil", func(t *testing.T) {
-		mock := &mockAuditLogger{}
-		wrapper := &auditorInterfaceWrapper{AuditLogger: mock}
-
+	t.Run("Close non-closer returns nil", func(t *testing.T) {
+		wrapper := &auditorInterfaceWrapper{AuditLogger: &mockAuditLogger{}}
 		if err := wrapper.Close(); err != nil {
 			t.Errorf("Close() error = %v, want nil", err)
 		}
 	})
 
-	t.Run("closer delegates", func(t *testing.T) {
+	t.Run("Close closer delegates", func(t *testing.T) {
 		mock := &mockFullAuditLogger{}
 		wrapper := &auditorInterfaceWrapper{AuditLogger: mock}
 
@@ -1244,4 +1299,193 @@ func TestAuditorInterfaceWrapper_Close(t *testing.T) {
 			t.Errorf("Close() should delegate, logs = %v", mock.logs)
 		}
 	})
+}
+
+// ============================================================================
+// Slice Parsing Boundary Tests
+// ============================================================================
+
+// TestParseSliceElement_InvalidInput pins the error contract across every
+// supported element type: all parse failures must surface as *ValidationError
+// (not raw strconv errors), enabling uniform handling by callers.
+func TestParseSliceElement_InvalidInput(t *testing.T) {
+	tests := []struct {
+		name    string
+		parse   func() error
+		wantErr bool
+	}{
+		{"string never fails", func() error { _, err := parseSliceElement[string]("anything"); return err }, false},
+		{"int invalid", func() error { _, err := parseSliceElement[int]("12x"); return err }, true},
+		{"int overflow", func() error { _, err := parseSliceElement[int]("9223372036854775808"); return err }, true},
+		{"int64 invalid", func() error { _, err := parseSliceElement[int64]("bad"); return err }, true},
+		{"uint negative", func() error { _, err := parseSliceElement[uint]("-1"); return err }, true},
+		{"uint64 invalid", func() error { _, err := parseSliceElement[uint64]("1.5"); return err }, true},
+		{"float invalid", func() error { _, err := parseSliceElement[float64]("x"); return err }, true},
+		{"bool invalid", func() error { _, err := parseSliceElement[bool]("maybe"); return err }, true},
+		{"duration invalid", func() error { _, err := parseSliceElement[time.Duration]("notaduration"); return err }, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.parse()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				var ve *ValidationError
+				if !errors.As(err, &ve) {
+					t.Errorf("error = %v (%T), want *ValidationError", err, err)
+				}
+			}
+		})
+	}
+}
+
+// TestParseSliceElement_ExtremeValidValues checks the numeric boundaries of
+// each element type round-trip exactly.
+func TestParseSliceElement_ExtremeValidValues(t *testing.T) {
+	t.Run("int64 extremes", func(t *testing.T) {
+		for _, s := range []string{"-9223372036854775808", "9223372036854775807"} {
+			v, err := parseSliceElement[int64](s)
+			if err != nil {
+				t.Fatalf("parseSliceElement[int64](%q) error = %v", s, err)
+			}
+			if strconv.FormatInt(v, 10) != s {
+				t.Errorf("parseSliceElement[int64](%q) = %d, round-trip mismatch", s, v)
+			}
+		}
+	})
+
+	t.Run("uint64 max", func(t *testing.T) {
+		v, err := parseSliceElement[uint64]("18446744073709551615")
+		if err != nil || v != 18446744073709551615 {
+			t.Errorf("parseSliceElement[uint64] max = %d, %v", v, err)
+		}
+	})
+
+	t.Run("whitespace is trimmed before parsing", func(t *testing.T) {
+		v, err := parseSliceElement[int]("  42\t")
+		if err != nil || v != 42 {
+			t.Errorf("parseSliceElement[int] with whitespace = %d, %v", v, err)
+		}
+	})
+}
+
+// TestParseCommaSeparated_Fallback pins the default-value semantics: empty
+// input and unparseable elements fall back to the caller's default when one
+// is provided, and to nil otherwise; empty segments are dropped.
+func TestParseCommaSeparated_Fallback(t *testing.T) {
+	def := []int{7}
+
+	tests := []struct {
+		name  string
+		value string
+		def   []int // nil = no default
+		want  []int
+	}{
+		{"empty without default", "", nil, nil},
+		{"empty with default", "", def, def},
+		{"invalid element without default", "1,bad,3", nil, nil},
+		{"invalid element with default", "1,bad,3", def, def},
+		{"blank segments dropped", " 1 , , 2 ,", nil, []int{1, 2}},
+		{"all valid", "1,2,3", nil, []int{1, 2, 3}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseCommaSeparated(tt.value, tt.def)
+			if tt.want == nil && got != nil {
+				t.Fatalf("parseCommaSeparated(%q) = %v, want nil", tt.value, got)
+			}
+			if tt.want != nil && !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("parseCommaSeparated(%q) = %v, want %v", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// Unmarshal Boundary Tests
+// ============================================================================
+
+// recordingUnmarshaler implements Unmarshaler to verify that UnmarshalInto
+// defers to custom unmarshaling before any reflection takes place.
+type recordingUnmarshaler struct {
+	got map[string]string
+	err error
+}
+
+func (u *recordingUnmarshaler) UnmarshalEnv(m map[string]string) error {
+	u.got = m
+	return u.err
+}
+
+func TestUnmarshalInto_UnmarshalerPrecedence(t *testing.T) {
+	t.Run("success delegates the map", func(t *testing.T) {
+		u := &recordingUnmarshaler{}
+		data := map[string]string{"K": "v"}
+		if err := UnmarshalInto(data, u); err != nil {
+			t.Fatalf("UnmarshalInto() error = %v", err)
+		}
+		if u.got["K"] != "v" {
+			t.Errorf("UnmarshalEnv received %v, want the source map", u.got)
+		}
+	})
+
+	t.Run("custom error propagates", func(t *testing.T) {
+		wantErr := errors.New("custom unmarshal failure")
+		u := &recordingUnmarshaler{err: wantErr}
+		if err := UnmarshalInto(map[string]string{"K": "v"}, u); !errors.Is(err, wantErr) {
+			t.Errorf("UnmarshalInto() error = %v, want %v", err, wantErr)
+		}
+	})
+}
+
+// failingEnvMarshaler implements Marshaler to verify MarshalStruct propagates
+// marshaling failures.
+type failingEnvMarshaler struct{}
+
+func (failingEnvMarshaler) MarshalEnv() ([]byte, error) {
+	return nil, errors.New("marshal exploded")
+}
+
+func TestMarshalStruct_MarshalerError(t *testing.T) {
+	if _, err := MarshalStruct(failingEnvMarshaler{}); err == nil {
+		t.Error("MarshalStruct() should propagate the Marshaler error")
+	}
+}
+
+func TestUnmarshalStruct_PropagatesParseError(t *testing.T) {
+	var target struct {
+		K string
+	}
+	if err := UnmarshalStruct("BROKEN=\"unterminated\n", &target); err == nil {
+		t.Error("UnmarshalStruct() should propagate the UnmarshalMap parse error")
+	}
+}
+
+// TestUnmarshalMap_FormatAutoFallback pins the auto-detection fallback: data
+// whose first meaningful line matches no format signature (no ": ", no "=")
+// and comment/blank-only data both default to FormatEnv parsing.
+func TestUnmarshalMap_FormatAutoFallback(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want map[string]string
+	}{
+		{"content with no format signature", "plainword", map[string]string{}},
+		{"comments and blanks only", "# a comment\n\n# another\n", map[string]string{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := UnmarshalMap(tt.data, FormatAuto)
+			if err != nil {
+				t.Fatalf("UnmarshalMap() error = %v", err)
+			}
+			if len(got) != len(tt.want) {
+				t.Errorf("UnmarshalMap() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

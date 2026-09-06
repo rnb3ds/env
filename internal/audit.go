@@ -20,7 +20,6 @@ var (
 	_ io.Closer = (*ChannelHandler)(nil)
 	_ io.Closer = (*NopHandler)(nil)
 	_ io.Closer = (*CloseableChannelHandler)(nil)
-	_ io.Closer = (*BufferedHandler)(nil)
 	_ io.Closer = (*Auditor)(nil)
 )
 
@@ -381,116 +380,120 @@ func NewAuditor(handler Handler, isSensitive IsSensitiveFunc, masker MaskerFunc,
 	return a
 }
 
-// Log records an audit event.
-func (a *Auditor) Log(action Action, key, reason string, success bool) error {
+// logEvent finalizes a pooled event (timestamp, key masking, sensitive flag)
+// and hands it to the handler. The caller must hold a.mu.RLock and have
+// re-checked a.enabled under that lock.
+//
+// NOTE: the RLock is held across handler.Log intentionally — it is
+// load-bearing. It serializes logEvent against Close()/SetEnabled() (which
+// take the write lock). Several handlers (e.g. JSONHandler) are NOT
+// internally Close-safe: their Close() closes the writer without taking their
+// own lock, so without this serialization a concurrent Auditor.Close() could
+// close the writer mid-Write (a data race). Do not move handler.Log outside
+// the lock without first making every Handler Close-safe.
+func (a *Auditor) logEvent(event *Event, key string) error {
+	event.Timestamp = time.Now()
+	// Compute the sensitive flag from the original key before masking.
+	event.Masked = key != "" && a.isSensitive(key)
+	event.Key = a.maskKey(key)
+	err := safeHandlerLog(a.handler, *event)
+	putAuditEvent(event)
+	return err
+}
+
+// safeHandlerLog invokes handler.Log with panic protection.
+//
+// The handler is user-supplied; if it panics, the panic is recovered and
+// returned as an error instead of crashing the process. Every call site —
+// including the foreground paths (Load/Parse, which call the auditor
+// mid-operation) — routes handler.Log through here.
+func safeHandlerLog(h Handler, event Event) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("audit handler panicked: %v\n%s", r, debug.Stack())
+		}
+	}()
+	return h.Log(event)
+}
+
+// safeHandlerClose invokes handler.Close with panic protection.
+// See safeHandlerLog for rationale.
+func safeHandlerClose(h Handler) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("audit handler panicked during Close: %v\n%s", r, debug.Stack())
+		}
+	}()
+	return h.Close()
+}
+
+// acquireLogEvent validates the enabled state and returns a pooled event the
+// caller can populate, or nil when auditing is disabled.
+// On success the caller holds a.mu.RLock and MUST call releaseLogEvent.
+func (a *Auditor) acquireLogEvent() (*Event, bool) {
 	// Fast path: atomic read avoids lock acquisition when auditing is disabled.
 	if !a.enabled.Load() {
-		return nil
+		return nil, false
 	}
 	a.mu.RLock()
-	// NOTE: the RLock is held across handler.Log intentionally — it is
-	// load-bearing. It serializes Log against Close()/SetEnabled() (which take
-	// the write lock). Several handlers (e.g. JSONHandler) are NOT internally
-	// Close-safe: their Close() closes the writer without taking their own lock,
-	// so without this serialization a concurrent Auditor.Close() could close the
-	// writer mid-Write (a data race). Do not move handler.Log outside the lock
-	// without first making every Handler Close-safe. The re-check below also
-	// ensures we don't log after a concurrent SetEnabled(false).
+	// Re-check under lock: ensures we don't log after a concurrent
+	// SetEnabled(false) or Close().
 	if !a.enabled.Load() {
 		a.mu.RUnlock()
+		return nil, false
+	}
+	return getAuditEvent(), true
+}
+
+// releaseLogEvent releases the read lock acquired by acquireLogEvent.
+func (a *Auditor) releaseLogEvent() {
+	a.mu.RUnlock()
+}
+
+// Log records an audit event.
+func (a *Auditor) Log(action Action, key, reason string, success bool) error {
+	event, ok := a.acquireLogEvent()
+	if !ok {
 		return nil
 	}
-	// Get pooled event and populate it
-	event := getAuditEvent()
-	event.Timestamp = time.Now()
+	defer a.releaseLogEvent()
 	event.Action = action
-	event.Key = a.maskKey(key)
-	event.File = ""
 	event.Reason = reason
 	event.Success = success
-	event.Details = ""
-	event.Duration = 0
-	event.Masked = key != "" && a.isSensitive(key)
-	err := a.handler.Log(*event)
-	putAuditEvent(event)
-	a.mu.RUnlock()
-	return err
+	return a.logEvent(event, key)
 }
 
 // LogWithFile records an audit event with file information.
 func (a *Auditor) LogWithFile(action Action, key, file, reason string, success bool) error {
-	// Fast path: atomic read avoids lock acquisition when auditing is disabled.
-	if !a.enabled.Load() {
+	event, ok := a.acquireLogEvent()
+	if !ok {
 		return nil
 	}
-	a.mu.RLock()
-	// NOTE: the RLock is held across handler.Log intentionally — it is
-	// load-bearing. It serializes Log against Close()/SetEnabled() (which take
-	// the write lock). Several handlers (e.g. JSONHandler) are NOT internally
-	// Close-safe: their Close() closes the writer without taking their own lock,
-	// so without this serialization a concurrent Auditor.Close() could close the
-	// writer mid-Write (a data race). Do not move handler.Log outside the lock
-	// without first making every Handler Close-safe. The re-check below also
-	// ensures we don't log after a concurrent SetEnabled(false).
-	if !a.enabled.Load() {
-		a.mu.RUnlock()
-		return nil
-	}
-	event := getAuditEvent()
-	event.Timestamp = time.Now()
+	defer a.releaseLogEvent()
 	event.Action = action
-	event.Key = a.maskKey(key)
 	event.File = file
 	event.Reason = reason
 	event.Success = success
-	event.Masked = key != "" && a.isSensitive(key)
-	err := a.handler.Log(*event)
-	putAuditEvent(event)
-	a.mu.RUnlock()
-	return err
+	return a.logEvent(event, key)
 }
 
 // LogWithDuration records an audit event with timing information.
 func (a *Auditor) LogWithDuration(action Action, key, reason string, success bool, duration time.Duration) error {
-	// Fast path: atomic read avoids lock acquisition when auditing is disabled.
-	if !a.enabled.Load() {
+	event, ok := a.acquireLogEvent()
+	if !ok {
 		return nil
 	}
-	a.mu.RLock()
-	// NOTE: the RLock is held across handler.Log intentionally — it is
-	// load-bearing. It serializes Log against Close()/SetEnabled() (which take
-	// the write lock). Several handlers (e.g. JSONHandler) are NOT internally
-	// Close-safe: their Close() closes the writer without taking their own lock,
-	// so without this serialization a concurrent Auditor.Close() could close the
-	// writer mid-Write (a data race). Do not move handler.Log outside the lock
-	// without first making every Handler Close-safe. The re-check below also
-	// ensures we don't log after a concurrent SetEnabled(false).
-	if !a.enabled.Load() {
-		a.mu.RUnlock()
-		return nil
-	}
-	event := getAuditEvent()
-	event.Timestamp = time.Now()
+	defer a.releaseLogEvent()
 	event.Action = action
-	event.Key = a.maskKey(key)
 	event.Reason = reason
 	event.Success = success
 	event.Duration = duration.Nanoseconds()
-	event.Masked = key != "" && a.isSensitive(key)
-	err := a.handler.Log(*event)
-	putAuditEvent(event)
-	a.mu.RUnlock()
-	return err
+	return a.logEvent(event, key)
 }
 
 // LogError records an error event.
 func (a *Auditor) LogError(action Action, key, errMsg string) error {
 	return a.Log(action, key, errMsg, false)
-}
-
-// LogSecurity records a security-related event.
-func (a *Auditor) LogSecurity(key, reason string) error {
-	return a.Log(ActionSecurity, key, reason, false)
 }
 
 // SetEnabled enables or disables audit logging.
@@ -507,11 +510,16 @@ func (a *Auditor) IsEnabled() bool {
 	return a.enabled.Load()
 }
 
-// Close closes the underlying handler.
+// Close closes the underlying handler and disables further logging.
+// Subsequent Log* calls become no-ops instead of writing to a handler
+// whose resources (e.g. an underlying file) may already be released.
+// SetEnabled(true) can re-enable logging on a closed auditor if the
+// handler remains usable.
 func (a *Auditor) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.handler.Close()
+	a.enabled.Store(false)
+	return safeHandlerClose(a.handler)
 }
 
 // maskKey masks a key for audit logging.
@@ -528,242 +536,4 @@ func (a *Auditor) maskKey(key string) string {
 // DefaultHandler returns the default audit handler (writes to stderr).
 func DefaultHandler() Handler {
 	return NewLogHandler(nil)
-}
-
-// ============================================================================
-// BufferedHandler
-// ============================================================================
-
-// BufferedHandlerConfig holds configuration for BufferedHandler.
-type BufferedHandlerConfig struct {
-	// Handler is the underlying handler to write to (required)
-	Handler Handler
-
-	// BufferSize is the maximum number of events to buffer before auto-flush
-	// Default: 100
-	BufferSize int
-
-	// FlushInterval is the maximum time to wait before auto-flush
-	// Set to 0 to disable time-based auto-flush
-	// Default: 5 seconds
-	FlushInterval time.Duration
-
-	// OnError is called when an error occurs during flush
-	// If nil, errors are silently ignored
-	OnError func(error)
-}
-
-// BufferedHandler buffers audit events and writes them in batches.
-// This significantly reduces I/O overhead for high-frequency operations.
-//
-// Features:
-//   - Batched writes reduce system call overhead
-//   - Time-based auto-flush ensures events are written promptly
-//   - Thread-safe for concurrent use
-//   - Graceful shutdown on Close() with guaranteed goroutine exit
-//
-// Example:
-//
-//	underlying := NewJSONHandler(file)
-//	buffered := NewBufferedHandler(BufferedHandlerConfig{
-//	    Handler:       underlying,
-//	    BufferSize:    100,
-//	    FlushInterval: 5 * time.Second,
-//	})
-//	defer buffered.Close()
-type BufferedHandler struct {
-	mu       sync.Mutex
-	handler  Handler
-	buffer   []Event
-	size     int
-	interval time.Duration
-	onError  func(error)
-
-	stopCh  chan struct{}
-	flushCh chan struct{}
-	stopped bool
-	wg      sync.WaitGroup
-}
-
-// Default values for BufferedHandler.
-const (
-	DefaultBufferSize    = 100
-	DefaultFlushInterval = 5 * time.Second
-)
-
-// NewBufferedHandler creates a new BufferedHandler with the given configuration.
-func NewBufferedHandler(cfg BufferedHandlerConfig) *BufferedHandler {
-	if cfg.Handler == nil {
-		cfg.Handler = NewNopHandler()
-	}
-	if cfg.BufferSize <= 0 {
-		cfg.BufferSize = DefaultBufferSize
-	}
-	if cfg.FlushInterval == 0 {
-		cfg.FlushInterval = DefaultFlushInterval
-	}
-
-	h := &BufferedHandler{
-		handler:  cfg.Handler,
-		buffer:   make([]Event, 0, cfg.BufferSize),
-		size:     cfg.BufferSize,
-		interval: cfg.FlushInterval,
-		onError:  cfg.OnError,
-		stopCh:   make(chan struct{}),
-		flushCh:  make(chan struct{}, 1),
-	}
-
-	// Start background flush goroutine if interval is set
-	if h.interval > 0 {
-		h.wg.Add(1)
-		go h.flushLoop()
-	}
-
-	return h
-}
-
-// flushLoop periodically flushes the buffer.
-func (h *BufferedHandler) flushLoop() {
-	defer h.wg.Done()
-	ticker := time.NewTicker(h.interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-h.stopCh:
-			return
-		case <-ticker.C:
-			h.safeFlush()
-		case <-h.flushCh:
-			// Manual flush requested
-			h.safeFlush()
-		}
-	}
-}
-
-// safeFlush calls Flush with panic protection.
-// The underlying handler is user-supplied; if it panics during Log,
-// the panic is recovered and reported via the OnError callback rather
-// than crashing the process. The flushLoop goroutine continues running
-// so subsequent flushes are unaffected.
-func (h *BufferedHandler) safeFlush() {
-	defer func() {
-		if r := recover(); r != nil {
-			if h.onError != nil {
-				h.onError(fmt.Errorf("panic during background flush: %v\n%s", r, debug.Stack()))
-			}
-		}
-	}()
-	_ = h.Flush() // error already handled internally via onError + re-queue
-}
-
-// Log adds an event to the buffer.
-// If the buffer is full, it triggers an automatic flush.
-func (h *BufferedHandler) Log(event Event) error {
-	h.mu.Lock()
-
-	if h.stopped {
-		h.mu.Unlock()
-		return fmt.Errorf("buffered handler is closed")
-	}
-
-	h.buffer = append(h.buffer, event)
-	shouldFlush := len(h.buffer) >= h.size
-
-	h.mu.Unlock()
-
-	// Flush outside of lock to allow concurrent Log() calls
-	if shouldFlush {
-		return h.Flush()
-	}
-	return nil
-}
-
-// Flush writes all buffered events to the underlying handler.
-// Events are removed from the buffer only once they have been written
-// successfully; on write failure the unwritten events are re-queued so that
-// nothing is lost and a later Flush/Close can retry them. This method is safe
-// for concurrent use.
-func (h *BufferedHandler) Flush() error {
-	h.mu.Lock()
-
-	if len(h.buffer) == 0 {
-		h.mu.Unlock()
-		return nil
-	}
-
-	// Take ownership of the current buffer and install a fresh one so that
-	// concurrent Log() calls append to the new buffer while we drain the old.
-	events := h.buffer
-	h.buffer = make([]Event, 0, h.size)
-
-	// Release lock before I/O to allow concurrent Log() calls
-	h.mu.Unlock()
-
-	for i := range events {
-		if err := h.handler.Log(events[i]); err != nil {
-			if h.onError != nil {
-				h.onError(err)
-			}
-			// Re-queue the unwritten tail (events[i:]) ahead of any events
-			// that concurrent Log() calls appended to the new buffer, so that
-			// failed events are retried in order and nothing is dropped.
-			// events[:i] were written successfully and are discarded.
-			h.mu.Lock()
-			h.buffer = append(events[i:], h.buffer...)
-			h.mu.Unlock()
-			return err
-		}
-	}
-
-	return nil
-}
-
-// RequestFlush signals that a flush should be performed soon.
-// This is useful for triggering a flush from another goroutine
-// without waiting for the flush to complete.
-func (h *BufferedHandler) RequestFlush() {
-	select {
-	case h.flushCh <- struct{}{}:
-	default:
-		// Flush already requested
-	}
-}
-
-// Close flushes any remaining events and stops the background flush goroutine.
-func (h *BufferedHandler) Close() error {
-	h.mu.Lock()
-	if h.stopped {
-		h.mu.Unlock()
-		return nil
-	}
-	h.stopped = true
-	h.mu.Unlock()
-
-	// Stop background goroutine
-	close(h.stopCh)
-	h.wg.Wait()
-
-	// Final flush
-	if err := h.Flush(); err != nil {
-		// Still close underlying handler even if flush fails
-		_ = h.handler.Close()
-		return err
-	}
-
-	return h.handler.Close()
-}
-
-// BufferLen returns the current number of events in the buffer.
-func (h *BufferedHandler) BufferLen() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return len(h.buffer)
-}
-
-// IsFull returns true if the buffer is at capacity.
-func (h *BufferedHandler) IsFull() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return len(h.buffer) >= h.size
 }

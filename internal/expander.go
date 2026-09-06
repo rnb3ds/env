@@ -97,7 +97,7 @@ type Expander struct {
 func NewExpander(cfg ExpanderConfig) *Expander {
 	maxDepth := cfg.MaxDepth
 	if maxDepth <= 0 {
-		maxDepth = 5 // DefaultMaxExpansionDepth
+		maxDepth = DefaultMaxExpansionDepth
 	}
 	if maxDepth > HardMaxExpansionDepth {
 		maxDepth = HardMaxExpansionDepth
@@ -189,6 +189,16 @@ func (e *Expander) expandSingleVar(s string) (string, error) {
 	return e.expandSingleSimpleVar(s)
 }
 
+// expandFull runs the general expansion path with a fresh visited map.
+// The single-variable fast paths call it whenever the variable reference does
+// not consume the entire string, so that any literal suffix is preserved
+// (the general path tracks consumed counts and writes the remaining segment).
+func (e *Expander) expandFull(s string) (string, error) {
+	visited := getVisitedMap()
+	defer putVisitedMap(visited)
+	return e.expandWithDepth(s, 0, visited)
+}
+
 // expandSingleSimpleVar handles $VAR syntax with leaf-value fast path.
 // Skips the visited map allocation when the resolved value has no further $ references.
 func (e *Expander) expandSingleSimpleVar(s string) (string, error) {
@@ -209,7 +219,12 @@ func (e *Expander) expandSingleSimpleVar(s string) (string, error) {
 	// Look up value
 	value, ok := e.lookup(key)
 	if !ok {
-		return "", nil
+		if end == len(s) {
+			return "", nil
+		}
+		// Unset variable with a literal suffix — the general path keeps the
+		// suffix ("$FOO bar" -> " bar" when FOO is unset).
+		return e.expandFull(s)
 	}
 
 	// Fast path: if the value is a leaf (no $), no recursion needed.
@@ -278,7 +293,11 @@ func (e *Expander) expandSingleBracedVar(s string) (string, error) {
 
 	content := s[2:end]
 	if content == "" {
-		return "{}", nil
+		if end+1 == len(s) {
+			return "{}", nil
+		}
+		// Literal suffix follows the empty braces — keep it ("${} tail" -> "{} tail").
+		return e.expandFull(s)
 	}
 
 	// Parse operator (:-,:=,:?)
@@ -303,10 +322,12 @@ func (e *Expander) expandSingleBracedVar(s string) (string, error) {
 		if opType == '?' {
 			value, ok := e.lookup(key)
 			if !ok || value == "" {
+				// SECURITY (SEC-05): do not echo the file-supplied :? message
+				// into the error struct (see expandBracedVariable).
 				return "", &ExpansionError{
 					Key:   key,
 					Kind:  ExpansionRequiredKind,
-					Chain: "required variable not set: " + defaultValue,
+					Chain: "required variable not set",
 				}
 			}
 			// Value is set — if entire string consumed and no $, return directly
@@ -327,7 +348,12 @@ func (e *Expander) expandSingleBracedVar(s string) (string, error) {
 		valid = e.keyPattern.MatchString(key)
 	}
 	if !valid {
-		return s[:end+1], nil
+		if end+1 == len(s) {
+			return s[:end+1], nil
+		}
+		// Invalid key with a literal suffix — the general path returns the
+		// reference verbatim and preserves the suffix ("${1BAD} tail").
+		return e.expandFull(s)
 	}
 
 	// Look up the value
@@ -335,8 +361,11 @@ func (e *Expander) expandSingleBracedVar(s string) (string, error) {
 	if !ok {
 		if hasDefault {
 			value = defaultValue
-		} else {
+		} else if end+1 == len(s) {
 			return "", nil
+		} else {
+			// Unset variable with a literal suffix — keep the suffix.
+			return e.expandFull(s)
 		}
 	}
 
@@ -519,7 +548,7 @@ func (e *Expander) expandBracedVariable(s string, depth int, visited map[string]
 	// Check for default value syntax using a single scan
 	var key, defaultValue string
 	var hasDefault bool
-	var opType byte // '!' for :-, '=' for :=, '?' for :?
+	var opType byte // '-' for :-, '=' for :=, '?' for :?
 
 	// Single scan to find colon operator using lookup table for O(1) validation
 	colonIdx := -1
@@ -540,13 +569,36 @@ func (e *Expander) expandBracedVariable(s string, depth int, visited map[string]
 		if opType == '?' {
 			value, ok := e.lookup(key)
 			if !ok || value == "" {
+				// SECURITY (SEC-05): the :? message is file content — echoing
+				// it into the error leaks attacker-controlled (or
+				// secret-bearing) text; the masked Key already identifies the
+				// variable.
 				return "", end + 1, &ExpansionError{
 					Key:   key,
 					Kind:  ExpansionRequiredKind,
-					Chain: "required variable not set: " + defaultValue,
+					Chain: "required variable not set",
 				}
 			}
-			return value, end + 1, nil
+			// The set-value must be expanded like the plain ${VAR} path below:
+			// it may itself contain $VAR references (HOST=$BASE with
+			// ${HOST:?required} must yield the expansion of $BASE, not the raw
+			// "$BASE" — regression: this branch previously returned the value
+			// unexpanded). Cycle detection mirrors the main path so a required
+			// variable that participates in a cycle errors instead of recursing.
+			if visited[key] {
+				return "", end + 1, &ExpansionError{
+					Key:   key,
+					Depth: depth,
+					Chain: e.buildChain(visited),
+				}
+			}
+			visited[key] = true
+			expanded, err := e.expandWithDepth(value, depth+1, visited)
+			delete(visited, key)
+			if err != nil {
+				return "", end + 1, err
+			}
+			return expanded, end + 1, nil
 		}
 	} else {
 		key = content
@@ -836,7 +888,8 @@ func (e *Expander) ExpandAllInMap(vars map[string]string) (map[string]string, er
 	// Build a lookup cache that first checks vars, then falls back to e.lookup.
 	// This avoids repeated os.LookupEnv syscalls for variables already present
 	// in the parsed map (the most common case for $VAR references).
-	lookupCache := make(map[string]lookupResult, len(vars))
+	lookupCache := getLookupCache()
+	defer putLookupCache(lookupCache)
 	cachedLookup := func(key string) (string, bool) {
 		if r, ok := lookupCache[key]; ok {
 			return r.value, r.ok
@@ -880,4 +933,37 @@ func (e *Expander) ExpandAllInMap(vars map[string]string) (map[string]string, er
 type lookupResult struct {
 	value string
 	ok    bool
+}
+
+// lookupCachePool pools the per-expansion lookup cache. The cache is only
+// needed for the duration of one ExpandAllInMap call; pooling it removes a
+// size-proportional map allocation from every batch expansion.
+var lookupCachePool = sync.Pool{
+	New: func() any {
+		return make(map[string]lookupResult, 16)
+	},
+}
+
+// getLookupCache retrieves a lookup cache from the pool.
+func getLookupCache() map[string]lookupResult {
+	m, ok := lookupCachePool.Get().(map[string]lookupResult)
+	if !ok {
+		return make(map[string]lookupResult, 16)
+	}
+	return m
+}
+
+// putLookupCache returns a lookup cache to the pool after clearing it.
+// SECURITY: clear() (Go 1.21+) guarantees no stale cached values — including
+// resolved secrets — survive into the next use.
+func putLookupCache(m map[string]lookupResult) {
+	if m == nil {
+		return
+	}
+	// Check size before clearing — after clear() the length is 0.
+	if len(m) > MaxPooledMapSize {
+		return // too large, let GC reclaim it
+	}
+	clear(m)
+	lookupCachePool.Put(m)
 }
